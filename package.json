@@ -1,0 +1,27 @@
+{
+  "name": "casion-yabawi",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "야바위 부스 게임 (offline, single-file build)",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "e2e": "playwright test",
+    "sim": "node scripts/simulate.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.56.1",
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3",
+    "vite": "7.3.7",
+    "vite-plugin-singlefile": "2.3.3",
+    "vitest": "4.1.12"
+  },
+  "overrides": {
+    "vite": "$vite"
+  }
+}
