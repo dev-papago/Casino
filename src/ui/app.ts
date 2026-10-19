@@ -1,0 +1,500 @@
+// Screens and the round flow (DESIGN.md sections 1, 3, 7, 8). UI phases live in memory;
+// the session and stats are saved at start, at pick (before the reveal), at quit and at 지급 완료.
+import { Sfx } from '../audio';
+import { CONFIG, saveSettings, sessionEconomy, type Settings } from '../config';
+import { quit, resumePhase, sessionNet, settleRound, startSession, type Session } from '../game/session';
+import { generatePlan, moveTimes, type CupId, type Plan, type Slot } from '../game/shuffle';
+import { cryptoRng } from '../rng';
+import { emptyStats, recordPayout, recordRound, saveState, type SavedState } from '../storage';
+import { adminPanel, pinPanel } from './admin';
+import { DEFS_SVG, SOUND_OFF_SVG, SOUND_ON_SVG } from './art';
+import { CupsView } from './cups';
+import { button, fromHtml, h, signed, sleep } from './dom';
+import { END_TEXT, chipDelayMs, chipIcon, confirmCard, settlementCard } from './panels';
+
+export type Screen = 'idle' | 'confirm' | 'pin' | 'admin' | 'game' | 'settlement';
+export type Phase = 'ready' | 'showBall' | 'shuffling' | 'picking' | 'reveal' | 'result';
+type Mode = 'paid' | 'practice';
+type PracticeLevel = 'easy' | 'normal';
+
+export interface Boot {
+  settings: Settings;
+  state: SavedState;
+  speed: number; // animation speed-up, ?speed=N (e2e only)
+}
+
+const PRACTICE_LEVELS: readonly PracticeLevel[] = ['easy', 'normal'];
+const ALL_CUPS: readonly CupId[] = [0, 1, 2];
+const OVERLAP_NOTE = '겹친 컵은 지나갈 수도, 튕겨 돌아갈 수도 있어요 (반반)';
+const DEMO_LEVEL = 'normal';
+const DEMO_RATE = 0.45; // the idle demo runs slower than real time
+const TITLE_CLICKS = 5;
+const TITLE_GAP_MS = 1500;
+
+/** ?speed=N, clamped to 1..100; anything else is 1. */
+export function parseSpeed(search: string): number {
+  const v = Number(new URLSearchParams(search).get('speed'));
+  return Number.isFinite(v) && v > 1 ? Math.min(100, v) : 1;
+}
+
+export function mountApp(root: HTMLElement, boot: Boot): void {
+  let settings = boot.settings;
+  let state = boot.state;
+  const speed = boot.speed;
+  const T = CONFIG.timing;
+  const rng = cryptoRng();
+  const sfx = new Sfx(settings.sound);
+  const ms = (x: number): number => x / speed;
+
+  let screen: Screen = 'idle';
+  let phase: Phase = 'ready';
+  let mode: Mode = 'paid';
+  let level: PracticeLevel = 'easy';
+  let tally = { rounds: 0, hits: 0 }; // this practice visit only
+  let plan: Plan | null = null;
+  let lastWin = false;
+  let roundToken = 0; // bumps to abandon an async round sequence
+  let demoToken = 0;
+  let titleClicks = { n: 0, at: 0 };
+
+  // ------------------------------------------------------------ skeleton
+  document.body.append(fromHtml(DEFS_SVG));
+  root.classList.add('app');
+  root.style.setProperty('--speed', String(speed));
+  const title = h('h1', { class: 'title', 'data-testid': 'title' }, '야바위');
+  const badge = h('div', { class: 'badge', 'data-testid': 'badge' });
+  const muteBtn = h('button', { class: 'mute', type: 'button', 'data-testid': 'mute' });
+  const status = h('div', { class: 'status', 'data-testid': 'status' });
+  const cups = new CupsView(T, (slot) => void pick(slot));
+  const banner = h('div', { class: 'banner', 'data-testid': 'banner', hidden: true });
+  const message = h('div', { class: 'message', 'data-testid': 'message', 'aria-live': 'polite' });
+  const controls = h('div', { class: 'controls', 'data-testid': 'controls' });
+  const overlay = h('div', { class: 'overlay', 'data-testid': 'overlay' });
+  cups.el.append(banner);
+  root.replaceChildren(
+    h('header', { class: 'top' }, h('div', { class: 'lights' }), h('div', { class: 'brand' }, title), badge, muteBtn),
+    status,
+    h('main', { class: 'table' }, cups.el),
+    message,
+    controls,
+    overlay,
+  );
+
+  // ------------------------------------------------------------ input
+  root.addEventListener('pointerdown', () => sfx.unlock(), { capture: true });
+  root.addEventListener('click', (e) => {
+    const b = (e.target as Element).closest('button');
+    if (!b) return;
+    if (!b.classList.contains('zone')) sfx.play('click');
+    b.blur(); // Space and Enter belong to the game, never to a focused button
+  });
+  muteBtn.addEventListener('click', toggleMute);
+  title.addEventListener('click', () => {
+    const now = performance.now();
+    titleClicks = now - titleClicks.at < TITLE_GAP_MS ? { n: titleClicks.n + 1, at: now } : { n: 1, at: now };
+    if (titleClicks.n < TITLE_CLICKS) return;
+    titleClicks = { n: 0, at: 0 };
+    if (screen === 'idle') showPin();
+  });
+  const typing = (t: EventTarget | null): boolean => t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement;
+  window.addEventListener('keydown', (e) => {
+    sfx.unlock();
+    if (typing(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
+    const space = e.code === 'Space' || e.key === ' ';
+    if (space || e.key === 'Enter') e.preventDefault();
+    if (e.repeat) return;
+    if (e.code === 'KeyM') return toggleMute();
+    if (e.key === 'Escape' && (screen === 'confirm' || screen === 'pin' || screen === 'admin')) return showIdle();
+    if (screen !== 'game') return;
+    const digit = '123'.indexOf(e.key);
+    if (space) void startRound();
+    else if (e.key === 'Enter') void next();
+    else if (digit >= 0) void pick(digit as Slot);
+  });
+  window.addEventListener('keyup', (e) => {
+    if (!typing(e.target) && (e.code === 'Space' || e.key === ' ')) e.preventDefault();
+  });
+
+  // ------------------------------------------------------------ helpers
+  function setScreen(s: Screen): void {
+    // Leftovers from the previous screen: the win chip in flight and settlement count ticks.
+    document.querySelectorAll('.flyer').forEach((el) => el.remove());
+    sfx.stopTicks();
+    screen = s;
+    root.dataset.screen = s;
+  }
+
+  function session(): Session | null {
+    return state.session;
+  }
+
+  function persist(next: SavedState): void {
+    state = next;
+    saveState(state);
+  }
+
+  function renderMute(): void {
+    const muted = settings.sound.muted;
+    muteBtn.replaceChildren(fromHtml(muted ? SOUND_OFF_SVG : SOUND_ON_SVG), h('span', {}, muted ? '소리 꺼짐' : '소리 켜짐'), h('kbd', {}, 'M'));
+    muteBtn.setAttribute('aria-pressed', String(muted));
+    muteBtn.classList.toggle('off', muted);
+  }
+
+  function toggleMute(): void {
+    settings = saveSettings({ ...settings, sound: { ...settings.sound, muted: !settings.sound.muted } });
+    sfx.set(settings.sound);
+    renderMute();
+    if (screen === 'admin') showAdmin();
+  }
+
+  // ------------------------------------------------------------ idle (+ confirm, PIN, admin on top of it)
+  function showIdle(): void {
+    roundToken++;
+    setScreen('idle');
+    root.dataset.phase = '';
+    overlay.replaceChildren();
+    banner.hidden = true;
+    badge.textContent = '';
+    cups.setPickable(false);
+    const e = CONFIG.economy;
+    status.replaceChildren(
+      h('div', { class: 'pill' }, chipIcon(), `칩 ${e.buyIn}개 = 참가비 ${e.fee} + 게임 칩 ${e.buyIn - e.fee}`),
+      h('div', { class: 'pill' }, `한 판 ${e.stake}칩 · 맞히면 ${e.returnOnWin}칩`),
+      h('div', { class: 'pill' }, `최대 ${settings.maxRounds}판`),
+      h('div', { class: 'pill' }, `+${e.winCap}칩 따면 클리어`),
+    );
+    message.replaceChildren(
+      h('div', { class: 'msg-main' }, '컵 속의 공을 찾아라!'),
+      h('div', { class: 'msg-sub' }, `${OVERLAP_NOTE} · 쉬움·보통 연습은 무료`),
+    );
+    controls.replaceChildren(
+      button('새 손님', showConfirm, { kind: 'primary', testid: 'new-guest' }),
+      button('연습하기 (무료)', () => enterGame('practice'), { testid: 'practice' }),
+    );
+    void demo(++demoToken);
+  }
+
+  async function demo(token: number): Promise<void> {
+    cups.reset();
+    await sleep(ms(800));
+    while (token === demoToken) {
+      const p = generatePlan(DEMO_LEVEL, CONFIG, rng);
+      cups.show(p, 0);
+      if (!(await cups.play(p, DEMO_RATE * speed))) return;
+      await sleep(ms(1600));
+    }
+  }
+
+  function stopDemo(): void {
+    demoToken++;
+    cups.stop();
+  }
+
+  function showConfirm(): void {
+    if (screen !== 'idle') return;
+    setScreen('confirm');
+    overlay.replaceChildren(confirmCard(sessionEconomy(settings), startPaid, showIdle));
+  }
+
+  function showPin(): void {
+    setScreen('pin');
+    overlay.replaceChildren(pinPanel(settings.pin, showAdmin, showIdle));
+  }
+
+  function showAdmin(): void {
+    setScreen('admin');
+    overlay.replaceChildren(
+      adminPanel({
+        settings: () => settings,
+        state: () => state,
+        saveSettings: (s) => {
+          settings = saveSettings(s);
+          sfx.set(settings.sound);
+          renderMute();
+          return settings;
+        },
+        resetStats: () => persist({ ...state, stats: emptyStats() }),
+        exit: showIdle,
+      }),
+    );
+  }
+
+  // ------------------------------------------------------------ game (paid and practice share every phase)
+  function startPaid(): void {
+    if (screen !== 'confirm') return;
+    persist({ ...state, session: startSession(sessionEconomy(settings), Date.now()) });
+    enterGame('paid');
+  }
+
+  function enterGame(m: Mode): void {
+    stopDemo();
+    roundToken++;
+    mode = m;
+    tally = { rounds: 0, hits: 0 };
+    plan = null;
+    overlay.replaceChildren();
+    setScreen('game');
+    cups.reset();
+    setPhase('ready');
+  }
+
+  function setPhase(p: Phase): void {
+    phase = p;
+    root.dataset.phase = p;
+    cups.setPickable(p === 'picking');
+    renderGame();
+  }
+
+  async function startRound(): Promise<void> {
+    if (screen !== 'game' || phase !== 'ready') return;
+    const s = session();
+    if (mode === 'paid' && (!s || s.ended)) return;
+    const token = ++roundToken;
+    const p = generatePlan(mode === 'paid' ? 'hardest' : level, CONFIG, rng);
+    plan = p;
+    // Show the ball under cup `start`, then lower the cup; the ball leaves the DOM before the shuffle.
+    cups.reset();
+    cups.show(p, 0);
+    cups.putBall(p.start);
+    setPhase('showBall');
+    cups.lift([p.start], true, ms(T.showBallMs * 0.26));
+    sfx.play('lift');
+    await sleep(ms(T.showBallMs * 0.7));
+    if (token !== roundToken) return;
+    cups.lift([p.start], false, ms(T.showBallMs * 0.22));
+    sfx.play('drop', ms(T.showBallMs * 0.18));
+    await sleep(ms(T.showBallMs * 0.3));
+    if (token !== roundToken) return;
+    cups.removeBall();
+    setPhase('shuffling');
+    shuffleSounds(p);
+    if (!(await cups.play(p, speed)) || token !== roundToken) return;
+    setPhase('picking');
+  }
+
+  /** One 'swish' per move whatever its kind, one 'tak' when overlapping cups meet (same for pass and bounce). */
+  function shuffleSounds(p: Plan): void {
+    const times = moveTimes(p);
+    p.moves.forEach((m, k) => {
+      sfx.play('swish', ms(times[k]));
+      if (m.kind === 'overlap') sfx.play('tak', ms(times[k] + (m.durMs - Math.min(T.overlapDwellMs, m.durMs)) / 2));
+    });
+  }
+
+  async function pick(slot: Slot): Promise<void> {
+    if (screen !== 'game' || phase !== 'picking' || !plan) return;
+    const p = plan;
+    const token = roundToken;
+    const win = slot === p.final;
+    const s = session();
+    if (mode === 'paid') {
+      if (!s) return;
+      persist({ session: settleRound(s, slot, p), stats: recordRound(state.stats, 'hardest', win) });
+    } else {
+      persist({ ...state, stats: recordRound(state.stats, p.level, win) });
+      tally = { rounds: tally.rounds + 1, hits: tally.hits + (win ? 1 : 0) };
+    }
+    lastWin = win;
+    setPhase('reveal');
+    // The picked cup first, then the others; the ball is drawn under cup `start`.
+    const picked = cups.cupAt(slot);
+    cups.putBall(p.start);
+    cups.lift([picked], true, ms(320));
+    sfx.play('lift');
+    await sleep(ms(T.revealMs * 0.42));
+    if (token !== roundToken) return;
+    cups.lift(
+      ALL_CUPS.filter((c) => c !== picked),
+      true,
+      ms(320),
+    );
+    sfx.play('lift');
+    await sleep(ms(T.revealMs * 0.58));
+    if (token !== roundToken) return;
+    setPhase('result');
+    if (win) {
+      sfx.play('win');
+      if (mode === 'paid') flyChip();
+    } else {
+      sfx.play('lose');
+      cups.shake(picked, ms(T.resultMs * 0.6));
+    }
+    if (mode === 'paid' && session()?.ended === 'clear') sfx.play('clear', 450);
+  }
+
+  async function next(): Promise<void> {
+    if (screen !== 'game' || phase !== 'result') return;
+    if (mode === 'paid' && session()?.ended) return showSettlement();
+    roundToken++;
+    cups.lowerAll(ms(260));
+    sfx.play('drop', ms(200));
+    setPhase('ready');
+  }
+
+  function quitSession(): void {
+    const s = session();
+    if (screen !== 'game' || mode !== 'paid' || !s || s.ended) return;
+    if (phase !== 'ready' && phase !== 'result') return;
+    persist({ ...state, session: quit(s) });
+    showSettlement();
+  }
+
+  function flyChip(): void {
+    const from = cups.ballRect();
+    const target = status.querySelector('[data-testid="stack"] .chip-svg');
+    const s = session();
+    if (!from || !target || !s) return;
+    const to = target.getBoundingClientRect();
+    const fly = h('div', { class: 'flyer' }, chipIcon(), h('b', {}, signed(s.econ.returnOnWin - s.econ.stake)));
+    document.body.append(fly);
+    const x0 = from.left + from.width / 2;
+    const y0 = from.top;
+    const x1 = to.left + to.width / 2;
+    const y1 = to.top + to.height / 2;
+    const at = (x: number, y: number, k: number): string => `translate(${x}px, ${y}px) translate(-50%, -50%) scale(${k})`;
+    const anim = fly.animate(
+      [
+        { transform: at(x0, y0, 0.6), opacity: 0 },
+        { transform: at(x0, y0 - 70, 1.5), opacity: 1, offset: 0.3 },
+        { transform: at(x1, y1, 0.5), opacity: 0.8 },
+      ],
+      { duration: ms(T.resultMs), easing: 'cubic-bezier(.45,0,.55,1)' },
+    );
+    anim.onfinish = () => {
+      fly.remove();
+      status.querySelector('[data-testid="stack"]')?.classList.add('pulse');
+    };
+  }
+
+  // ------------------------------------------------------------ game rendering
+  function renderGame(): void {
+    const s = session();
+    badge.textContent = mode === 'paid' ? `${CONFIG.levels.hardest.label} · 칩 게임` : `무료 연습 · ${CONFIG.levels[level].label}`;
+    badge.className = mode === 'paid' ? 'badge paid' : 'badge';
+    if (phase !== 'reveal') renderStatus(s); // the status bar must not give the answer away before the cups lift
+    renderMessage(s);
+    renderControls(s);
+    const ended = mode === 'paid' && phase === 'result' ? (s?.ended ?? null) : null; // 종료 배너
+    banner.hidden = !ended;
+    banner.textContent = ended ? END_TEXT[ended] : '';
+    banner.dataset.reason = ended ?? '';
+  }
+
+  function renderStatus(s: Session | null): void {
+    if (mode === 'practice') {
+      const canSwitch = phase === 'ready' || phase === 'result';
+      status.replaceChildren(
+        h('div', { class: 'pill' }, '무료 연습 · 칩 없음'),
+        h(
+          'div',
+          { class: 'seg', role: 'group', 'aria-label': '난이도' },
+          ...PRACTICE_LEVELS.map((id) => {
+            const b = button(CONFIG.levels[id].label, () => {
+              level = id;
+              renderGame();
+            });
+            b.classList.toggle('on', id === level);
+            b.disabled = !canSwitch;
+            return b;
+          }),
+        ),
+        h('div', { class: 'pill' }, '맞힌 판 ', h('b', {}, `${tally.hits} / ${tally.rounds}`)),
+      );
+      return;
+    }
+    if (!s) return status.replaceChildren();
+    const played = s.rounds.length;
+    const max = s.econ.maxRounds;
+    const toClear = Math.max(0, s.econ.winCap - sessionNet(s));
+    status.replaceChildren(
+      h('div', { class: 'pill big', 'data-testid': 'stack' }, chipIcon(), '게임 칩 ', h('b', { 'data-testid': 'stack-n' }, s.stack), '개'),
+      h(
+        'div',
+        { class: 'pill' },
+        '판 ',
+        h('span', { class: 'dots', 'aria-hidden': 'true' }, h('span', { class: 'done' }, '●'.repeat(played)), '○'.repeat(Math.max(0, max - played))),
+        h('b', { 'data-testid': 'rounds' }, `${played}/${max}`),
+      ),
+      ...(s.ended ? [] : [h('div', { class: 'pill' }, '클리어까지 ', h('b', { 'data-testid': 'to-clear' }, `+${toClear}`))]),
+    );
+  }
+
+  function renderMessage(s: Session | null): void {
+    const set = (main: string, sub?: string, cls = ''): void =>
+      message.replaceChildren(h('div', { class: `msg-main ${cls}`.trim() }, main), ...(sub ? [h('div', { class: 'msg-sub' }, sub)] : []));
+    switch (phase) {
+      case 'ready':
+        return set('[섞기 시작]을 누르면 공을 보여 주고 컵을 섞어요', OVERLAP_NOTE);
+      case 'showBall':
+        return set('공은 이 컵 안에 있어요!');
+      case 'shuffling':
+        return set('잘 보세요…');
+      case 'picking':
+        return set('컵을 고르세요', '클릭하거나 키보드 1 · 2 · 3', 'pulse-text');
+      case 'reveal':
+        return set('과연…');
+      case 'result': {
+        if (mode === 'practice') return set(lastWin ? '맞혔어요!' : '아쉬워요! 공은 다른 컵에 있었어요', undefined, lastWin ? 'win' : 'lose');
+        if (!s) return;
+        const e = s.econ;
+        const delta = lastWin ? e.returnOnWin - e.stake : -e.stake;
+        message.replaceChildren(
+          h(
+            'div',
+            { class: `msg-main ${lastWin ? 'win' : 'lose'}` },
+            h('span', { class: 'delta', 'data-testid': 'delta' }, signed(delta)),
+            lastWin ? ' 맞혔어요! ' : ' 아쉬워요. ',
+            `남은 칩 ${s.stack}개`,
+          ),
+        );
+        return;
+      }
+    }
+  }
+
+  function renderControls(s: Session | null): void {
+    const paid = mode === 'paid';
+    const leave = paid
+      ? button('그만하기', quitSession, { kind: 'ghost', testid: 'quit' })
+      : button('연습 끝내기', showIdle, { kind: 'ghost', testid: 'practice-exit' });
+    if (phase === 'ready') {
+      controls.replaceChildren(button('섞기 시작', () => void startRound(), { kind: 'primary', key: 'Space', testid: 'start-round' }), leave);
+    } else if (phase === 'result') {
+      controls.replaceChildren(
+        ...(paid && s?.ended
+          ? [button('정산하기', () => void next(), { kind: 'primary', key: 'Enter', testid: 'to-settlement' })]
+          : [button('다음 판', () => void next(), { kind: 'primary', key: 'Enter', testid: 'next-round' }), leave]),
+      );
+    } else {
+      controls.replaceChildren(); // no input while the ball is shown, the cups move or the reveal runs
+    }
+  }
+
+  // ------------------------------------------------------------ settlement
+  function showSettlement(): void {
+    const s = session();
+    if (!s?.ended) return showIdle();
+    stopDemo();
+    roundToken++;
+    setScreen('settlement');
+    root.dataset.phase = '';
+    cups.setPickable(false);
+    controls.replaceChildren();
+    overlay.replaceChildren(settlementCard({ ...s, ended: s.ended }, payout));
+    for (let i = 0; i < s.stack; i++) sfx.play('tick', ms(chipDelayMs(i)));
+  }
+
+  function payout(): void {
+    const s = session();
+    if (screen !== 'settlement' || !s?.ended) return;
+    persist({ session: null, stats: recordPayout(state.stats, s) });
+    showIdle();
+  }
+
+  // ------------------------------------------------------------ boot (refresh rule, section 3)
+  renderMute();
+  const resume = resumePhase(state.session);
+  if (resume === 'settlement') showSettlement();
+  else if (resume === 'ready') enterGame('paid');
+  else showIdle();
+}
