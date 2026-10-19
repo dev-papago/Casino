@@ -1,53 +1,47 @@
 #!/usr/bin/env node
-// 야바위 booth: consolidated simulation (shuffle ceiling + session economy + festival + guard).
-// Plain Node (>= 18) ESM, no dependencies.
-// It reads the SAME config file the app imports: src/config/defaults.json.
+// 야바위 booth simulation. Plain Node (>= 18) ESM, no dependencies.
+// Reads the SAME defaults the app uses: src/config/defaults.json
 //
-//   node scripts/simulate.mjs                 full run (about 1 minute)
-//   node scripts/simulate.mjs --quick         fewer samples (smoke test)
-//   node scripts/simulate.mjs --seed 7 --config other.json --json out.json
+//   npm run sim   (= node scripts/simulate.mjs)   full run, about 6 s
+//   node scripts/simulate.mjs --quick              smoke run
+//   node scripts/simulate.mjs --seed 7 --config my.json
 //
-// The sim uses a seeded PRNG (sfc32) so results are reproducible.
-// The app itself uses crypto.getRandomValues with rejection sampling.
-// Session tables are EXACT (dynamic programming over every reachable state);
-// shuffle, festival and alarm tables are Monte Carlo.
+// The output starts with "요약"; docs/DESIGN.md section 4 pastes that block verbatim.
+// The sim uses a seeded PRNG so results are reproducible; the app uses crypto.getRandomValues.
+// Session tables (B, C) are EXACT (dynamic programming over every reachable state).
+// Shuffle (A) and festival (E) tables are Monte Carlo.
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const argv = process.argv.slice(2);
-const flag = (n) => argv.includes(n);
 const opt = (n, d) => { const i = argv.indexOf(n); return i >= 0 && i + 1 < argv.length ? argv[i + 1] : d; };
-const QUICK = flag('--quick');
+const QUICK = argv.includes('--quick');
 const SEED = Number(opt('--seed', '20261019')) >>> 0;
 const CONFIG_PATH = resolve(opt('--config', join(ROOT, 'src/config/defaults.json')));
-const JSON_OUT = opt('--json', null);
 const CFG = JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
+const ECON = CFG.economy;
 
-const N_ROUNDS = QUICK ? 30000 : 300000; // shuffle rounds per tier
-const N_FEST = QUICK ? 1000 : 10000; // simulated festival days per scenario
-const N_ALARM = QUICK ? 500 : 3000; // alarm trials per case
-const ALARM_HORIZON = 2500; // rounds, roughly one festival day of 최상 play
+const N_ROUNDS = QUICK ? 20000 : 200000; // shuffle plans per level
+const N_DAYS = QUICK ? 500 : 5000; // simulated festival days per scenario
 
-// Sim-only assumptions (not game config). All of them are stated in DESIGN.md section 10.
+// Sim-only assumptions (not game config). Listed in DESIGN.md section 10.
 const ASSUME = {
-  pickAvgMs: 2500, // average time a player takes to pick
-  sessionOverheadSec: 30, // staff enters buy-in + cash-out counting
-  warmupRoundsAvg: 0.5, // free 연습/보통 rounds per session, on average
-  humanModels: {
-    // per-move probability of losing the cup on a plain swap / a 3-cup rotation.
-    // At an overlap no information exists, so every model guesses 50:50 there.
-    practice: [{ name: '캐주얼', es: 0.02, er: 0.02 }, { name: '숙련', es: 0.005, er: 0.005 }, { name: '완벽 지각', es: 0, er: 0 }],
-    normal: [{ name: '캐주얼', es: 0.04, er: 0.04 }, { name: '숙련', es: 0.01, er: 0.01 }, { name: '완벽 지각', es: 0, er: 0 }],
-    hardest: [{ name: '캐주얼', es: 0.1, er: 0.2 }, { name: '숙련', es: 0.03, er: 0.06 }, { name: '완벽 지각', es: 0, er: 0 }],
+  pickSec: 2.5, // time a player takes to pick a cup
+  sessionOverheadSec: 30, // staff takes the chips, counts chips at cash-out
+  // Human tracker: follows ONE hypothesis and loses it with prob es (pair swap) / er (3-cup rotation).
+  // At an overlap nobody has information, so every model guesses 50:50 there.
+  humans: {
+    easy: { 캐주얼: [0.02, 0.02], 숙련: [0.005, 0.005], 완벽지각: [0, 0] },
+    normal: { 캐주얼: [0.04, 0.04], 숙련: [0.01, 0.01], 완벽지각: [0, 0] },
+    hardest: { 캐주얼: [0.1, 0.2], 숙련: [0.03, 0.06], 완벽지각: [0, 0] },
   },
+  festival: { pPlay: 0.8, pReplay: 0.25, maxSessions: 3 },
 };
 
-// ---------------------------------------------------------------------------
-// RNG (sim only)
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------- RNG (sim only)
 function splitmix32(seed) {
   let a = seed | 0;
   return () => {
@@ -62,34 +56,25 @@ function sfc32(a, b, c, d) {
   return () => {
     a >>>= 0; b >>>= 0; c >>>= 0; d >>>= 0;
     let t = (a + b) | 0;
-    a = b ^ (b >>> 9);
-    b = (c + (c << 3)) | 0;
-    c = (c << 21) | (c >>> 11);
-    d = (d + 1) | 0;
-    t = (t + d) | 0;
-    c = (c + t) | 0;
+    a = b ^ (b >>> 9); b = (c + (c << 3)) | 0; c = (c << 21) | (c >>> 11);
+    d = (d + 1) | 0; t = (t + d) | 0; c = (c + t) | 0;
     return (t >>> 0) / 4294967296;
   };
 }
 const sm = splitmix32(SEED);
 const rng = sfc32(sm(), sm(), sm(), sm());
-for (let i = 0; i < 24; i++) rng();
 const randInt = (n) => Math.floor(rng() * n);
-const pickWeighted = (list) => { let r = rng(); for (const x of list) { if ((r -= x.w) < 0) return x; } return list[list.length - 1]; };
 
-// ---------------------------------------------------------------------------
-// PART A. Honest shuffle plan generator + ideal-observer ceiling
-// (mirrors src/game/shuffle.ts generatePlan)
-//   swap(a,b)    two cups trade slots on separated arcs; trackable in principle
-//   rotate(dir)  all 3 cups move one slot at once; trackable in principle
-//   overlap(a,b) both cups meet at ONE point, coincide, then leave along the same
-//                two return paths. Hidden coin: pass (they really trade) or bounce
-//                (they really return). The renderer is identity-free, so frames are
-//                identical for both outcomes: zero information for any observer.
+// ---------------------------------------------------------------- A. shuffle plan (mirrors src/game/shuffle.ts)
+// Slots are positions 0,1,2 (left to right). Move semantics (same as the Move type in DESIGN.md section 8):
+//   swap(a,b)          the cups at slots a and b trade slots (separated arcs, trackable in principle)
+//   rotate(dir)        the cup at slot i moves to slot (i + dir) % 3, all three at once (trackable in principle)
+//   overlap(a,b,pass)  the cups at a and b meet at ONE point, fully coincide, then leave on the same two paths.
+//                      pass = true: they trade slots like swap. pass = false: each returns to its own slot.
+//                      Cups are identical and z-order depends only on position, so both look identical.
 // Ideal observer: swap/rotate permute the belief vector, overlap averages the pair.
-// ceiling = max(posterior) = the best hit rate ANY observer can reach on that round.
-// Acceptance uses only visible structure + visible start, never the coins.
-// ---------------------------------------------------------------------------
+// ceiling = max(belief) = best hit rate ANY observer can reach on that plan.
+// Plans with ceiling > cMax are redrawn. Acceptance never looks at the coins.
 const PAIRS = [[0, 1], [1, 2], [0, 2]];
 
 function drawMoves(sh) {
@@ -100,68 +85,49 @@ function drawMoves(sh) {
   for (let k = 0; k < n; k++) {
     const r = rng() * tot;
     const durMs = Math.round(sh.moveMs[0] + rng() * (sh.moveMs[1] - sh.moveMs[0]));
-    if (r < overlap) { const [a, b] = PAIRS[randInt(3)]; moves.push({ kind: 'overlap', a, b, durMs: Math.round(durMs * sh.overlapMsMult) }); }
+    if (r < overlap) { const [a, b] = PAIRS[randInt(3)]; moves.push({ kind: 'overlap', a, b, durMs: Math.round(durMs * CFG.timing.overlapMsMult) }); }
     else if (r < overlap + rotate) moves.push({ kind: 'rotate', dir: rng() < 0.5 ? 1 : 2, durMs });
     else { const [a, b] = PAIRS[randInt(3)]; moves.push({ kind: 'swap', a, b, durMs }); }
   }
   return moves;
 }
 
-function posterior(start, moves) {
+function belief(start, moves) {
   let p = [0, 0, 0];
   p[start] = 1;
   for (const m of moves) {
-    if (m.kind === 'swap') { const x = p[m.a]; p[m.a] = p[m.b]; p[m.b] = x; }
+    if (m.kind === 'swap') [p[m.a], p[m.b]] = [p[m.b], p[m.a]];
     else if (m.kind === 'rotate') { const q = [0, 0, 0]; for (let i = 0; i < 3; i++) q[(i + m.dir) % 3] = p[i]; p = q; }
     else { const avg = (p[m.a] + p[m.b]) / 2; p[m.a] = avg; p[m.b] = avg; }
   }
   return p;
 }
 
-function trace(start, moves, coins) {
+// Slot of the ball's cup after every move (the fold of applyMove in the app).
+function ballSlot(start, moves) {
   let pos = start;
-  moves.forEach((m, i) => {
-    if (m.kind === 'swap' || (m.kind === 'overlap' && coins[i])) { if (pos === m.a) pos = m.b; else if (pos === m.b) pos = m.a; }
+  for (const m of moves) {
+    if (m.kind === 'swap' || (m.kind === 'overlap' && m.pass)) { if (pos === m.a) pos = m.b; else if (pos === m.b) pos = m.a; }
     else if (m.kind === 'rotate') pos = (pos + m.dir) % 3;
-  });
-  return pos;
-}
-
-function makeAcceptor(ceiling) {
-  if (!ceiling || ceiling.mode === 'none') return () => true;
-  if (ceiling.mode === 'maxPosterior') return (post) => Math.max(...post) <= ceiling.cMax + 1e-12;
-  if (ceiling.mode === 'shape') {
-    // the target shape for THIS round is drawn first (visible-only information)
-    const shape = pickWeighted(ceiling.shapes.map((s) => ({ ...s, w: s.weight }))).shape;
-    return (post) => [...post].sort((x, y) => y - x).every((v, i) => Math.abs(v - shape[i]) < 1e-9);
   }
-  throw new Error('unknown ceiling mode ' + ceiling.mode);
+  return pos;
 }
 
 function generatePlan(sh) {
   const start = randInt(3);
-  const accept = makeAcceptor(sh.ceiling);
   for (let tries = 1; ; tries++) {
     const moves = drawMoves(sh);
-    const post = posterior(start, moves);
-    if (accept(post)) {
-      const coins = moves.map((m) => (m.kind === 'overlap' ? rng() < 0.5 : false)); // drawn AFTER acceptance
-      const final = trace(start, moves, coins);
-      const ms = moves.reduce((s, m) => s + m.durMs, 0);
-      return { start, moves, coins, post, ceiling: Math.max(...post), final, tries, ms };
+    const post = belief(start, moves);
+    const ceiling = Math.max(...post);
+    if (sh.cMax == null || ceiling <= sh.cMax + 1e-12) {
+      for (const m of moves) if (m.kind === 'overlap') m.pass = rng() < 0.5; // coins drawn AFTER acceptance
+      return { start, moves, post, ceiling, final: ballSlot(start, moves), tries, ms: moves.reduce((s, m) => s + m.durMs, 0) };
     }
-    if (tries > 100000) throw new Error('ceiling rule unreachable');
+    if (tries > 100000) throw new Error('cMax unreachable with this shuffle config');
   }
 }
 
-// Ideal Bayesian observer (perfect eyes, slow-motion video): picks argmax posterior.
-function bayesPick(plan) {
-  const mx = Math.max(...plan.post);
-  const best = [0, 1, 2].filter((i) => Math.abs(plan.post[i] - mx) < 1e-12);
-  return best[randInt(best.length)];
-}
-// Human-like tracker with ONE hypothesis; loses the cup with prob es / er on plain moves.
-function humanPick(plan, es, er) {
+function humanPick(plan, [es, er]) {
   let h = plan.start;
   for (const m of plan.moves) {
     if (m.kind === 'swap') {
@@ -169,400 +135,224 @@ function humanPick(plan, es, er) {
     } else if (m.kind === 'rotate') {
       const nh = (h + m.dir) % 3;
       h = rng() < er ? [0, 1, 2].filter((x) => x !== nh)[randInt(2)] : nh;
-    } else if (h === m.a || h === m.b) {
-      if (rng() < 0.5) h = h === m.a ? m.b : m.a;
-    }
+    } else if ((h === m.a || h === m.b) && rng() < 0.5) h = h === m.a ? m.b : m.a;
   }
   return h;
 }
 
 function partA() {
   const out = {};
-  for (const [key, tier] of Object.entries(CFG.tiers)) {
-    const sh = tier.shuffle;
-    const models = ASSUME.humanModels[key] || [];
-    let tries = 0, maxTries = 0, sumC = 0, maxC = 0, bayes = 0, rand = 0, startPick = 0, midPick = 0, moves = 0, overlaps = 0, rotations = 0, ms = 0;
+  for (const [id, lv] of Object.entries(CFG.levels)) {
+    const models = Object.entries(ASSUME.humans[id] || {});
+    let moves = 0, overlaps = 0, rotations = 0, ms = 0, tries = 0, maxTries = 0, sumC = 0, maxC = 0, random = 0;
     const human = models.map(() => 0);
-    const fgs = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
-    const hist = new Map();
+    const grid = [[0, 0, 0], [0, 0, 0], [0, 0, 0]];
     for (let i = 0; i < N_ROUNDS; i++) {
-      const r = generatePlan(sh);
-      tries += r.tries; if (r.tries > maxTries) maxTries = r.tries;
-      sumC += r.ceiling; if (r.ceiling > maxC) maxC = r.ceiling;
-      const hk = r.ceiling.toFixed(4); hist.set(hk, (hist.get(hk) || 0) + 1);
-      moves += r.moves.length; ms += r.ms;
+      const r = generatePlan(lv.shuffle);
+      moves += r.moves.length; ms += r.ms; tries += r.tries; maxTries = Math.max(maxTries, r.tries);
       for (const m of r.moves) { if (m.kind === 'overlap') overlaps++; else if (m.kind === 'rotate') rotations++; }
-      fgs[r.start][r.final]++;
-      if (bayesPick(r) === r.final) bayes++;
-      if (randInt(3) === r.final) rand++;
-      if (r.start === r.final) startPick++;
-      if (r.final === 1) midPick++;
-      models.forEach((h, j) => { if (humanPick(r, h.es, h.er) === r.final) human[j]++; });
+      sumC += r.ceiling; maxC = Math.max(maxC, r.ceiling);
+      grid[r.start][r.final]++;
+      if (randInt(3) === r.final) random++;
+      models.forEach(([, e], j) => { if (humanPick(r, e) === r.final) human[j]++; });
     }
     let chi2 = 0;
-    for (const row of fgs) { const s = row[0] + row[1] + row[2]; for (const x of row) chi2 += (x - s / 3) ** 2 / (s / 3); }
-    const top = [...hist.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([c, n]) => `${c} (${pct(n / N_ROUNDS, 0)})`);
-    out[key] = {
-      label: tier.label, rounds: N_ROUNDS,
-      meanMoves: moves / N_ROUNDS, meanOverlaps: overlaps / N_ROUNDS, meanRotations: rotations / N_ROUNDS,
-      meanShuffleSec: ms / N_ROUNDS / 1000, meanTries: tries / N_ROUNDS, maxTries,
-      meanCeiling: sumC / N_ROUNDS, maxCeiling: maxC, ceilingTop: top,
-      bayesHit: bayes / N_ROUNDS, randomHit: rand / N_ROUNDS, startCupHit: startPick / N_ROUNDS, middleHit: midPick / N_ROUNDS,
-      human: Object.fromEntries(models.map((h, j) => [h.name, human[j] / N_ROUNDS])),
-      chi2FinalGivenStart: chi2,
+    for (const row of grid) { const s = row[0] + row[1] + row[2]; for (const x of row) chi2 += (x - s / 3) ** 2 / (s / 3); }
+    out[id] = {
+      label: lv.label, paid: lv.paid, meanMoves: moves / N_ROUNDS, meanOverlaps: overlaps / N_ROUNDS, meanRotations: rotations / N_ROUNDS,
+      shuffleSec: ms / N_ROUNDS / 1000, meanTries: tries / N_ROUNDS, maxTries, ideal: sumC / N_ROUNDS, maxCeiling: maxC,
+      random: random / N_ROUNDS, chi2, human: Object.fromEntries(models.map(([name], j) => [name, human[j] / N_ROUNDS])),
     };
   }
   return out;
 }
 
-// ---------------------------------------------------------------------------
-// PART B. Session economy, EXACT (dynamic programming over (rounds, stack)).
-// Rules (mirror src/game/economy.ts):
-//   * fee is charged together with the first committed round
-//   * a stake is allowed only if: stack covers fee+stake,
-//     net - fee - stake >= -lossLimit, and (capMode 'block') a win cannot push net above winCap
-//   * capMode 'stopAfter' (used only by rejected variants): play until net >= winCap
-// ---------------------------------------------------------------------------
-const POLICIES = {
-  playAll: ({ allowed }) => [{ bet: allowed[0], w: 1 }],
-  maxBet: ({ allowed }) => [{ bet: allowed[allowed.length - 1], w: 1 }],
-  randomBet: ({ allowed }) => allowed.map((b) => ({ bet: b, w: 1 / allowed.length })),
-  mixed7030: ({ allowed }) => (allowed.length === 1 ? [{ bet: allowed[0], w: 1 }] : [{ bet: allowed[0], w: 0.7 }, { bet: allowed[allowed.length - 1], w: 0.3 }]),
-  quitter: ({ r, net, allowed }) => (r > 0 && (net >= 4 || net <= -5) ? [{ bet: null, w: 1 }] : [{ bet: allowed[0], w: 1 }]),
-};
-
-function normEcon(e) { return { capMode: 'block', ...e, bets: [...e.bets].sort((x, y) => x.stake - y.stake) }; }
-
-function allowedBets(econ, stack, net, feeDue) {
-  return econ.bets.filter((b) => stack - feeDue - b.stake >= 0
-    && net - feeDue - b.stake >= -econ.lossLimit
-    && (econ.capMode !== 'block' || net - feeDue - b.stake + b.returnOnWin <= econ.winCap));
-}
-function blockedReason(econ, stack, net, feeDue) {
-  const b = econ.bets[0];
-  if (stack - feeDue - b.stake < 0) return 'broke';
-  if (net - feeDue - b.stake < -econ.lossLimit) return 'lossLimit';
-  return 'winCap';
+// ---------------------------------------------------------------- B. session rules, EXACT (mirrors src/game/session.ts)
+// Staff takes buyIn chips; the fee is taken at once, so stack = buyIn - fee. After each round (= before the next) the session ENDS if
+//   net >= winCap ('clear')  |  stack < stake ('broke': game chips used up)  |  rounds used up ('rounds').
+// net = stack - buyIn, so the worst result is -buyIn.
+function endReason(e, stack, r) {
+  if (e.winCap != null && stack - e.buyIn >= e.winCap) return 'clear';
+  if (stack < e.stake) return 'broke';
+  if (r >= e.maxRounds) return 'rounds';
+  return null;
 }
 
-function exactSession(econIn, p, policyName = 'playAll', { buyIn = 10, maxRounds } = {}) {
-  const econ = normEcon(econIn);
-  const R = maxRounds ?? econ.maxRounds;
-  const policy = POLICIES[policyName];
+function exactSession(e, p) {
   const add = (m, k, v) => m.set(k, (m.get(k) || 0) + v);
-  let cur = new Map([[buyIn, 1]]);
+  let cur = new Map([[e.buyIn - e.fee, 1]]);
   const dist = new Map();
-  const ends = { rounds: 0, lossLimit: 0, winCap: 0, broke: 0, quit: 0 };
-  let eWag = 0, eFee = 0, eRounds = 0, pBust = 0;
+  const ends = { clear: 0, broke: 0, rounds: 0 };
+  let eRounds = 0;
   for (let r = 0; cur.size; r++) {
     const next = new Map();
     for (const [stack, pr] of cur) {
-      const net = stack - buyIn;
-      const feeDue = r === 0 ? econ.fee : 0;
-      let reason = null, acts = null;
-      if (r >= R) reason = 'rounds';
-      else if (econ.capMode === 'stopAfter' && net >= econ.winCap) reason = 'winCap';
-      else {
-        const allowed = allowedBets(econ, stack, net, feeDue);
-        if (!allowed.length) reason = blockedReason(econ, stack, net, feeDue);
-        else acts = policy({ r, net, allowed });
-      }
-      if (reason) { ends[reason] += pr; add(dist, net, pr); if (stack === 0) pBust += pr; continue; }
-      for (const { bet, w } of acts) {
-        const q = pr * w;
-        if (!bet) { ends.quit += q; add(dist, net, q); if (stack === 0) pBust += q; continue; }
-        eWag += q * bet.stake; eFee += q * feeDue; eRounds += q;
-        const after = stack - feeDue - bet.stake;
-        add(next, after + bet.returnOnWin, q * p);
-        add(next, after, q * (1 - p));
-      }
+      const why = endReason(e, stack, r);
+      if (why) { ends[why] += pr; add(dist, stack - e.buyIn, pr); continue; }
+      eRounds += pr;
+      add(next, stack - e.stake + e.returnOnWin, pr * p);
+      add(next, stack - e.stake, pr * (1 - p));
     }
     cur = next;
   }
-  const keys = [...dist.keys()].sort((a, b) => a - b);
+  const keys = [...dist.keys()].sort((a, b) => a - b).filter((k) => dist.get(k) > 1e-12);
   let mean = 0, m2 = 0;
-  for (const k of keys) { const v = dist.get(k); mean += k * v; m2 += k * k * v; }
-  const q = (x) => { let c = 0; for (const k of keys) { c += dist.get(k); if (c >= x - 1e-12) return k; } return keys[keys.length - 1]; };
-  const live = keys.filter((k) => dist.get(k) > 1e-12);
+  for (const k of keys) { mean += k * dist.get(k); m2 += k * k * dist.get(k); }
+  const q = (x) => { let c = 0; for (const k of keys) { c += dist.get(k); if (c >= x - 1e-12) return k; } return keys.at(-1); };
   const P = (pred) => keys.filter(pred).reduce((s, k) => s + dist.get(k), 0);
+  const paidIn = eRounds * e.stake + e.fee;
   return {
-    p, mean, sd: Math.sqrt(Math.max(0, m2 - mean * mean)),
-    p5: q(0.05), p25: q(0.25), p50: q(0.5), p75: q(0.75), p95: q(0.95),
-    min: live[0], max: live[live.length - 1],
-    pAhead: P((k) => k > 0), pEvenOrBetter: P((k) => k >= 0), pLose5: P((k) => k <= -5), pGain5: P((k) => k >= 5),
-    pBust, ends, eRounds, eWag, eFee,
-    rtp: 1 + mean / (eWag + eFee),
-    dist: Object.fromEntries(keys.map((k) => [k, dist.get(k)])),
+    p, mean, sd: Math.sqrt(Math.max(0, m2 - mean * mean)), p5: q(0.05), p50: q(0.5), p95: q(0.95), min: keys[0], max: keys.at(-1),
+    pEven: P((k) => k >= 0), pGain5: P((k) => k >= 5), ends, eRounds,
+    rtp: (paidIn + mean) / paidIn, dist: Object.fromEntries(keys.map((k) => [k, dist.get(k)])),
   };
 }
 
-function breakEven(econ, policy = 'playAll', opts = {}) {
-  let lo = 0.2, hi = 0.7;
-  for (let i = 0; i < 50; i++) { const mid = (lo + hi) / 2; if (exactSession(econ, mid, policy, opts).mean < 0) lo = mid; else hi = mid; }
+function breakEven(e) {
+  let lo = 0.2, hi = 0.8;
+  for (let i = 0; i < 50; i++) { const mid = (lo + hi) / 2; if (exactSession(e, mid).mean < 0) lo = mid; else hi = mid; }
   return (lo + hi) / 2;
 }
 
-// Monte Carlo session (same rules) used inside the festival sim, where hits must be tracked for the guard.
-function mcSession(econ, p, policyName, buyIn, maxRounds) {
-  const R = maxRounds ?? econ.maxRounds;
-  const policy = POLICIES[policyName];
-  let stack = buyIn, rounds = 0, hits = 0, wag = 0, fee = 0;
-  for (;;) {
-    const net = stack - buyIn;
-    const feeDue = rounds === 0 ? econ.fee : 0;
-    if (rounds >= R) break;
-    if (econ.capMode === 'stopAfter' && net >= econ.winCap) break;
-    const allowed = allowedBets(econ, stack, net, feeDue);
-    if (!allowed.length) break;
-    const acts = policy({ r: rounds, net, allowed });
-    let u = rng(), bet = acts[acts.length - 1].bet;
-    for (const a of acts) { if ((u -= a.w) < 0) { bet = a.bet; break; } }
-    if (!bet) break;
-    stack -= feeDue + bet.stake; fee += feeDue; wag += bet.stake; rounds++;
-    if (rng() < p) { stack += bet.returnOnWin; hits++; }
-  }
-  return { net: stack - buyIn, rounds, hits, wag, fee };
+function mcSession(e, p) {
+  let stack = e.buyIn - e.fee, r = 0;
+  while (!endReason(e, stack, r)) { stack -= e.stake; if (rng() < p) stack += e.returnOnWin; r++; }
+  return stack - e.buyIn;
 }
 
-// ---------------------------------------------------------------------------
-// PART C. Festival day (booth bankruptcy risk), Monte Carlo
-// ---------------------------------------------------------------------------
-function wilsonLB(h, n, z) {
-  if (n === 0) return 0;
-  const ph = h / n, z2 = z * z;
-  return (ph + z2 / (2 * n) - z * Math.sqrt((ph * (1 - ph) + z2 / (4 * n)) / n)) / (1 + z2 / n);
-}
-
-function simFestivalDay(scn, guard) {
-  const V = CFG.booth.expectedVisitorsPerDay, C = CFG.booth.chipsPerVisitor;
-  const econ = normEcon(CFG.tiers.hardest.economy);
-  const maxRounds = CFG.booth.busyMode ? econ.busyMaxRounds : econ.maxRounds;
-  let outstanding = 0, booth = 0, boothMin = 0, sessions = 0, rounds = 0, maxVisitor = 0, n = 0, h = 0, paused = false, stopped = false;
+// ---------------------------------------------------------------- E. festival day (booth budget), Monte Carlo
+function festivalDay(scn) {
+  const V = CFG.booth.expectedVisitors, C = CFG.booth.chipsPerVisitor;
+  let outstanding = 0, sessions = 0;
   for (let v = 0; v < V; v++) {
     let chips = C;
     if (rng() < scn.pPlay) {
-      const p = pickWeighted(scn.skill).p;
-      const pol = pickWeighted(scn.policies).name;
+      const p = scn.skill[randInt(scn.skill.length)];
       for (let s = 0; s < scn.maxSessions; s++) {
         if (s > 0 && rng() >= scn.pReplay) break;
-        if (guard && (paused || stopped)) break;
-        if (chips < econ.minBuyIn) break;
-        const r = mcSession(econ, p, pol, Math.min(econ.maxBuyIn, chips), maxRounds);
-        chips += r.net; sessions++; rounds += r.rounds;
-        booth -= r.net; if (booth < boothMin) boothMin = booth;
-        n += r.rounds; h += r.hits;
-        if (guard) {
-          if (n >= guard.minRounds && wilsonLB(h, n, guard.z) > guard.pauseAt.hardest) paused = true;
-          if (booth < guard.boothStopLoss) stopped = true;
-        }
+        if (chips < ECON.buyIn) break;
+        chips += mcSession(ECON, p);
+        sessions++;
       }
     }
-    outstanding += chips; if (chips > maxVisitor) maxVisitor = chips;
+    outstanding += chips;
   }
-  return { issued: V * C, outstanding, booth, boothMin, sessions, rounds, maxVisitor, paused, stopped };
+  return { issued: V * C, outstanding, booth: V * C - outstanding, sessions };
 }
 
-function quantile(sorted, q) { return sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(q * (sorted.length - 1))))]; }
+// ---------------------------------------------------------------- output helpers
+const MINUS = '−';
+const pct = (x, d = 1) => (100 * x).toFixed(d) + '%';
+const f = (x, d = 2) => Number(x).toFixed(d);
+const sg = (x) => (x > 0 ? '+' + x : String(x).replace('-', MINUS));
+const sgf = (x, d = 2) => { const v = Number(x); const s = v.toFixed(d); if (Number(s) === 0) return (0).toFixed(d); return v > 0 ? '+' + s : s.replace('-', MINUS); };
+const table = (head, rows) => ['| ' + head.join(' | ') + ' |', '|' + head.map(() => '---').join('|') + '|', ...rows.map((r) => '| ' + r.join(' | ') + ' |')].join('\n');
+const quant = (sorted, x) => sorted[Math.min(sorted.length - 1, Math.max(0, Math.floor(x * (sorted.length - 1))))];
+const n0 = (x) => Math.round(x).toLocaleString('en-US');
 
-function partC(A, sessionSec) {
-  const H = A.hardest;
-  const skillReal = [
-    { p: 1 / 3, w: 0.4 }, { p: H.human['캐주얼'], w: 0.35 }, { p: H.human['숙련'], w: 0.2 }, { p: H.human['완벽 지각'], w: 0.05 },
-  ];
-  const scenarios = {
-    '현실적 혼합': { pPlay: 0.8, pReplay: 0.25, maxSessions: 3, skill: skillReal, policies: [{ name: 'playAll', w: 0.85 }, { name: 'quitter', w: 0.15 }] },
-    '최악(누수 없음): 전원 이상적 관찰자, 3세션': { pPlay: 1, pReplay: 1, maxSessions: 3, skill: [{ p: H.meanCeiling, w: 1 }], policies: [{ name: 'playAll', w: 1 }] },
-    '고장: 렌더링 누수로 전원 p=0.40, 3세션': { pPlay: 1, pReplay: 1, maxSessions: 3, skill: [{ p: 0.4, w: 1 }], policies: [{ name: 'playAll', w: 1 }] },
-  };
-  const out = [];
-  for (const [name, scn] of Object.entries(scenarios)) {
-    for (const guard of [null, CFG.guard]) {
-      const nets = [], outs = [], mins = [];
-      let exceed = 0, sessions = 0, rounds = 0, maxVisitor = 0, pausedDays = 0, stoppedDays = 0;
-      for (let f = 0; f < N_FEST; f++) {
-        const r = simFestivalDay(scn, guard);
-        nets.push(r.booth); outs.push(r.outstanding / r.issued); mins.push(r.boothMin);
-        if (r.outstanding > r.issued) exceed++;
-        sessions += r.sessions; rounds += r.rounds;
-        if (r.maxVisitor > maxVisitor) maxVisitor = r.maxVisitor;
-        if (r.paused) pausedDays++;
-        if (r.stopped) stoppedDays++;
-      }
-      nets.sort((a, b) => a - b); outs.sort((a, b) => a - b); mins.sort((a, b) => a - b);
-      const mean = nets.reduce((a, b) => a + b, 0) / N_FEST;
-      const spd = sessions / N_FEST;
-      out.push({
-        scenario: name, guard: !!guard, days: N_FEST, issued: CFG.booth.expectedVisitorsPerDay * CFG.booth.chipsPerVisitor,
-        boothMean: mean, boothPerVisitor: mean / CFG.booth.expectedVisitorsPerDay, boothPerSession: mean / spd,
-        boothP1: quantile(nets, 0.01), boothMin: nets[0], runningMinP1: quantile(mins, 0.01),
-        pOverBudget: exceed / N_FEST, outP50: quantile(outs, 0.5), outP99: quantile(outs, 0.99),
-        sessionsPerDay: spd, roundsPerDay: rounds / N_FEST, staffHours: (spd * sessionSec) / 3600,
-        maxVisitor, pPaused: pausedDays / N_FEST, pStopLoss: stoppedDays / N_FEST,
-      });
-    }
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// PART D. Leak alarm power (Wilson one-sided lower bound, checked every 10 rounds after 60)
-// ---------------------------------------------------------------------------
-function partD(A) {
-  const g = CFG.guard, hc = A.hardest.meanCeiling;
-  const cases = [['WARN (LB > 평균 상한)', hc], ['PAUSE (LB > ' + g.pauseAt.hardest + ')', g.pauseAt.hardest]];
-  const ps = [1 / 3, hc, 0.36, 0.38, 0.4, 0.45];
-  const out = [];
-  for (const [name, thr] of cases) {
-    for (const pTrue of ps) {
-      let fired = 0; const at = [];
-      for (let t = 0; t < N_ALARM; t++) {
-        let h = 0;
-        for (let n = 1; n <= ALARM_HORIZON; n++) {
-          if (rng() < pTrue) h++;
-          if (n >= g.minRounds && n % g.checkEvery === 0 && wilsonLB(h, n, g.z) > thr) { fired++; at.push(n); break; }
-        }
-      }
-      at.sort((a, b) => a - b);
-      out.push({ alarm: name, threshold: thr, pTrue, pFire: fired / N_ALARM, medianRounds: at.length ? quantile(at, 0.5) : null });
-    }
-  }
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// Output helpers
-// ---------------------------------------------------------------------------
-function pct(x, d = 1) { return (100 * x).toFixed(d) + '%'; }
-function f(x, d = 2) { return Number(x).toFixed(d); }
-function sg(x) { return x > 0 ? '+' + x : String(x); }
-function sgf(x, d = 2) { const s = Number(x).toFixed(d); return x > 0 ? '+' + s : s; }
-function table(head, rows) {
-  const lines = ['| ' + head.join(' | ') + ' |', '|' + head.map(() => '---').join('|') + '|'];
-  for (const r of rows) lines.push('| ' + r.join(' | ') + ' |');
-  return lines.join('\n');
-}
-
-// ---------------------------------------------------------------------------
-// Run
-// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------- compute
 const t0 = Date.now();
-const results = { generatedAt: new Date().toISOString(), seed: SEED, quick: QUICK, config: CONFIG_PATH };
-const H = normEcon(CFG.tiers.hardest.economy);
-const NE = normEcon(CFG.tiers.normal.economy);
-
-console.log(`# 야바위 시뮬레이션 결과 (seed ${SEED}${QUICK ? ', quick' : ''}, config ${CONFIG_PATH.replace(ROOT + '/', '')})\n`);
-
-// ---- A
 const A = partA();
-results.shuffle = A;
-console.log(`## A. 셔플 생성기와 이상적 관찰자 상한 (난이도마다 ${N_ROUNDS.toLocaleString()}판)\n`);
-console.log(table(
-  ['난이도', '동작 수', '겹치기/회전', '셔플 시간', '생성 시도 평균/최대', '상한 평균 / 최대', '상한 분포(상위)', '이상적 베이즈', '완벽 지각', '숙련', '캐주얼', '시작 컵 고정', '가운데 고정', '무작위', 'χ²(6df)'],
-  Object.values(A).map((r) => [
-    r.label, f(r.meanMoves, 1), `${f(r.meanOverlaps, 1)} / ${f(r.meanRotations, 1)}`, f(r.meanShuffleSec, 1) + 's', `${f(r.meanTries, 1)} / ${r.maxTries}`,
-    `${f(r.meanCeiling, 4)} / ${f(r.maxCeiling, 4)}`, r.ceilingTop.join(', '),
-    f(r.bayesHit, 4), f(r.human['완벽 지각'], 4), f(r.human['숙련'], 4), f(r.human['캐주얼'], 4),
-    f(r.startCupHit, 4), f(r.middleHit, 4), f(r.randomHit, 4), f(r.chi2FinalGivenStart, 1),
-  ]),
-));
-console.log(`\nχ²(최종 위치 | 시작 위치, 자유도 6) 99% 임계값 = 16.81. 표준오차(적중률) ≈ ${f(Math.sqrt(0.25 / N_ROUNDS), 4)}.\n`);
+const H = A.hardest;
+const cMax = CFG.levels.hardest.shuffle.cMax ?? H.maxCeiling;
+const be = breakEven(ECON);
+const S = exactSession(ECON, 1 / 3);
+const SI = exactSession(ECON, H.ideal);
+const SC = exactSession(ECON, cMax);
+const ECON6 = { ...ECON, maxRounds: 6 };
+const S6 = exactSession(ECON6, 1 / 3);
+const [rLo, rHi] = ECON.maxRoundsRange;
+const worstInRange = Math.max(...Array.from({ length: rHi - rLo + 1 }, (_, i) => exactSession({ ...ECON, maxRounds: rLo + i }, cMax).mean));
 
-// ---- B1: hardest by hit rate
-const be = breakEven(H);
-const beBusy = breakEven(H, 'playAll', { maxRounds: H.busyMaxRounds });
-results.breakEven = { hardest: be, hardestBusy: beBusy };
-const hc = A.hardest.meanCeiling;
-const gridH = [0.3, 1 / 3, hc, CFG.tiers.hardest.shuffle.ceiling.cMax, 0.35, 0.36, be, 0.4, 0.45];
-const label = (p) => (Math.abs(p - 1 / 3) < 1e-9 ? '1/3 (무작위, 사람 대부분)' : Math.abs(p - hc) < 1e-9 ? f(p, 4) + ' (이상적 관찰자 평균)' : Math.abs(p - be) < 1e-9 ? f(p, 4) + ' (세션 손익분기)' : Math.abs(p - CFG.tiers.hardest.shuffle.ceiling.cMax) < 1e-9 ? f(p, 5) + ' (판별 상한 cMax)' : f(p, 2));
-const sessRow = (r, perRound) => [
-  perRound, pct(r.rtp), sgf(r.mean), f(r.sd), sg(r.p5), sg(r.p50), sg(r.p95), `${sg(r.min)} / ${sg(r.max)}`,
-  pct(r.pBust), pct(r.ends.lossLimit), pct(r.ends.winCap), pct(r.pEvenOrBetter), f(r.eRounds, 2), sgf(-r.mean),
+const real = [1 / 3, H.human['캐주얼'], H.human['숙련'], H.human['완벽지각']];
+const scenarios = [
+  [`현실적: ${pct(ASSUME.festival.pPlay, 0)} 플레이, ${pct(ASSUME.festival.pReplay, 0)} 재도전(최대 ${ASSUME.festival.maxSessions}세션)`, { ...ASSUME.festival, skill: real }],
+  ['최악(정상 셔플): 전원 이상적 관찰자, 전원 3세션', { pPlay: 1, pReplay: 1, maxSessions: 3, skill: [H.ideal] }],
+  ['버그 가정: 셔플 화면이 새서 전원 p = 0.40, 3세션', { pPlay: 1, pReplay: 1, maxSessions: 3, skill: [0.4] }],
 ];
-const sessHead = ['한 판 RTP', '세션 RTP', '평균', '표준편차', 'p5', 'p50', 'p95', '최소 / 최대', '파산(0칩)', '손실한도 도달', '최대획득 도달', '본전 이상', '평균 판수', '부스/방문자'];
-const B1 = gridH.map((p) => ({ p, ...exactSession(H, p, 'playAll') }));
-results.hardestSessions = B1.map(({ dist, ...r }) => r);
-console.log(`## B1. 최상 (1칩 걸고 맞히면 3칩, 참가비 1칩, ${H.maxRounds}판, 최대 +${H.winCap}, 손실 한도 ${H.lossLimit}, 버이인 10) — 정확 계산\n`);
-console.log(table(['적중률 p', ...sessHead], B1.map((r) => [label(r.p), ...sessRow(r, pct(r.p * 3))])));
-console.log(`\n세션 손익분기 적중률 = ${f(be, 4)} (바쁨 모드 ${H.busyMaxRounds}판: ${f(beBusy, 4)}). 이상적 관찰자 평균 상한과의 여유 = ${f(be - hc, 4)}. 부스/방문자 = 방문자 1명이 이 조건으로 1세션 할 때 부스가 얻는 칩.`);
-const d13 = B1[1].dist;
-console.log(`\np = 1/3 정확 분포 (버이인 10): ` + Object.entries(d13).map(([k, v]) => [Number(k), v]).sort((a, b) => a[0] - b[0]).filter(([, v]) => v > 1e-6).map(([k, v]) => `${sg(k)}: ${pct(v, 2)}`).join(', ') + '\n');
-
-// ---- B2: buy-in sensitivity
-console.log(`## B2. 최상, 버이인별 (p = 1/3 / 이상적 관찰자) — 정확 계산. 기본 최소 버이인 = ${H.minBuyIn} (3, 5는 참고용)\n`);
-const B2 = [];
-for (const buyIn of [3, 5, 7, 8, 10]) for (const p of [1 / 3, hc]) B2.push({ buyIn, ...exactSession(H, p, 'playAll', { buyIn }) });
-results.buyInSensitivity = B2.map(({ dist, ...r }) => r);
-console.log(table(['버이인', 'p', '세션 RTP', '평균', 'p5', 'p50', 'p95', '최소 / 최대', '파산(0칩)', '손실한도 도달'],
-  B2.map((r) => [r.buyIn, f(r.p, 4), pct(r.rtp), sgf(r.mean), sg(r.p5), sg(r.p50), sg(r.p95), `${sg(r.min)} / ${sg(r.max)}`, pct(r.pBust), pct(r.ends.lossLimit)])));
-console.log('');
-
-// ---- B3: hardest variants
-console.log('## B3. 최상 규칙 대안 비교 (버이인 10) — 정확 계산\n');
-const base = CFG.tiers.hardest.economy;
-const variants = [
-  ['**채택**: 1→3, 참가비 1, 8판, +10 상한, 손실 6', base, 'playAll', {}],
-  [`바쁨 모드: ${base.busyMaxRounds}판`, base, 'playAll', { maxRounds: base.busyMaxRounds }],
-  ['6판', base, 'playAll', { maxRounds: 6 }],
-  ['중도 정산 정책(+4 / −5에서 그만)', base, 'quitter', {}],
-  ['참가비 없음', { ...base, fee: 0 }, 'playAll', {}],
-  ['참가비 2 (누수 의심 시 비상 설정)', { ...base, fee: 2 }, 'playAll', {}],
-  ['10판', { ...base, maxRounds: 10 }, 'playAll', {}],
-  ['1~2칩 허용(1→3, 2→6), 항상 최대', { ...base, bets: [{ stake: 1, returnOnWin: 3 }, { stake: 2, returnOnWin: 6 }] }, 'maxBet', {}],
-  ['손실 한도 없음', { ...base, lossLimit: 10 }, 'playAll', {}],
-  ['제안 P안: 2→5, 참가비 없음, 5판, 보호 4칩, +10 도달 시 종료', { ...base, fee: 0, bets: [{ stake: 2, returnOnWin: 5 }], maxRounds: 5, capMode: 'stopAfter' }, 'playAll', {}],
-  ['제안 R안: 2→5 / 4→10, 8판, 손실 6, +10 도달 시 종료, 70:30 베팅', { ...base, fee: 0, bets: [{ stake: 2, returnOnWin: 5 }, { stake: 4, returnOnWin: 10 }], maxRounds: 8, capMode: 'stopAfter' }, 'mixed7030', {}],
-];
-const B3 = variants.map(([name, econ, pol, opts]) => {
-  const a = exactSession(econ, 1 / 3, pol, opts), b = exactSession(econ, hc, pol, opts), c = exactSession(econ, 0.4, pol, opts);
-  return { name, a, b, c, be: breakEven(econ, pol, opts) };
+const E = scenarios.map(([name, scn]) => {
+  const nets = []; let over = 0, sessions = 0;
+  for (let d = 0; d < N_DAYS; d++) { const r = festivalDay(scn); nets.push(r.booth); if (r.outstanding > r.issued) over++; sessions += r.sessions; }
+  nets.sort((a, b) => a - b);
+  return { name, mean: nets.reduce((a, b) => a + b, 0) / N_DAYS, p1: quant(nets, 0.01), worst: nets[0], over: over / N_DAYS, sessions: sessions / N_DAYS };
 });
-results.hardestVariants = B3.map(({ name, a, b, c, be: x }) => ({ name, breakEven: x, p333: strip(a), ideal: strip(b), p40: strip(c) }));
-function strip({ dist, ...r }) { return r; }
-console.log(table(['규칙', '세션 RTP (1/3 / 이상적)', '평균 (1/3 / 이상적 / 0.40)', '표준편차', 'p5 / p50 / p95 (1/3)', '최소 / 최대', '손실 ≥5칩 확률', '본전 이상', '평균 판수', '세션 손익분기 p'],
-  B3.map(({ name, a, b, c, be: x }) => [name, `${pct(a.rtp)} / ${pct(b.rtp)}`, `${sgf(a.mean)} / ${sgf(b.mean)} / ${sgf(c.mean)}`, f(a.sd), `${sg(a.p5)} / ${sg(a.p50)} / ${sg(a.p95)}`, `${sg(a.min)} / ${sg(a.max)}`, pct(a.pLose5), pct(a.pEvenOrBetter), f(a.eRounds, 1), f(x, 3)])));
-console.log('');
 
-// ---- B4: normal if it were paid (reference only)
-console.log(`## B4. (참고, 채택 안 함) 보통을 유료로 켤 경우: 1→2 / 2→4, 참가비 없음, ${NE.maxRounds}판 — 정확 계산\n`);
-const nc = A.normal.meanCeiling;
-const gridN = [1 / 3, 0.4, A.normal.human['캐주얼'], A.normal.human['숙련'], nc, 0.5, 0.55];
-const B4 = [];
-for (const p of gridN) for (const pol of ['playAll', 'maxBet']) B4.push({ pol, ...exactSession(NE, p, pol) });
-results.normalPaidReference = B4.map(strip);
-console.log(table(['적중률 p', '베팅', ...sessHead],
-  B4.map((r) => [Math.abs(r.p - 1 / 3) < 1e-9 ? '1/3' : Math.abs(r.p - nc) < 1e-9 ? f(r.p, 4) + ' (이상적 관찰자)' : f(r.p, 4), r.pol === 'playAll' ? '항상 1칩' : '항상 2칩', ...sessRow(r, pct(r.p * 2))])));
-console.log(`\n보통 이상적 관찰자 상한 ${f(nc, 4)} vs 손익분기 0.5000 → 누수 여유 ${f(0.5 - nc, 4)} (가드 최소 ${CFG.guard.minLeakMargin}). 일부 판은 상한이 정확히 0.5라 그 판의 여유는 0.\n`);
-
-// ---- throughput
 const T = CFG.timing;
-const roundSec = (T.showBallMs + A.hardest.meanShuffleSec * 1000 + ASSUME.pickAvgMs + T.revealMs + T.resultMs) / 1000;
-const freeRoundSec = (T.showBallMs + A.normal.meanShuffleSec * 1000 + ASSUME.pickAvgMs + T.revealMs + T.resultMs) / 1000;
-const sessionSec = ASSUME.sessionOverheadSec + B1[1].eRounds * roundSec + ASSUME.warmupRoundsAvg * freeRoundSec;
-const busySessionSec = ASSUME.sessionOverheadSec + exactSession(H, 1 / 3, 'playAll', { maxRounds: H.busyMaxRounds }).eRounds * roundSec;
-results.throughput = { roundSec, freeRoundSec, sessionSec, sessionsPerHour: 3600 / sessionSec, busySessionSec, busySessionsPerHour: 3600 / busySessionSec };
+const roundSec = (T.showBallMs + H.shuffleSec * 1000 + T.revealMs + T.resultMs) / 1000 + ASSUME.pickSec;
+const sessionSec = ASSUME.sessionOverheadSec + S.eRounds * roundSec;
+const session6Sec = ASSUME.sessionOverheadSec + S6.eRounds * roundSec;
 
-// ---- C
-const C = partC(A, sessionSec);
-results.festival = C;
-console.log(`## C. 축제 하루 (방문자 ${CFG.booth.expectedVisitorsPerDay}명 × ${CFG.booth.chipsPerVisitor}칩 = ${CFG.booth.expectedVisitorsPerDay * CFG.booth.chipsPerVisitor}칩 발행, ${N_FEST.toLocaleString()}일 반복, 칩 게임은 최상만)\n`);
-console.log(table(['시나리오', '가드', '부스 순이익 평균', '방문자당', '세션당', 'p1', '최악', '발행량 초과 확률', '남은 칩 p50 / p99', '세션/일', '직원 시간', '최다 보유 방문자', '자동 일시정지', '손절 발동'],
-  C.map((r) => [r.scenario, r.guard ? '켬' : '끔', sgf(r.boothMean, 0), sgf(r.boothPerVisitor), sgf(r.boothPerSession), sg(r.boothP1), sg(r.boothMin), pct(r.pOverBudget, 2), `${pct(r.outP50)} / ${pct(r.outP99)}`, f(r.sessionsPerDay, 0), f(r.staffHours, 1) + 'h', r.maxVisitor, pct(r.pPaused, 2), pct(r.pStopLoss, 2)])));
-console.log('\n현실적 혼합: 방문자 80%가 플레이, 추가 세션 확률 25%(최대 3세션, 칩이 최소 버이인 이상일 때만). 실력 분포 40% 무작위(1/3), 35% 캐주얼, 20% 숙련, 5% 완벽 지각(적중률은 A표 값). 85% 끝까지 플레이, 15% 중도 정산.\n');
+// ---------------------------------------------------------------- summary (pasted verbatim into DESIGN.md section 4)
+const issued = CFG.booth.expectedVisitors * CFG.booth.chipsPerVisitor;
+const lvLine = (id) => { const r = A[id]; return `  - ${r.label}: ${f(r.human['캐주얼'], 3)} / ${f(r.human['숙련'], 3)} / ${f(r.human['완벽지각'], 3)} / ${f(r.ideal, 3)}, 셔플 ${f(r.shuffleSec, 1)}초`; };
+console.log(`## 요약 (seed ${SEED}${QUICK ? ', quick' : ''}, config ${CONFIG_PATH.replace(ROOT + '/', '')})\n`);
+console.log([
+  `- 최상 규칙: 칩 ${ECON.buyIn}개를 받는다 (참가비 ${ECON.fee} + 게임 칩 ${ECON.buyIn - ECON.fee}). 한 판 ${ECON.stake}칩, 맞히면 ${ECON.returnOnWin}칩. 최대 ${ECON.maxRounds}판. 게임 칩이 0개가 되거나 +${ECON.winCap}칩 이상 따면 끝.`,
+  `- 적중률 1/3 (사람 대부분): 세션 평균 ${sgf(S.mean)}칩, 세션 RTP ${pct(S.rtp)} (한 판 RTP ${pct((ECON.returnOnWin / 3) / ECON.stake)}). 결과 ${sg(S.min)} … ${sg(S.max)}, p5 / p50 / p95 = ${sg(S.p5)} / ${sg(S.p50)} / ${sg(S.p95)}, 평균 ${f(S.eRounds, 1)}판.`,
+  `- 같은 조건에서 ${ECON.buyIn}칩을 모두 잃는 세션 ${pct(S.ends.broke)}, 본전 이상 ${pct(S.pEven)}, +5칩 이상 ${pct(S.pGain5)}, 클리어 ${pct(S.ends.clear)}.`,
+  `- 최대 판수를 6으로 줄이면: 평균 ${sgf(S6.mean)}칩, 세션 RTP ${pct(S6.rtp)}, ${ECON.buyIn}칩을 모두 잃는 세션 ${pct(S6.ends.broke)}, 결과 ${sg(S6.min)} … ${sg(S6.max)}, 평균 ${f(S6.eRounds, 1)}판.`,
+  `- 이상적 관찰자 (모든 프레임을 슬로모션으로 보는 완벽한 관찰자): 최상 적중률 평균 ${f(H.ideal, 4)} → 세션 평균 ${sgf(SI.mean)}칩. 어떤 판도 cMax = ${f(cMax, 4)}보다 높지 않다. 세션 손익분기 적중률은 ${f(be, 4)}.`,
+  `- 매 판 ${f(cMax, 4)}로 쳐도 세션 평균 ${sgf(SC.mean)}칩이고, 관리자가 고를 수 있는 최대 판수 ${rLo}~${rHi} 어디서나 ${sgf(worstInRange)}칩 이하다.`,
+  `- 난이도별 적중률 (캐주얼 / 숙련 / 완벽 지각 / 이상적 관찰자)과 셔플 길이`,
+  lvLine('easy'), lvLine('normal'), lvLine('hardest'),
+  `- 쉬움·보통에 1칩 걸고 2칩을 주면 완벽 지각만으로 RTP ${pct(2 * A.easy.human['완벽지각'], 0)} / ${pct(2 * A.normal.human['완벽지각'], 0)} → 부스가 진다. 그래서 무료 연습판이다.`,
+  `- 축제 하루 (${CFG.booth.expectedVisitors}명 × ${CFG.booth.chipsPerVisitor}칩 = ${n0(issued)}칩 발행, ${n0(N_DAYS)}일): 현실적 시나리오에서 부스 평균 ${sgf(E[0].mean, 0)}칩, 나쁜 날(p1) ${sg(E[0].p1)}칩, 가장 나쁜 날 ${sg(E[0].worst)}칩. 상품 예산(발행 칩)을 넘은 날 ${pct(E[0].over, 2)}. 전원 이상적 관찰자로 3세션씩 해도 평균 ${sgf(E[1].mean, 0)}칩, 넘은 날 ${pct(E[1].over, 2)}. 렌더링 버그로 전원 p = 0.40이면 평균 ${sgf(E[2].mean, 0)}칩.`,
+  `- 처리량: 한 판 ${f(roundSec, 1)}초, 세션 ${f(sessionSec / 60, 1)}분 → 시간당 약 ${f(3600 / sessionSec, 0)}세션 (최대 6판이면 약 ${f(3600 / session6Sec, 0)}세션).`,
+].join('\n'));
+console.log('\n전체 표는 아래.\n');
 
-// ---- D
-const D = partD(A);
-results.alarm = D;
-console.log(`## D. 누수 경보 탐지력 (최상, Wilson 단측 z=${CFG.guard.z}, ${CFG.guard.minRounds}판 이후 ${CFG.guard.checkEvery}판마다 검사, ${ALARM_HORIZON}판 안에 울릴 확률)\n`);
-console.log(table(['경보', '실제 p', '울릴 확률', '울릴 때까지 판수(중앙값)'], D.map((r) => [r.alarm, f(r.pTrue, 4), pct(r.pFire), r.medianRounds ?? '—'])));
+// ---------------------------------------------------------------- full tables
+console.log(`## A. 난이도별 셔플과 적중률 (난이도마다 ${n0(N_ROUNDS)}판, Monte Carlo)\n`);
+console.log(table(
+  ['난이도', '칩', '동작 수', '겹치기 / 회전', '셔플 시간', '이상적 관찰자 (평균 / 최대)', '완벽 지각', '숙련', '캐주얼', '무작위', 'χ² (최종 vs 시작)'],
+  Object.values(A).map((r) => [r.label, r.paid ? '유료' : '무료', f(r.meanMoves, 1), `${f(r.meanOverlaps, 1)} / ${f(r.meanRotations, 1)}`, f(r.shuffleSec, 1) + 's',
+    `${f(r.ideal, 4)} / ${f(r.maxCeiling, 4)}`, f(r.human['완벽지각'], 4), f(r.human['숙련'], 4), f(r.human['캐주얼'], 4), f(r.random, 4), f(r.chi2, 1)]),
+));
+console.log(`\n이상적 관찰자 = 매 판 사후확률이 가장 큰 칸을 고르는 완벽한 관찰자 (평균 = 기대 적중률, 최대 = 한 판 상한). χ²(자유도 6) 99% 임계값 16.81. 최상 생성 시도 평균 ${f(H.meanTries, 1)}회, 최대 ${H.maxTries}회.\n`);
+
+const grid = [
+  [0.3, '0.30 (못 따라감)'],
+  [1 / 3, '1/3 (사람 대부분)'],
+  [H.ideal, `${f(H.ideal, 4)} (이상적 관찰자 평균)`],
+  [cMax, `${f(cMax, 5)} (한 판 상한 cMax)`],
+  [be, `${f(be, 4)} (세션 손익분기)`],
+  [0.4, '0.40 (버그 가정)'],
+];
+console.log(`## B. 최상: 칩 ${ECON.buyIn}개 (참가비 ${ECON.fee}), ${ECON.stake}칩 걸고 맞히면 ${ECON.returnOnWin}칩, 최대 ${ECON.maxRounds}판, 클리어 +${ECON.winCap} (정확 계산)\n`);
+console.log(table(
+  ['적중률 p', '한 판 RTP', '세션 RTP', '세션 평균', '표준편차', 'p5 / p50 / p95', '최소 / 최대', `${ECON.buyIn}칩 모두 잃음`, '이익 ≥5', '본전 이상', '클리어', '평균 판수'],
+  grid.map(([p, label]) => { const r = exactSession(ECON, p); return [label, pct((p * ECON.returnOnWin) / ECON.stake), pct(r.rtp), sgf(r.mean), f(r.sd), `${sg(r.p5)} / ${sg(r.p50)} / ${sg(r.p95)}`, `${sg(r.min)} / ${sg(r.max)}`,
+    pct(r.ends.broke), pct(r.pGain5), pct(r.pEven), pct(r.ends.clear), f(r.eRounds, 2)]; }),
+));
+console.log(`\n세션 RTP = 돌려받은 칩 / (건 칩 + 참가비). p = 1/3 정확 분포: ` + Object.entries(S.dist).map(([k, v]) => [Number(k), v]).sort((a, b) => a[0] - b[0]).filter(([, v]) => v > 1e-5).map(([k, v]) => `${sg(k)}: ${pct(v, 2)}`).join(', ') + '\n');
+
+console.log('## C. 최상 규칙 대안 (정확 계산)\n');
+const V = [
+  ...Array.from({ length: rHi - rLo + 1 }, (_, i) => rLo + i).map((m) => [m === ECON.maxRounds ? `**최대 ${m}판 (기본값)**` : `최대 ${m}판`, { ...ECON, maxRounds: m }]),
+  ['참가비 없음', { ...ECON, fee: 0 }],
+  ['클리어 없음', { ...ECON, winCap: null }],
+];
+console.log(table(['규칙', '세션 RTP (1/3 / 이상적)', '평균 (1/3 / 이상적 / 0.40)', '표준편차', 'p5 / p50 / p95', '최소 / 최대', `${ECON.buyIn}칩 모두 잃음`, '평균 판수', '손익분기 p'],
+  V.map(([name, e]) => {
+    const a = exactSession(e, 1 / 3), b = exactSession(e, H.ideal), c = exactSession(e, 0.4);
+    return [name, `${pct(a.rtp)} / ${pct(b.rtp)}`, `${sgf(a.mean)} / ${sgf(b.mean)} / ${sgf(c.mean)}`, f(a.sd), `${sg(a.p5)} / ${sg(a.p50)} / ${sg(a.p95)}`, `${sg(a.min)} / ${sg(a.max)}`, pct(a.ends.broke), f(a.eRounds, 1), f(breakEven(e), 3)];
+  })));
+console.log('\n최대 판수와 참가비만 다른 행은 p = 1/3에서 평균이 모두 −참가비다 (한 판이 공정하므로). 판수를 늘리면 RTP는 100%에 가까워지지만 표준편차가 커지고, 칩을 모두 잃는 비율은 줄지 않는다.\n');
+
+console.log('## D. 쉬움·보통에 칩을 걸게 하면? (참고, 1칩 걸고 2칩 받는다고 가정, RTP = 2p)\n');
+console.log(table(['난이도', '캐주얼', '숙련', '완벽 지각', '이상적 관찰자'],
+  ['easy', 'normal'].map((id) => [A[id].label, ...['캐주얼', '숙련', '완벽지각'].map((k) => `${f(A[id].human[k], 3)} → ${pct(2 * A[id].human[k], 0)}`), `${f(A[id].ideal, 3)} → ${pct(2 * A[id].ideal, 0)}`])));
 console.log('');
 
-// ---- throughput print
-console.log('## E. 처리량 (한 대 기준)\n');
-console.log(table(['항목', '값'], [
-  ['최상 한 판 (공 보여주기 + 셔플 + 선택 + 공개 + 결과)', f(roundSec, 1) + 's'],
-  ['세션 (평균 ' + f(B1[1].eRounds, 1) + '판 + 무료 ' + ASSUME.warmupRoundsAvg + '판 + 접수/정산 ' + ASSUME.sessionOverheadSec + 's)', f(sessionSec / 60, 2) + '분 → 시간당 ' + f(3600 / sessionSec, 0) + '세션'],
-  ['바쁨 모드 (' + H.busyMaxRounds + '판, 무료 판 없음)', f(busySessionSec / 60, 2) + '분 → 시간당 ' + f(3600 / busySessionSec, 0) + '세션'],
-]));
+console.log(`## E. 축제 하루 (방문자 ${CFG.booth.expectedVisitors}명 × ${CFG.booth.chipsPerVisitor}칩 = ${n0(issued)}칩 발행, ${n0(N_DAYS)}일 반복)\n`);
+console.log(table(['시나리오', '부스 순이익 평균', 'p1', '최악', '상품 교환 칩 > 발행 칩 확률', '세션/일'],
+  E.map((r) => [r.name, sgf(r.mean, 0), sg(r.p1), sg(r.worst), pct(r.over, 2), f(r.sessions, 0)])));
+console.log(`\n부스 순이익 = 발행 칩 − 하루 끝에 방문자가 가진 칩(= 상품으로 바꿀 칩). 양수면 상품 예산(발행 칩 × 칩 가치) 안에서 끝난다. 칩이 ${ECON.buyIn}개 이상 남은 사람만 다시 할 수 있다.\n`);
 
+console.log('## F. 처리량 (노트북 1대)\n');
+console.log(table(['항목', '값'], [
+  ['최상 한 판 (공 보여주기 + 셔플 + 선택 + 공개 + 결과)', f(roundSec, 1) + '초'],
+  [`세션 (평균 ${f(S.eRounds, 1)}판 + 접수·정산 ${ASSUME.sessionOverheadSec}초)`, `${f(sessionSec / 60, 1)}분 → 시간당 약 ${f(3600 / sessionSec, 0)}세션`],
+  ['최대 판수 6으로 줄이면', `${f(session6Sec / 60, 1)}분 → 시간당 약 ${f(3600 / session6Sec, 0)}세션`],
+]));
 console.log(`\n(실행 시간 ${((Date.now() - t0) / 1000).toFixed(1)}s)`);
-if (JSON_OUT) { writeFileSync(resolve(JSON_OUT), JSON.stringify(results, null, 2)); console.log('wrote ' + resolve(JSON_OUT)); }
