@@ -34,7 +34,7 @@ describe('account', () => {
     expect(a.cash).toBe(1000 - 100 - 1); // fee 0.1% of $1,000
     expect(pos.qty).toBeCloseTo(20); // $1,000 / $50
     expect(pos.margin).toBe(100);
-    expect(liquidationPrice(pos, econ)).toBeCloseTo(50 * (1 - 0.95 / 10));
+    expect(liquidationPrice(pos, econ)).toBeCloseTo(50 * (1 - (1 - econ.maintenance) / 10));
   });
 
   it('rejects bad orders', () => {
@@ -89,6 +89,12 @@ describe('account', () => {
     expect(r.account.positions).toEqual({});
     expect(r.account.cash).toBe(a.cash);
     expect(r.account.liquidations).toBe(1);
+  });
+
+  it('never liquidates a 1× position, however far it falls', () => {
+    const a = ok(buy(newAccount(econ), 'gamestop', 10, 100, 1, econ));
+    expect(liquidationPrice(a.positions.gamestop, econ)).toBe(0);
+    expect(liquidate(a, { gamestop: 0.01 }, econ).fills).toHaveLength(0);
   });
 
   it('never pays out below zero, even after a gap through the liquidation price', () => {

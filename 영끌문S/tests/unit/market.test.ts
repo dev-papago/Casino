@@ -44,17 +44,43 @@ describe('market', () => {
     }
   });
 
-  it('follows the designed tendencies over 3 minutes (average of many games)', () => {
+  it('keeps each tendency over a game while the next seconds stay a coin flip (many games)', () => {
     const rng = seededRng(4);
-    const sums: Record<string, number> = {};
     const N = 200;
+    const GAME = T.sessionSec * SEC;
+    const ups: Record<string, number> = {};
+    const mean: Record<string, number> = {};
+    const persist: Record<string, [number, number]> = {};
     for (let g = 0; g < N; g++) {
       const m = new Market(rng);
-      for (let i = 0; i < 180 * SEC; i++) m.step();
-      for (const s of m.stocks) sums[s.def.id] = (sums[s.def.id] ?? 0) + Math.log(s.price / s.def.start) / N;
+      const last = m.stocks.map((s) => s.price);
+      const moves: number[][] = m.stocks.map(() => []);
+      for (let i = 1; i <= GAME; i++) {
+        m.step();
+        if (i % (10 * SEC)) continue;
+        m.stocks.forEach((s, k) => {
+          moves[k].push(Math.sign(s.price - last[k]));
+          last[k] = s.price;
+        });
+      }
+      m.stocks.forEach((s, k) => {
+        const id = s.def.id;
+        ups[id] = (ups[id] ?? 0) + (s.price > s.def.start ? 1 / N : 0);
+        mean[id] = (mean[id] ?? 0) + (s.price / s.def.start - 1) / N;
+        const p = (persist[id] ??= [0, 0]);
+        for (let j = 1; j < moves[k].length; j++) {
+          p[0] += moves[k][j] === moves[k][j - 1] ? 1 : 0;
+          p[1]++;
+        }
+      });
     }
-    expect(sums.kingka).toBeGreaterThan(0); // safe climb
-    expect(sums.lownix).toBeGreaterThan(sums.kingka); // climbs faster
-    expect(sums.mwodna).toBeLessThan(0); // declines
+    expect(ups.kingka).toBeGreaterThan(0.65); // safe climb
+    expect(mean.lownix).toBeGreaterThan(mean.kingka); // climbs faster on average
+    expect(ups.lownix).toBeGreaterThan(0.55);
+    expect(ups.mwodna).toBeLessThan(0.35); // declines
+    for (const id of ['kingka', 'lownix', 'dolge', 'mwodna']) {
+      const [same, all] = persist[id];
+      expect(same / all, id).toBeLessThan(0.58); // the last 10 s say little about the next 10 s
+    }
   });
 });
