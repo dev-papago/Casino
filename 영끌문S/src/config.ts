@@ -76,13 +76,14 @@ export interface EconomyConfig {
   feeRate: number; // on position size (margin × leverage), when opening and when closing
   maintenance: number; // liquidated once the loss reaches (1 − maintenance) of the margin
   minOrder: number; // smallest margin per order ($); below this with no position the game is over
+  leverageFrom: number; // leverage above 1× needs at least this much equity ($)
 }
 
 export interface GameConfig {
   timing: {
     tickMs: number;
     ticksPerCandle: number;
-    historyCandles: number; // drawn before the game starts, ending at the start price
+    historyCandles: number; // drawn before the game starts, ending at the start price (0: the chart starts empty)
     visibleCandles: number;
     keepCandles: number;
   };
@@ -91,8 +92,8 @@ export interface GameConfig {
 }
 
 export const CONFIG: GameConfig = {
-  timing: { tickMs: 100, ticksPerCandle: 10, historyCandles: 150, visibleCandles: 90, keepCandles: 600 },
-  economy: { deposit: 1000, leverages: [1, 2, 5, 10, 20], feeRate: 0.001, maintenance: 0.05, minOrder: 10 },
+  timing: { tickMs: 100, ticksPerCandle: 10, historyCandles: 0, visibleCandles: 90, keepCandles: 600 },
+  economy: { deposit: 1000, leverages: [1, 2, 5, 10, 20], feeRate: 0.001, maintenance: 0.05, minOrder: 10, leverageFrom: 2000 },
   stocks: [
     {
       id: 'kingka',
@@ -105,9 +106,9 @@ export const CONFIG: GameConfig = {
       bounds: [0.5, 3],
       model: {
         kind: 'steady',
-        vol: 0.0012,
-        up: { drift: 0.00035, meanSec: 30 },
-        down: { drift: -0.0005, meanSec: 12 },
+        vol: 0.0003,
+        up: { drift: 0.00035, meanSec: 45 },
+        down: { drift: -0.0005, meanSec: 18 },
       },
     },
     {

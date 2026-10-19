@@ -7,11 +7,11 @@ const T = CONFIG.timing;
 const SEC = 1000 / T.tickMs;
 
 describe('market', () => {
-  it('opens with a full history that ends at each start price', () => {
+  it('opens at each start price with the configured history', () => {
     const m = new Market(seededRng(1));
     for (const s of m.stocks) {
       expect(s.candles).toHaveLength(T.historyCandles);
-      expect(s.candles[s.candles.length - 1].c).toBeCloseTo(s.def.start, 6);
+      if (s.candles.length) expect(s.candles[s.candles.length - 1].c).toBeCloseTo(s.def.start, 6);
       expect(s.price).toBe(s.def.start);
       expect(s.live).toEqual({ o: s.def.start, h: s.def.start, l: s.def.start, c: s.def.start });
     }
@@ -47,7 +47,7 @@ describe('market', () => {
   it('follows the designed tendencies over 3 minutes (average of many games)', () => {
     const rng = seededRng(4);
     const sums: Record<string, number> = {};
-    const N = 60;
+    const N = 200;
     for (let g = 0; g < N; g++) {
       const m = new Market(rng);
       for (let i = 0; i < 180 * SEC; i++) m.step();

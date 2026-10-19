@@ -96,6 +96,7 @@ export function mountApp(root: HTMLElement): void {
 
   // Right: account
   const accEquity = h('div', { class: 'acc-equity', 'data-testid': 'equity' });
+  const accRate = h('span', { class: 'acc-rate', 'data-testid': 'equity-rate' });
   const accPnl = h('div', { class: 'acc-pnl' });
   const accCash = h('dd', { 'data-testid': 'cash' });
   const accInvested = h('dd', {});
@@ -107,6 +108,7 @@ export function mountApp(root: HTMLElement): void {
     h('button', { class: 'seg-btn', type: 'button', 'data-testid': `lev-${L}`, onclick: () => setLeverage(L) }, `${L}×`),
   );
   const levNote = h('div', { class: 'note', hidden: true }, '보유 중인 레버리지로 고정');
+  const levLockNote = h('div', { class: 'note', 'data-testid': 'lev-lock', hidden: true }, `평가 자산 ${usd(econ.leverageFrom, 0)}부터 레버리지 사용 가능`);
   const amountInput = h('input', {
     class: 'amount-input',
     type: 'text',
@@ -144,6 +146,7 @@ export function mountApp(root: HTMLElement): void {
     h('div', { class: 'field-label' }, '레버리지'),
     h('div', { class: 'seg' }, ...levBtns),
     levNote,
+    levLockNote,
     h('div', { class: 'field-label' }, '증거금 (투자 금액)'),
     h(
       'div',
@@ -220,7 +223,7 @@ export function mountApp(root: HTMLElement): void {
         'div',
         { class: 'panel account' },
         h('div', { class: 'panel-title' }, '평가 자산'),
-        accEquity,
+        h('div', { class: 'acc-equity-row' }, accEquity, accRate),
         accPnl,
         h('dl', { class: 'rows' }, h('dt', {}, '주문 가능 예탁금'), accCash, h('dt', {}, '투자 중 (평가)'), accInvested),
       ),
@@ -253,7 +256,7 @@ export function mountApp(root: HTMLElement): void {
   }
 
   function setLeverage(L: number): void {
-    if (account.positions[selected]) return;
+    if (account.positions[selected] || (L > 1 && leverageLocked())) return;
     leverage = L;
     sfx.play('click');
     render();
@@ -284,12 +287,14 @@ export function mountApp(root: HTMLElement): void {
   }
 
   const effectiveLeverage = (): number => account.positions[selected]?.leverage ?? leverage;
+  /** Leverage above 1× opens once the equity reaches econ.leverageFrom. */
+  const leverageLocked = (): boolean => equity(account, market.prices()) < econ.leverageFrom;
   const current = (): Stock => market.get(selected);
 
   function doBuy(): void {
     if (screen !== 'trade') return;
     const st = current();
-    const r = buy(account, selected, st.price, amount, effectiveLeverage(), econ);
+    const r = buy(account, selected, st.price, amount, effectiveLeverage(), econ, equity(account, market.prices()));
     applyTrade(r, st);
   }
 
@@ -348,7 +353,7 @@ export function mountApp(root: HTMLElement): void {
   function startGame(): void {
     sfx.unlock();
     sfx.play('start');
-    market = new Market(rng);
+    // The market was created fresh for the title screen and has not moved since.
     account = newAccount(econ);
     extremes = freshExtremes(market);
     prevPrices = market.prices();
@@ -383,6 +388,16 @@ export function mountApp(root: HTMLElement): void {
     setScreen('result');
   }
 
+  /** Back to the title with a fresh, still market (the next game starts from it). */
+  function backToTitle(): void {
+    sfx.play('click');
+    market = new Market(rng);
+    extremes = freshExtremes(market);
+    prevPrices = market.prices();
+    chart.reset();
+    setScreen('title');
+  }
+
   function setScreen(s: Screen): void {
     screen = s;
     root.dataset.screen = s;
@@ -404,7 +419,7 @@ export function mountApp(root: HTMLElement): void {
             { class: 'rules' },
             h('li', {}, `기본예탁금 `, h('b', {}, usd(econ.deposit, 0)), '으로 시작합니다'),
             h('li', {}, '좌측 종목을 골라 차트를 보고 우측에서 매수 / 매도'),
-            h('li', {}, `레버리지 최대 `, h('b', {}, `${Math.max(...econ.leverages)}배`), ' — 청산가에 닿으면 증거금 전액 손실'),
+            h('li', {}, `평가 자산 `, h('b', {}, usd(econ.leverageFrom, 0)), `부터 레버리지 최대 `, h('b', {}, `${Math.max(...econ.leverages)}배`), ' — 청산가에 닿으면 증거금 전액 손실'),
             h('li', {}, `매수·매도 때 주문 규모의 ${num(econ.feeRate * 100, 1)}% 수수료`),
           ),
           button('게임 시작', () => startGame(), { kind: 'primary', key: 'Enter', testid: 'start' }),
@@ -453,8 +468,7 @@ export function mountApp(root: HTMLElement): void {
             h('dd', {}, usd(a.fees)),
           ),
           button('처음으로', () => {
-            sfx.play('click');
-            setScreen('title');
+            backToTitle();
           }, { kind: 'primary', key: 'Enter', testid: 'restart' }),
         ),
       );
@@ -508,7 +522,9 @@ export function mountApp(root: HTMLElement): void {
     const eq = equity(account, prices);
     const net = eq - econ.deposit;
     setText(accEquity, usd(eq));
-    setText(accPnl, `${signedUsd(net)} (${pct(net / econ.deposit)})`);
+    setText(accRate, pct(net / econ.deposit));
+    setTone(accRate, net);
+    setText(accPnl, `${signedUsd(net)} (기본예탁금 ${usd(econ.deposit, 0)} 대비)`);
     setTone(accPnl, net);
     setText(accCash, usd(account.cash));
     setText(accInvested, usd(eq - account.cash));
@@ -518,12 +534,15 @@ export function mountApp(root: HTMLElement): void {
     sideSell.classList.toggle('active', side === 'sell');
     buyPane.hidden = side !== 'buy';
     sellPane.hidden = side !== 'sell';
+    const locked = eq < econ.leverageFrom;
+    if (!pos && locked) leverage = 1; // fell below the line: back to 1×
     const L = effectiveLeverage();
     levBtns.forEach((b, i) => {
       b.classList.toggle('active', econ.leverages[i] === L);
-      b.disabled = !!pos && econ.leverages[i] !== L;
+      b.disabled = pos ? econ.leverages[i] !== L : locked && econ.leverages[i] > 1;
     });
     levNote.hidden = !pos;
+    levLockNote.hidden = !locked;
     if (document.activeElement !== amountInput && amountInput.value !== (amount ? String(amount) : '')) {
       amountInput.value = amount ? String(amount) : '';
     }
@@ -536,7 +555,13 @@ export function mountApp(root: HTMLElement): void {
     const entryAfter = pos ? (pos.qty * pos.entry + size) / (pos.qty + size / st.price) : st.price;
     setText(pvLiq, usd(liquidationPrice({ qty: 0, entry: entryAfter, margin: 0, leverage: L }, econ), d));
     const buyError =
-      amount < econ.minOrder ? `최소 주문 ${usd(econ.minOrder, 0)}` : amount + fee > account.cash + 1e-9 ? TRADE_ERROR_TEXT.cash : '';
+      L > 1 && locked
+        ? TRADE_ERROR_TEXT.locked
+        : amount < econ.minOrder
+          ? `최소 주문 ${usd(econ.minOrder, 0)}`
+          : amount + fee > account.cash + 1e-9
+            ? TRADE_ERROR_TEXT.cash
+            : '';
     setText(buyMsg, buyError);
     buyBtn.disabled = screen !== 'trade' || !!buyError;
 
@@ -663,7 +688,7 @@ export function mountApp(root: HTMLElement): void {
     if (e.key === 'Enter' && (screen === 'title' || screen === 'result')) {
       e.preventDefault();
       if (screen === 'title') startGame();
-      else setScreen('title');
+      else backToTitle();
     } else if (e.key === 'Escape' && screen === 'confirm') {
       setScreen('trade');
     } else if ((e.key === 'm' || e.key === 'M') && !e.repeat) {
@@ -704,6 +729,11 @@ export function mountApp(root: HTMLElement): void {
     const now = performance.now();
     owed += (now - lastAt) / T.tickMs;
     lastAt = now;
+    // The title screen shows a frozen market; drop the time so the game does not start with a catch-up.
+    if (screen === 'title') {
+      owed = 0;
+      return;
+    }
     let n = Math.floor(owed);
     owed -= n;
     if (n === 0) return;

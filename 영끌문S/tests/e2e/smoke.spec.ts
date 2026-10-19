@@ -12,6 +12,10 @@ test('a game from the title screen to the settlement', async ({ page }) => {
   await expect(app).toHaveAttribute('data-screen', 'trade');
   await expect(page.getByTestId('cash')).toHaveText('$1,000.00');
 
+  // Leverage stays locked until the equity reaches econ.leverageFrom ($2,000).
+  await expect(page.getByTestId('lev-5')).toBeDisabled();
+  await expect(page.getByTestId('lev-lock')).toBeVisible();
+
   // Selecting a tab shows that stock's description.
   await page.getByTestId('tab-mwodna').click();
   await expect(page.getByTestId('detail-desc')).toContainText('암 백신');

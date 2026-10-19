@@ -5,7 +5,7 @@
 // buying more of a stock you hold must use the same leverage, and the entry price becomes the average.
 // The position is liquidated once its loss reaches (1 − maintenance) of the margin: the player loses
 // the whole margin and never more (cash cannot go negative).
-import type { EconomyConfig } from '../config.ts';
+import { CONFIG, type EconomyConfig } from '../config.ts';
 
 export interface Position {
   qty: number;
@@ -34,13 +34,14 @@ export interface Fill {
   cashDelta: number;
 }
 
-export type TradeError = 'amount' | 'cash' | 'leverage' | 'position' | 'price';
+export type TradeError = 'amount' | 'cash' | 'leverage' | 'locked' | 'position' | 'price';
 export type TradeResult = { ok: true; account: Account; fill: Fill } | { ok: false; error: TradeError };
 
 export const TRADE_ERROR_TEXT: Record<TradeError, string> = {
   amount: '주문 금액을 확인하세요',
   cash: '예탁금이 부족합니다',
   leverage: '보유 중인 레버리지로만 추가 매수할 수 있습니다',
+  locked: `레버리지는 평가 자산 $${CONFIG.economy.leverageFrom.toLocaleString('en-US')}부터 쓸 수 있습니다`,
   position: '보유 수량이 없습니다',
   price: '가격 오류',
 };
@@ -86,11 +87,13 @@ export function buy(
   margin: number,
   leverage: number,
   econ: EconomyConfig,
+  assets = acc.cash, // equity at the current prices; leverage above 1× needs econ.leverageFrom
 ): TradeResult {
   if (!(price > 0) || !Number.isFinite(price)) return { ok: false, error: 'price' };
   margin = cents(margin);
   if (!Number.isFinite(margin) || margin < econ.minOrder) return { ok: false, error: 'amount' };
   if (!econ.leverages.includes(leverage)) return { ok: false, error: 'leverage' };
+  if (leverage > 1 && !(assets >= econ.leverageFrom)) return { ok: false, error: 'locked' };
   const held = acc.positions[stockId];
   if (held && held.leverage !== leverage) return { ok: false, error: 'leverage' };
   const fee = openFee(margin, leverage, econ);

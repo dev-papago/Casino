@@ -14,7 +14,8 @@ import {
   type TradeResult,
 } from '../../src/game/account.ts';
 
-const econ = CONFIG.economy;
+// Leverage unlocks at econ.leverageFrom; most tests use it from the first trade.
+const econ = { ...CONFIG.economy, leverageFrom: 0 };
 const ok = (r: TradeResult): Account => {
   if (!r.ok) throw new Error(`trade failed: ${r.error}`);
   return r.account;
@@ -45,6 +46,15 @@ describe('account', () => {
     const held = ok(buy(a, 'kingka', 50, 100, 5, econ));
     expect(buy(held, 'kingka', 50, 100, 10, econ)).toEqual({ ok: false, error: 'leverage' });
     expect(sell(a, 'kingka', 50, 1, econ)).toEqual({ ok: false, error: 'position' });
+  });
+
+  it('leverage above 1× needs the equity to reach leverageFrom', () => {
+    const real = CONFIG.economy;
+    const a = newAccount(real);
+    expect(buy(a, 'kingka', 50, 100, 5, real)).toEqual({ ok: false, error: 'locked' }); // defaults to cash
+    expect(buy(a, 'kingka', 50, 100, 5, real, real.leverageFrom - 0.01)).toEqual({ ok: false, error: 'locked' });
+    expect(buy(a, 'kingka', 50, 100, 5, real, real.leverageFrom).ok).toBe(true);
+    expect(buy(a, 'kingka', 50, 100, 1, real, 0).ok).toBe(true); // 1× is always open
   });
 
   it('adding to a position averages the entry and keeps margin = qty × entry / leverage', () => {

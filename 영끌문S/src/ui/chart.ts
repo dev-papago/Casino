@@ -100,13 +100,13 @@ export class CandleChart {
     // Candles
     const slot = P.w / this.visible;
     const body = Math.max(1, slot * 0.66);
-    const offset = this.visible - candles.length;
     ctx.save();
     ctx.beginPath();
     ctx.rect(P.x, 0, P.w, h);
     ctx.clip();
     candles.forEach((c, i) => {
-      const cx = P.x + (offset + i + 0.5) * slot;
+      // A game starts with only the live candle: candles fill in from the left edge, then scroll.
+      const cx = P.x + (i + 0.5) * slot;
       const color = c.c >= c.o ? UP : DOWN;
       const yo = yOf(c.o);
       const yc = yOf(c.c);
@@ -132,7 +132,7 @@ export class CandleChart {
     const live = stock.live;
     const lastColor = live.c >= live.o ? UP : DOWN;
     this.hline(stock.price, lastColor, '', d, rem, yOf, false);
-    this.last = { x: P.x + (this.visible - 0.5) * slot, y: clamp(yOf(stock.price), P.y, P.y + P.h) };
+    this.last = { x: P.x + (candles.length - 0.5) * slot, y: clamp(yOf(stock.price), P.y, P.y + P.h) };
   }
 
   private ease(candles: readonly Candle[]): void {
