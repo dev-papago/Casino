@@ -1,8 +1,8 @@
 // Screens and the round flow (DESIGN.md sections 1, 3, 7, 8). UI phases live in memory;
-// the session and stats are saved at start, at pick (before the reveal), at quit and at 지급 완료.
+// the session and stats are saved at start, at pick (before the reveal), at 정산 and at 지급 완료.
 import { Sfx } from '../audio';
-import { CONFIG, saveSettings, sessionEconomy, type Settings } from '../config';
-import { quit, resumePhase, sessionNet, settleRound, startSession, type Session } from '../game/session';
+import { CONFIG, LEVEL_IDS, PAID_LEVELS, saveSettings, sessionEconomy, type LevelId, type Settings } from '../config';
+import { betAmount, maxBetFor, quit, resumePhase, sessionNet, settleRound, startSession, type Session } from '../game/session';
 import { generatePlan, moveTimes, type CupId, type Plan, type Slot } from '../game/shuffle';
 import { cryptoRng } from '../rng';
 import { emptyStats, recordPayout, recordRound, saveState, type SavedState } from '../storage';
@@ -15,7 +15,6 @@ import { END_TEXT, chipDelayMs, chipIcon, confirmCard, settlementCard } from './
 export type Screen = 'idle' | 'confirm' | 'pin' | 'admin' | 'game' | 'settlement';
 export type Phase = 'ready' | 'showBall' | 'shuffling' | 'picking' | 'reveal' | 'result';
 type Mode = 'paid' | 'practice';
-type PracticeLevel = 'easy' | 'normal';
 
 export interface Boot {
   settings: Settings;
@@ -23,10 +22,10 @@ export interface Boot {
   speed: number; // animation speed-up, ?speed=N (e2e only)
 }
 
-const PRACTICE_LEVELS: readonly PracticeLevel[] = ['easy', 'normal'];
 const ALL_CUPS: readonly CupId[] = [0, 1, 2];
 const OVERLAP_NOTE = '겹친 컵은 지나갈 수도, 튕겨 돌아갈 수도 있어요 (반반)';
 const DEMO_LEVEL = 'normal';
+const MAX_PILE = 40; // chips drawn and ticked on the settlement card
 const DEMO_RATE = 0.45; // the idle demo runs slower than real time
 const TITLE_CLICKS = 5;
 const TITLE_GAP_MS = 1500;
@@ -49,10 +48,13 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
   let screen: Screen = 'idle';
   let phase: Phase = 'ready';
   let mode: Mode = 'paid';
-  let level: PracticeLevel = 'easy';
+  let level: LevelId = 'easy'; // practice level
+  let paidLevel: LevelId = PAID_LEVELS[0]; // paid: level and bet picked before each round
+  let bet = 1;
   let tally = { rounds: 0, hits: 0 }; // this practice visit only
   let plan: Plan | null = null;
   let lastWin = false;
+  let lastDelta = 0;
   let roundToken = 0; // bumps to abandon an async round sequence
   let demoToken = 0;
   let titleClicks = { n: 0, at: 0 };
@@ -107,6 +109,8 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     if (e.key === 'Escape' && (screen === 'confirm' || screen === 'pin' || screen === 'admin')) return showIdle();
     if (screen !== 'game') return;
     const digit = '123'.indexOf(e.key);
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') return void (e.preventDefault(), stepLevel(e.key === 'ArrowLeft' ? -1 : 1));
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') return void (e.preventDefault(), stepBet(e.key === 'ArrowUp' ? 1 : -1));
     if (space) void startRound();
     else if (e.key === 'Enter') void next();
     else if (digit >= 0) void pick(digit as Slot);
@@ -156,16 +160,15 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     banner.hidden = true;
     badge.textContent = '';
     cups.setPickable(false);
-    const e = CONFIG.economy;
     status.replaceChildren(
-      h('div', { class: 'pill' }, chipIcon(), `칩 ${e.buyIn}개 = 참가비 ${e.fee} + 게임 칩 ${e.buyIn - e.fee}`),
-      h('div', { class: 'pill' }, `한 판 ${e.stake}칩 · 맞히면 ${e.returnOnWin}칩`),
-      h('div', { class: 'pill' }, `최대 ${settings.maxRounds}판`),
-      h('div', { class: 'pill' }, `+${e.winCap}칩 따면 클리어`),
+      h('div', { class: 'pill' }, chipIcon(), `시작 칩 ${CONFIG.economy.buyIn}개`),
+      h('div', { class: 'pill' }, PAID_LEVELS.map((id) => `${CONFIG.levels[id].label} ×${CONFIG.levels[id].multiplier}`).join(' · ')),
+      h('div', { class: 'pill' }, '맞히면 판돈 × 배율만큼 얻고, 틀리면 같은 만큼 잃어요'),
+      h('div', { class: 'pill' }, `한 판 최대 ${settings.maxBet}칩`),
     );
     message.replaceChildren(
       h('div', { class: 'msg-main' }, '컵 속의 공을 찾아라!'),
-      h('div', { class: 'msg-sub' }, `${OVERLAP_NOTE} · 쉬움·보통 연습은 무료`),
+      h('div', { class: 'msg-sub' }, `${OVERLAP_NOTE} · 정산할 때까지 계속 · 연습은 무료`),
     );
     controls.replaceChildren(
       button('새 손님', showConfirm, { kind: 'primary', testid: 'new-guest' }),
@@ -232,6 +235,7 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     mode = m;
     tally = { rounds: 0, hits: 0 };
     plan = null;
+    clampChoice();
     overlay.replaceChildren();
     setScreen('game');
     cups.reset();
@@ -248,9 +252,9 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
   async function startRound(): Promise<void> {
     if (screen !== 'game' || phase !== 'ready') return;
     const s = session();
-    if (mode === 'paid' && (!s || s.ended)) return;
+    if (mode === 'paid' && (!s || s.ended || bet < 1 || bet > maxBetFor(s, paidLevel))) return;
     const token = ++roundToken;
-    const p = generatePlan(mode === 'paid' ? 'hardest' : level, CONFIG, rng);
+    const p = generatePlan(mode === 'paid' ? paidLevel : level, CONFIG, rng);
     plan = p;
     // Show the ball under cup `start`, then lower the cup; the ball leaves the DOM before the shuffle.
     cups.reset();
@@ -289,7 +293,9 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     const s = session();
     if (mode === 'paid') {
       if (!s) return;
-      persist({ session: settleRound(s, slot, p), stats: recordRound(state.stats, 'hardest', win) });
+      const next = settleRound(s, p.level, bet, slot, p);
+      lastDelta = next.rounds[next.rounds.length - 1].delta;
+      persist({ session: next, stats: recordRound(state.stats, p.level, win) });
     } else {
       persist({ ...state, stats: recordRound(state.stats, p.level, win) });
       tally = { rounds: tally.rounds + 1, hits: tally.hits + (win ? 1 : 0) };
@@ -315,11 +321,11 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     if (win) {
       sfx.play('win');
       if (mode === 'paid') flyChip();
+      if (mode === 'paid' && lastDelta >= 10) sfx.play('clear', 450);
     } else {
       sfx.play('lose');
       cups.shake(picked, ms(T.resultMs * 0.6));
     }
-    if (mode === 'paid' && session()?.ended === 'clear') sfx.play('clear', 450);
   }
 
   async function next(): Promise<void> {
@@ -328,7 +334,46 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     roundToken++;
     cups.lowerAll(ms(260));
     sfx.play('drop', ms(200));
+    clampChoice();
     setPhase('ready');
+  }
+
+  // ------------------------------------------------------------ paid: level and bet for the next round
+  /** Keeps the chosen level playable and the bet within 1..maxBet for the current stack. */
+  function clampChoice(): void {
+    const s = session();
+    if (mode !== 'paid' || !s) return;
+    if (maxBetFor(s, paidLevel) < 1) paidLevel = PAID_LEVELS.find((id) => maxBetFor(s, id) >= 1) ?? PAID_LEVELS[0];
+    bet = Math.max(1, Math.min(bet, maxBetFor(s, paidLevel)));
+  }
+
+  function chooseLevel(id: LevelId): void {
+    const s = session();
+    if (screen !== 'game' || phase !== 'ready' || mode !== 'paid' || !s || maxBetFor(s, id) < 1) return;
+    paidLevel = id;
+    clampChoice();
+    renderGame();
+  }
+
+  function stepLevel(dir: -1 | 1): void {
+    if (mode === 'practice') {
+      if (phase !== 'ready' && phase !== 'result') return;
+      const i = LEVEL_IDS.indexOf(level) + dir;
+      if (i >= 0 && i < LEVEL_IDS.length) level = LEVEL_IDS[i];
+      return renderGame();
+    }
+    const s = session();
+    if (!s) return;
+    for (let i = PAID_LEVELS.indexOf(paidLevel) + dir; i >= 0 && i < PAID_LEVELS.length; i += dir) {
+      if (maxBetFor(s, PAID_LEVELS[i]) >= 1) return chooseLevel(PAID_LEVELS[i]);
+    }
+  }
+
+  function stepBet(d: -1 | 1): void {
+    const s = session();
+    if (screen !== 'game' || phase !== 'ready' || mode !== 'paid' || !s) return;
+    bet = Math.max(1, Math.min(bet + d, maxBetFor(s, paidLevel)));
+    renderGame();
   }
 
   function quitSession(): void {
@@ -345,7 +390,7 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     const s = session();
     if (!from || !target || !s) return;
     const to = target.getBoundingClientRect();
-    const fly = h('div', { class: 'flyer' }, chipIcon(), h('b', {}, signed(s.econ.returnOnWin - s.econ.stake)));
+    const fly = h('div', { class: 'flyer' }, chipIcon(), h('b', {}, signed(lastDelta)));
     document.body.append(fly);
     const x0 = from.left + from.width / 2;
     const y0 = from.top;
@@ -369,7 +414,8 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
   // ------------------------------------------------------------ game rendering
   function renderGame(): void {
     const s = session();
-    badge.textContent = mode === 'paid' ? `${CONFIG.levels.hardest.label} · 칩 게임` : `무료 연습 · ${CONFIG.levels[level].label}`;
+    const lv = CONFIG.levels[mode === 'paid' ? paidLevel : level];
+    badge.textContent = mode === 'paid' ? `칩 게임 · ${lv.label} ×${lv.multiplier}` : `무료 연습 · ${lv.label}`;
     badge.className = mode === 'paid' ? 'badge paid' : 'badge';
     if (phase !== 'reveal') renderStatus(s); // the status bar must not give the answer away before the cups lift
     renderMessage(s);
@@ -388,7 +434,7 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
         h(
           'div',
           { class: 'seg', role: 'group', 'aria-label': '난이도' },
-          ...PRACTICE_LEVELS.map((id) => {
+          ...LEVEL_IDS.map((id) => {
             const b = button(CONFIG.levels[id].label, () => {
               level = id;
               renderGame();
@@ -403,19 +449,14 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
       return;
     }
     if (!s) return status.replaceChildren();
-    const played = s.rounds.length;
-    const max = s.econ.maxRounds;
-    const toClear = Math.max(0, s.econ.winCap - sessionNet(s));
+    const amt = betAmount(bet, paidLevel);
     status.replaceChildren(
-      h('div', { class: 'pill big', 'data-testid': 'stack' }, chipIcon(), '게임 칩 ', h('b', { 'data-testid': 'stack-n' }, s.stack), '개'),
-      h(
-        'div',
-        { class: 'pill' },
-        '판 ',
-        h('span', { class: 'dots', 'aria-hidden': 'true' }, h('span', { class: 'done' }, '●'.repeat(played)), '○'.repeat(Math.max(0, max - played))),
-        h('b', { 'data-testid': 'rounds' }, `${played}/${max}`),
-      ),
-      ...(s.ended ? [] : [h('div', { class: 'pill' }, '클리어까지 ', h('b', { 'data-testid': 'to-clear' }, `+${toClear}`))]),
+      h('div', { class: 'pill big', 'data-testid': 'stack' }, chipIcon(), '칩 ', h('b', { 'data-testid': 'stack-n' }, s.stack), '개'),
+      h('div', { class: 'pill' }, '판 ', h('b', { 'data-testid': 'rounds' }, s.rounds.length)),
+      h('div', { class: 'pill' }, '손님 결과 ', h('b', { 'data-testid': 'net' }, signed(sessionNet(s)))),
+      ...(s.ended || phase === 'result'
+        ? []
+        : [h('div', { class: 'pill stakes', 'data-testid': 'stakes' }, `판돈 ${bet} · 맞히면 `, h('b', { class: 'win' }, `+${amt}`), ' · 틀리면 ', h('b', { class: 'lose' }, `−${amt}`))]),
     );
   }
 
@@ -424,6 +465,7 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
       message.replaceChildren(h('div', { class: `msg-main ${cls}`.trim() }, main), ...(sub ? [h('div', { class: 'msg-sub' }, sub)] : []));
     switch (phase) {
       case 'ready':
+        if (mode === 'paid') return set('난이도와 판돈을 고르고 [섞기 시작]', `← → 난이도 · ↑ ↓ 판돈 · ${OVERLAP_NOTE}`);
         return set('[섞기 시작]을 누르면 공을 보여 주고 컵을 섞어요', OVERLAP_NOTE);
       case 'showBall':
         return set('공은 이 컵 안에 있어요!');
@@ -436,8 +478,7 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
       case 'result': {
         if (mode === 'practice') return set(lastWin ? '맞혔어요!' : '아쉬워요! 공은 다른 컵에 있었어요', undefined, lastWin ? 'win' : 'lose');
         if (!s) return;
-        const e = s.econ;
-        const delta = lastWin ? e.returnOnWin - e.stake : -e.stake;
+        const delta = lastDelta;
         message.replaceChildren(
           h(
             'div',
@@ -455,10 +496,14 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
   function renderControls(s: Session | null): void {
     const paid = mode === 'paid';
     const leave = paid
-      ? button('그만하기', quitSession, { kind: 'ghost', testid: 'quit' })
+      ? button('정산하기', quitSession, { kind: 'ghost', testid: 'quit' })
       : button('연습 끝내기', showIdle, { kind: 'ghost', testid: 'practice-exit' });
     if (phase === 'ready') {
-      controls.replaceChildren(button('섞기 시작', () => void startRound(), { kind: 'primary', key: 'Space', testid: 'start-round' }), leave);
+      controls.replaceChildren(
+        ...(paid && s ? [levelPicker(s), betPicker(s)] : []),
+        button('섞기 시작', () => void startRound(), { kind: 'primary', key: 'Space', testid: 'start-round' }),
+        leave,
+      );
     } else if (phase === 'result') {
       controls.replaceChildren(
         ...(paid && s?.ended
@@ -468,6 +513,37 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     } else {
       controls.replaceChildren(); // no input while the ball is shown, the cups move or the reveal runs
     }
+  }
+
+  function levelPicker(s: Session): HTMLElement {
+    return h(
+      'div',
+      { class: 'seg', role: 'group', 'aria-label': '난이도', 'data-testid': 'level-picker' },
+      ...PAID_LEVELS.map((id) => {
+        const lv = CONFIG.levels[id];
+        const b = button(`${lv.label} ×${lv.multiplier}`, () => chooseLevel(id), { testid: `level-${id}` });
+        b.classList.toggle('on', id === paidLevel);
+        b.disabled = maxBetFor(s, id) < 1;
+        return b;
+      }),
+    );
+  }
+
+  function betPicker(s: Session): HTMLElement {
+    const max = maxBetFor(s, paidLevel);
+    const minus = button('−', () => stepBet(-1), { testid: 'bet-minus' });
+    const plus = button('+', () => stepBet(1), { testid: 'bet-plus' });
+    minus.disabled = bet <= 1;
+    plus.disabled = bet >= max;
+    return h(
+      'div',
+      { class: 'bet', role: 'group', 'aria-label': '판돈' },
+      h('span', { class: 'bet-label' }, '판돈'),
+      minus,
+      h('b', { class: 'bet-n', 'data-testid': 'bet-n' }, bet),
+      plus,
+      h('small', {}, `최대 ${max}`),
+    );
   }
 
   // ------------------------------------------------------------ settlement
@@ -480,8 +556,8 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     root.dataset.phase = '';
     cups.setPickable(false);
     controls.replaceChildren();
-    overlay.replaceChildren(settlementCard({ ...s, ended: s.ended }, payout));
-    for (let i = 0; i < s.stack; i++) sfx.play('tick', ms(chipDelayMs(i)));
+    overlay.replaceChildren(settlementCard({ ...s, ended: s.ended }, payout, MAX_PILE));
+    for (let i = 0; i < Math.min(s.stack, MAX_PILE); i++) sfx.play('tick', ms(chipDelayMs(i)));
   }
 
   function payout(): void {
