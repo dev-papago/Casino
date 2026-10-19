@@ -4,6 +4,8 @@
   "version": "0.1.0",
   "type": "module",
   "description": "야바위 부스 게임 (offline, single-file build)",
+  "author": "casion",
+  "main": "electron/main.cjs",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
@@ -11,15 +13,44 @@
     "test": "vitest run",
     "e2e": "playwright test",
     "sim": "node scripts/simulate.mjs",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "app": "vite build && electron .",
+    "exe": "vite build && electron-builder --win portable --x64"
   },
   "devDependencies": {
     "@playwright/test": "1.56.1",
     "@types/node": "22.20.5",
+    "electron": "44.5.1",
+    "electron-builder": "26.15.3",
     "typescript": "5.9.3",
     "vite": "7.3.7",
     "vite-plugin-singlefile": "2.3.3",
     "vitest": "4.1.12"
+  },
+  "build": {
+    "appId": "com.casion.yabawi",
+    "productName": "Yabawi",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/index.html",
+      "electron/main.cjs",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "Yabawi-${version}-portable.exe"
+    }
   },
   "overrides": {
     "vite": "$vite"

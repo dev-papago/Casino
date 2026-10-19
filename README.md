@@ -2,12 +2,15 @@
 
 인터넷 없이 노트북 한 대에서 돌리는 야바위 게임입니다. 설계와 경제 수치는 [docs/DESIGN.md](docs/DESIGN.md)에 있습니다.
 
-## 부스에서 실행하기
+## 부스에서 실행하기 (exe)
 
-1. (인터넷 되는 곳에서 한 번만) `npm install` → `npm run build`
-2. 만들어진 `dist/index.html` 파일 하나를 노트북에 복사합니다.
-3. 부스에서 그 파일을 더블클릭해 Chrome이나 Edge로 엽니다. 인터넷이 필요 없습니다.
-   - 통계는 브라우저에 저장되므로 매일 같은 브라우저, 같은 파일 위치에서 여세요.
+1. (Windows PC, 인터넷 되는 곳에서 한 번만) `npm install` → `npm run exe`
+2. `release/Yabawi-<버전>-portable.exe` 파일 하나가 만들어집니다. 설치 없이 더블클릭하면 바로 실행되고, 인터넷이 필요 없습니다.
+   - 창이 최대화로 열립니다. `F11`로 전체 화면을 켜고 끕니다.
+   - 통계는 PC의 사용자 데이터 폴더에 저장되므로 exe를 다른 폴더로 옮겨도 유지됩니다.
+   - 서명되지 않은 exe라 처음 실행할 때 Windows SmartScreen 경고가 뜰 수 있습니다. "추가 정보" → "실행"을 누르세요.
+- 빌드 없이 창으로 바로 확인: `npm run app`
+- exe 대신 브라우저로 쓰려면 `npm run build` 후 `dist/index.html`을 Chrome이나 Edge로 엽니다.
 
 ## 진행 방법
 
@@ -30,6 +33,8 @@
 |---|---|
 | `npm run dev` | 개발 서버 |
 | `npm run build` | `dist/index.html` 한 파일로 빌드 |
+| `npm run app` | 빌드 후 Electron 창으로 실행 |
+| `npm run exe` | Windows portable exe 만들기 (`release/`) |
 | `npm test` | 단위 테스트 (Vitest) |
 | `npm run e2e` | 브라우저 테스트 (Playwright) |
 | `npm run sim` | 경제 시뮬레이션 |
