@@ -1,8 +1,9 @@
-// Screen layout and game flow (DESIGN.md sections 1 and 5): stock tabs on the left, the chart in the
-// middle, account and orders on the right. The market never pauses while a game runs (not even behind
-// the 정산 dialog); every tick moves all stocks, then liquidates positions that touched their price.
+// Screen layout and game flow (DESIGN.md sections 1 and 5): stock tabs on the left (easiest first), the chart
+// in the middle, account and orders on the right. The market never pauses while a game runs (not even behind
+// the 정산 dialog); every tick moves all stocks, then liquidates positions that touched their price. When the
+// game time runs out the market closes and everything is settled at the closing prices.
 import { Sfx } from '../audio.ts';
-import { CONFIG } from '../config.ts';
+import { CONFIG, DIFFICULTY_LABEL, type StockDef } from '../config.ts';
 import {
   TRADE_ERROR_TEXT,
   buy,
@@ -28,7 +29,7 @@ import { clock, num, pct, qty, signedUsd, tone, usd } from './format.ts';
 
 export type Screen = 'title' | 'trade' | 'confirm' | 'result';
 type Side = 'buy' | 'sell';
-type EndReason = 'settle' | 'broke';
+type EndReason = 'settle' | 'broke' | 'close';
 
 const MUTE_KEY = 'yeongkkeul:v1:muted';
 const BUY_STEPS = [0.1, 0.25, 0.5, 1] as const;
@@ -38,6 +39,10 @@ const DEFAULT_AMOUNT = 100;
 const MAX_CATCHUP = 600; // ticks; after a longer stall the market skips ahead instead of replaying
 const ENTRY_COLOR = '#f5c542';
 const LIQ_COLOR = '#c04dff';
+const STOCKS: readonly StockDef[] = [...CONFIG.stocks].sort((a, b) => a.difficulty - b.difficulty);
+const URGENT_SEC = 30; // the countdown turns red
+const WARN_SEC = 60; // one toast before the close
+const stars = (n: number): string => `${'★'.repeat(n)}${'☆'.repeat(5 - n)}`;
 
 export function mountApp(root: HTMLElement): void {
   const econ = CONFIG.economy;
@@ -48,7 +53,7 @@ export function mountApp(root: HTMLElement): void {
   let market = new Market(rng);
   let account: Account = newAccount(econ);
   let screen: Screen = 'title';
-  let selected = CONFIG.stocks[0].id;
+  let selected = STOCKS[0].id;
   let side: Side = 'buy';
   let leverage = econ.leverages[0];
   let amount = DEFAULT_AMOUNT;
@@ -64,10 +69,11 @@ export function mountApp(root: HTMLElement): void {
 
   const muteBtn = h('button', { class: 'icon-btn', type: 'button', 'data-testid': 'mute', title: '소리 (M)' });
   const settleBtn = button('정산하기', () => openConfirm(), { kind: 'ghost', testid: 'settle' });
-  const clockEl = h('div', { class: 'clock', 'data-testid': 'clock' }, '00:00');
+  const clockLabel = h('span', { class: 'clock-label' }, T.sessionSec > 0 ? '장 마감까지' : '경과');
+  const clockEl = h('div', { class: 'clock', 'data-testid': 'clock' }, clock(T.sessionSec));
 
   // Left: stock tabs + detail
-  const tabs = CONFIG.stocks.map((def) => {
+  const tabs = STOCKS.map((def) => {
     const price = h('span', { class: 'tab-price' });
     const chg = h('span', { class: 'tab-chg' });
     const hold = h('span', { class: 'tab-hold', hidden: true });
@@ -75,14 +81,19 @@ export function mountApp(root: HTMLElement): void {
       'button',
       { class: 'tab', type: 'button', 'data-testid': `tab-${def.id}`, onclick: () => select(def.id) },
       h('span', { class: 'tab-top' }, h('span', { class: 'tab-name' }, def.name), hold),
-      h('span', { class: 'tab-ticker' }, def.ticker),
+      h(
+        'span',
+        { class: 'tab-ticker' },
+        def.ticker,
+        h('span', { class: 'level', 'data-level': def.difficulty, title: `난이도 ${stars(def.difficulty)}` }, DIFFICULTY_LABEL[def.difficulty]),
+      ),
       h('span', { class: 'tab-bottom' }, price, chg),
     );
     return { def, el, price, chg, hold };
   });
   const detailName = h('h2', { class: 'detail-name' });
   const detailTicker = h('span', { class: 'detail-ticker' });
-  const detailRisk = h('div', { class: 'risk' });
+  const detailLevel = h('div', { class: 'level-row', 'data-testid': 'detail-level' });
   const detailDesc = h('p', { class: 'detail-desc', 'data-testid': 'detail-desc' });
   const detailStart = h('dd', {});
   const detailHigh = h('dd', { class: 'up' });
@@ -193,18 +204,23 @@ export function mountApp(root: HTMLElement): void {
       'header',
       { class: 'top' },
       h('div', { class: 'brand' }, h('span', { class: 'logo' }, '영끌문', h('b', {}, 'S')), h('span', { class: 'tagline' }, '모의 투자 시뮬레이터')),
-      h('div', { class: 'top-mid' }, h('span', { class: 'live-dot' }), 'LIVE', clockEl),
+      h('div', { class: 'top-mid' }, h('span', { class: 'live-dot' }), 'LIVE', clockLabel, clockEl),
       h('div', { class: 'top-actions' }, muteBtn, settleBtn),
     ),
     h(
       'aside',
       { class: 'col left' },
-      h('div', { class: 'panel tabs-panel' }, h('div', { class: 'panel-title' }, '종목'), h('div', { class: 'tabs' }, ...tabs.map((t) => t.el))),
+      h(
+        'div',
+        { class: 'panel tabs-panel' },
+        h('div', { class: 'panel-title' }, '종목 · 쉬운 순'),
+        h('div', { class: 'tabs' }, ...tabs.map((t) => t.el)),
+      ),
       h(
         'div',
         { class: 'panel detail', 'data-testid': 'detail' },
         h('div', { class: 'detail-head' }, detailName, detailTicker),
-        detailRisk,
+        detailLevel,
         detailDesc,
         h('dl', { class: 'rows' }, h('dt', {}, '시작가'), detailStart, h('dt', {}, '게임 중 최고'), detailHigh, h('dt', {}, '게임 중 최저'), detailLow),
       ),
@@ -357,7 +373,7 @@ export function mountApp(root: HTMLElement): void {
     account = newAccount(econ);
     extremes = freshExtremes(market);
     prevPrices = market.prices();
-    selected = CONFIG.stocks[0].id;
+    selected = STOCKS[0].id;
     side = 'buy';
     leverage = econ.leverages[0];
     sellFraction = 1;
@@ -386,6 +402,7 @@ export function mountApp(root: HTMLElement): void {
     ending = { reason, account };
     sfx.play(reason === 'broke' ? 'liquidate' : 'end');
     setScreen('result');
+    renderClock(); // stops at the time the game ended
   }
 
   /** Back to the title with a fresh, still market (the next game starts from it). */
@@ -396,6 +413,7 @@ export function mountApp(root: HTMLElement): void {
     prevPrices = market.prices();
     chart.reset();
     setScreen('title');
+    renderClock();
   }
 
   function setScreen(s: Screen): void {
@@ -421,6 +439,9 @@ export function mountApp(root: HTMLElement): void {
             h('li', {}, '좌측 종목을 골라 차트를 보고 우측에서 매수 / 매도'),
             h('li', {}, `평가 자산 `, h('b', {}, usd(econ.leverageFrom, 0)), `부터 레버리지 최대 `, h('b', {}, `${Math.max(...econ.leverages)}배`), ' — 청산가에 닿으면 증거금 전액 손실'),
             h('li', {}, `매수·매도 때 주문 규모의 ${num(econ.feeRate * 100, 1)}% 수수료`),
+            T.sessionSec > 0
+              ? h('li', {}, '게임 시간 ', h('b', {}, `${clock(T.sessionSec)}`), ' — 장이 마감되면 보유 종목을 종가로 자동 정산')
+              : null,
           ),
           button('게임 시작', () => startGame(), { kind: 'primary', key: 'Enter', testid: 'start' }),
         ),
@@ -452,7 +473,7 @@ export function mountApp(root: HTMLElement): void {
         h(
           'div',
           { class: `card result-card is-${tone(net)}`, 'data-testid': 'result' },
-          h('h2', {}, ending.reason === 'broke' ? '파산했습니다…' : '정산 결과'),
+          h('h2', {}, ending.reason === 'broke' ? '파산했습니다…' : ending.reason === 'close' ? '장 마감 · 정산 결과' : '정산 결과'),
           h('div', { class: 'result-total', 'data-testid': 'result-total' }, usd(total)),
           h('div', { class: `result-net ${tone(net)}` }, `${signedUsd(net)} (${pct(net / econ.deposit)})`),
           h(
@@ -502,8 +523,8 @@ export function mountApp(root: HTMLElement): void {
     // Detail
     setText(detailName, def.name);
     setText(detailTicker, def.ticker);
-    setText(detailRisk, `위험도 ${'★'.repeat(def.risk)}${'☆'.repeat(5 - def.risk)}`);
-    detailRisk.dataset.risk = String(def.risk);
+    setText(detailLevel, `난이도 ${stars(def.difficulty)} ${DIFFICULTY_LABEL[def.difficulty]}`);
+    detailLevel.dataset.level = String(def.difficulty);
     setText(detailDesc, def.description);
     setText(detailStart, usd(def.start, d));
     setText(detailHigh, usd(extremes[selected].hi, d));
@@ -553,7 +574,7 @@ export function mountApp(root: HTMLElement): void {
     setText(pvFee, usd(fee));
     // After this order the entry is the average of what is held and what is bought.
     const entryAfter = pos ? (pos.qty * pos.entry + size) / (pos.qty + size / st.price) : st.price;
-    setText(pvLiq, usd(liquidationPrice({ qty: 0, entry: entryAfter, margin: 0, leverage: L }, econ), d));
+    setText(pvLiq, liqText(liquidationPrice({ entry: entryAfter, leverage: L }, econ), d));
     const buyError =
       L > 1 && locked
         ? TRADE_ERROR_TEXT.locked
@@ -572,7 +593,7 @@ export function mountApp(root: HTMLElement): void {
       setText(hvLev, `${pos.leverage}×`);
       setText(hvPnl, `${signedUsd(pnl)} (${pct(pnl / pos.margin)})`);
       setTone(hvPnl, pnl);
-      setText(hvLiq, usd(liquidationPrice(pos, econ), d));
+      setText(hvLiq, liqText(liquidationPrice(pos, econ), d));
       const sellQty = pos.qty * sellFraction;
       const back = positionValue(pos, st.price) * sellFraction - sellQty * st.price * econ.feeRate;
       setText(svQty, `${qty(sellQty)}주`);
@@ -626,10 +647,10 @@ export function mountApp(root: HTMLElement): void {
   function chartLines(): ChartLine[] {
     const pos = account.positions[selected];
     if (!pos || screen === 'title') return [];
-    return [
-      { price: pos.entry, label: `평단 ${pos.leverage}×`, color: ENTRY_COLOR },
-      { price: liquidationPrice(pos, econ), label: '청산가', color: LIQ_COLOR },
-    ];
+    const lines: ChartLine[] = [{ price: pos.entry, label: `평단 ${pos.leverage}×`, color: ENTRY_COLOR }];
+    const liq = liquidationPrice(pos, econ);
+    if (liq > 0) lines.push({ price: liq, label: '청산가', color: LIQ_COLOR });
+    return lines;
   }
 
   // ------------------------------------------------------------ effects
@@ -695,9 +716,9 @@ export function mountApp(root: HTMLElement): void {
       muteBtn.click();
     } else if ((e.key === 'ArrowUp' || e.key === 'ArrowDown') && screen === 'trade') {
       e.preventDefault();
-      const i = CONFIG.stocks.findIndex((s) => s.id === selected);
-      const n = CONFIG.stocks.length;
-      select(CONFIG.stocks[(i + (e.key === 'ArrowUp' ? n - 1 : 1)) % n].id);
+      const i = STOCKS.findIndex((s) => s.id === selected);
+      const n = STOCKS.length;
+      select(STOCKS[(i + (e.key === 'ArrowUp' ? n - 1 : 1)) % n].id);
     }
   });
   // No context menu, no text selection drag, no wheel-zoom tricks on the inputs.
@@ -720,7 +741,20 @@ export function mountApp(root: HTMLElement): void {
         onLiquidated(r.fills);
         if (isBroke(account, econ)) finish('broke');
       }
+      if (T.sessionSec > 0) {
+        const left = T.sessionSec - (market.ticks * T.tickMs) / 1000;
+        if (left <= 0) finish('close');
+        else if (Math.abs(left - WARN_SEC) < T.tickMs / 2000) toast(`장 마감 ${WARN_SEC}초 전!`, 'warn');
+      }
     }
+  }
+
+  function renderClock(): void {
+    const sec = (market.ticks * T.tickMs) / 1000;
+    const left = Math.max(0, T.sessionSec - sec);
+    setText(clockEl, clock(T.sessionSec > 0 ? Math.ceil(left) : sec));
+    const playing = screen === 'trade' || screen === 'confirm';
+    clockEl.classList.toggle('urgent', playing && T.sessionSec > 0 && left <= URGENT_SEC);
   }
 
   let lastAt = performance.now();
@@ -739,7 +773,7 @@ export function mountApp(root: HTMLElement): void {
     if (n === 0) return;
     if (n > MAX_CATCHUP) n = MAX_CATCHUP;
     for (let i = 0; i < n; i++) tick();
-    if (screen === 'trade' || screen === 'confirm') setText(clockEl, clock((market.ticks * T.tickMs) / 1000));
+    if (screen === 'trade' || screen === 'confirm') renderClock();
     render();
   }, T.tickMs / 2);
 
@@ -767,6 +801,11 @@ function setTone(el: HTMLElement, v: number): void {
   const t = tone(v);
   el.classList.toggle('up', t === 'up');
   el.classList.toggle('down', t === 'down');
+}
+
+/** A 1× position borrows nothing and has no liquidation price. */
+function liqText(price: number, d: number): string {
+  return price > 0 ? usd(price, d) : '없음';
 }
 
 function signedPrice(v: number, d: number): string {

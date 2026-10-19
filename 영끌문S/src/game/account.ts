@@ -3,8 +3,8 @@
 //
 // One isolated position per stock. 매수 puts up `margin` dollars and opens margin × leverage of stock;
 // buying more of a stock you hold must use the same leverage, and the entry price becomes the average.
-// The position is liquidated once its loss reaches (1 − maintenance) of the margin: the player loses
-// the whole margin and never more (cash cannot go negative).
+// A leveraged position is liquidated once its loss reaches (1 − maintenance) of the margin: the player loses
+// the whole margin and never more (cash cannot go negative). A 1× position borrows nothing and is never liquidated.
 import { CONFIG, type EconomyConfig } from '../config.ts';
 
 export interface Position {
@@ -65,8 +65,9 @@ export function maxMargin(cash: number, leverage: number, econ: EconomyConfig): 
   return Math.max(0, m);
 }
 
-export function liquidationPrice(pos: Position, econ: EconomyConfig): number {
-  return pos.entry * (1 - (1 - econ.maintenance) / pos.leverage);
+/** Price at which the position is liquidated; 0 for 1× (never). */
+export function liquidationPrice(pos: Pick<Position, 'entry' | 'leverage'>, econ: EconomyConfig): number {
+  return pos.leverage > 1 ? pos.entry * (1 - (1 - econ.maintenance) / pos.leverage) : 0;
 }
 
 export const unrealized = (pos: Position, price: number): number => pos.qty * (price - pos.entry);

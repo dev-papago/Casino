@@ -3,10 +3,22 @@
 // the market converts them to one tick (timing.tickMs). Ranges are inclusive [min, max].
 export type Range = readonly [number, number];
 
-/** 킹카콜라: alternating up / down regimes, low noise. */
+/**
+ * Randomness every stock gets on top of its model (DESIGN.md section 2): Gaussian noise whose size wanders
+ * between calm and choppy stretches, plus rare jumps either way. It hides the model's trend over a few
+ * seconds, so the next candles cannot be read off the last ones; the trend only shows over minutes.
+ */
+export interface NoiseDef {
+  vol: number; // per √second, on average
+  wander: number; // spread of the log volatility (0: always the same size)
+  wanderSec: number; // typical length of a calm or choppy stretch
+  jumpRate: number; // jumps per second
+  jumpSize: Range; // log size of a jump; up or down with equal odds
+}
+
+/** 킹카콜라: alternating up / down regimes. */
 export interface SteadyModel {
   kind: 'steady';
-  vol: number;
   up: { drift: number; meanSec: number };
   down: { drift: number; meanSec: number };
 }
@@ -14,7 +26,6 @@ export interface SteadyModel {
 export interface CrashModel {
   kind: 'crash';
   drift: number;
-  vol: number;
   rallyFree: number; // log gain from the bottom before the hazard starts to grow
   hazardBase: number;
   hazardSlope: number; // extra crashes per second per unit of log gain above rallyFree
@@ -24,7 +35,6 @@ export interface CrashModel {
 /** 돌지코인: sum of sine waves (new period and height every half wave) around a slowly wandering anchor. */
 export interface WaveModel {
   kind: 'wave';
-  vol: number;
   waves: readonly { periodSec: Range; amp: Range }[];
   revert: number; // pull toward the anchor, per second
   anchorVol: number;
@@ -33,30 +43,35 @@ export interface WaveModel {
 export interface DecayModel {
   kind: 'decay';
   drift: number;
-  vol: number;
   spikeRate: number;
   spikeGain: Range; // total log gain of one spike
   spikeSec: Range;
   fadeShare: Range; // part of the spike given back afterwards
   fadeSec: Range;
 }
-/** 게이임스탑: price = anchor + fast mean-reverting deviation with jumps; the anchor squeezes and dumps. */
+/**
+ * 게이임스탑: nothing to read. The level takes sudden jumps both ways (squeezes up, crashes down) that stay, on top
+ * of the noise, and a fast mean-reverting deviation adds sub-second needles. A jump says nothing about the next
+ * one, so selling the top and buying the bottom is luck, not a pattern; the drift sets how fast it bleeds.
+ */
 export interface SqueezeModel {
   kind: 'squeeze';
-  revert: number; // deviation pull back, per second (3 → half-life about 0.23 s)
-  vol: number;
-  jumpRate: number;
+  drift: number; // per second, between jumps
+  squeezeRate: number; // up jumps per second
+  squeezeGain: Range; // log size of an up jump
+  crashRate: number; // down jumps per second
+  crashDrop: Range; // log size of a down jump
+  jumpSec: Range; // how long a jump takes
+  revert: number; // needle pull back, per second (15 → half-life about 0.05 s: needles, not tradeable dips)
+  vol: number; // needle noise
+  jumpRate: number; // needle spikes per second
   jumpSize: Range;
-  jumpUp: number; // probability a jump goes up
-  calmSec: Range;
-  calmVol: number;
-  squeezeChance: number; // after a calm stretch: squeeze with this probability, else another calm stretch
-  squeezeGain: Range; // log
-  squeezeSec: Range;
-  dumpTo: Range; // log level relative to the base the dump falls back to
-  dumpSec: Range;
+  jumpUp: number; // probability a needle spike goes up
 }
 export type ModelDef = SteadyModel | CrashModel | WaveModel | DecayModel | SqueezeModel;
+
+export type Difficulty = 1 | 2 | 3 | 4 | 5;
+export const DIFFICULTY_LABEL: Record<Difficulty, string> = { 1: '쉬움', 2: '보통', 3: '어려움', 4: '고난도', 5: '극악' };
 
 export interface StockDef {
   id: string;
@@ -64,9 +79,10 @@ export interface StockDef {
   ticker: string;
   start: number; // price when a game starts ($)
   decimals: number;
-  risk: 1 | 2 | 3 | 4 | 5;
+  difficulty: Difficulty; // the tabs are sorted by this, easiest first
   description: string;
   bounds: Range; // soft price range as multiples of start; outside it the price is pulled back
+  noise: NoiseDef;
   model: ModelDef;
 }
 
@@ -74,7 +90,7 @@ export interface EconomyConfig {
   deposit: number; // 기본예탁금 ($)
   leverages: readonly number[];
   feeRate: number; // on position size (margin × leverage), when opening and when closing
-  maintenance: number; // liquidated once the loss reaches (1 − maintenance) of the margin
+  maintenance: number; // leveraged positions are liquidated once the loss reaches (1 − maintenance) of the margin
   minOrder: number; // smallest margin per order ($); below this with no position the game is over
   leverageFrom: number; // leverage above 1× needs at least this much equity ($)
 }
@@ -86,14 +102,15 @@ export interface GameConfig {
     historyCandles: number; // drawn before the game starts, ending at the start price (0: the chart starts empty)
     visibleCandles: number;
     keepCandles: number;
+    sessionSec: number; // the market closes and everything is settled after this long (0: no limit)
   };
   economy: EconomyConfig;
   stocks: readonly StockDef[];
 }
 
 export const CONFIG: GameConfig = {
-  timing: { tickMs: 100, ticksPerCandle: 10, historyCandles: 0, visibleCandles: 90, keepCandles: 600 },
-  economy: { deposit: 1000, leverages: [1, 2, 5, 10, 20], feeRate: 0.001, maintenance: 0.05, minOrder: 10, leverageFrom: 2000 },
+  timing: { tickMs: 100, ticksPerCandle: 10, historyCandles: 0, visibleCandles: 90, keepCandles: 600, sessionSec: 300 },
+  economy: { deposit: 1000, leverages: [1, 2, 5, 10, 20], feeRate: 0.001, maintenance: 0.2, minOrder: 10, leverageFrom: 2000 },
   stocks: [
     {
       id: 'kingka',
@@ -101,14 +118,14 @@ export const CONFIG: GameConfig = {
       ticker: 'KKCL',
       start: 64,
       decimals: 2,
-      risk: 1,
+      difficulty: 1,
       description: '세계적인 필수소비재주. 장기적으로 우상향 하지만 조금 작은 확률로 우하향 한다. 가장 안전한 종목',
       bounds: [0.5, 3],
+      noise: { vol: 0.003, wander: 0.3, wanderSec: 20, jumpRate: 0.02, jumpSize: [0.004, 0.012] },
       model: {
         kind: 'steady',
-        vol: 0.0003,
-        up: { drift: 0.00035, meanSec: 45 },
-        down: { drift: -0.0005, meanSec: 18 },
+        up: { drift: 0.00022, meanSec: 45 },
+        down: { drift: -0.00012, meanSec: 20 },
       },
     },
     {
@@ -117,18 +134,18 @@ export const CONFIG: GameConfig = {
       ticker: 'SKLW',
       start: 140,
       decimals: 2,
-      risk: 3,
+      difficulty: 2,
       description: '최근 수요가 폭증하고 있는 HBM의 선두주자. 가파르게 우상향 하지만 적은 확률로 단기간에 하락 가능',
       bounds: [0.4, 5],
+      noise: { vol: 0.0045, wander: 0.35, wanderSec: 15, jumpRate: 0.03, jumpSize: [0.006, 0.02] },
       model: {
         kind: 'crash',
-        drift: 0.0018,
-        vol: 0.0028,
-        rallyFree: 0.04,
-        hazardBase: 0.001,
-        hazardSlope: 0.25,
-        crashDrop: [0.09, 0.16],
-        crashSec: [1.5, 3.5],
+        drift: 0.00055,
+        rallyFree: 0.05,
+        hazardBase: 0.0015,
+        hazardSlope: 0.12,
+        crashDrop: [0.06, 0.12],
+        crashSec: [1.5, 3],
       },
     },
     {
@@ -137,18 +154,18 @@ export const CONFIG: GameConfig = {
       ticker: 'DOLGE',
       start: 2,
       decimals: 4,
-      risk: 4,
+      difficulty: 3,
       description: '최근 자금 유입이 높아진 크립토. 변동성이 큰 자산이므로 투자에 주의하자.',
       bounds: [0.35, 3],
+      noise: { vol: 0.008, wander: 0.35, wanderSec: 15, jumpRate: 0.03, jumpSize: [0.01, 0.025] },
       model: {
         kind: 'wave',
-        vol: 0.004,
         waves: [
-          { periodSec: [24, 48], amp: [0.006, 0.013] },
-          { periodSec: [5, 11], amp: [0.003, 0.007] },
+          { periodSec: [40, 90], amp: [0.0012, 0.003] },
+          { periodSec: [8, 16], amp: [0.0008, 0.002] },
         ],
-        revert: 0.004,
-        anchorVol: 0.002,
+        revert: 0.003,
+        anchorVol: 0.003,
       },
     },
     {
@@ -157,17 +174,17 @@ export const CONFIG: GameConfig = {
       ticker: 'MWDN',
       start: 61,
       decimals: 2,
-      risk: 3,
+      difficulty: 4,
       description: '암 백신 치료제를 개발하는 바이오주. 장기적으로 우하향 하지만 적은 확률로 급등 가능',
       bounds: [0.15, 3],
+      noise: { vol: 0.004, wander: 0.35, wanderSec: 15, jumpRate: 0.03, jumpSize: [0.006, 0.02] },
       model: {
         kind: 'decay',
-        drift: -0.0008,
-        vol: 0.0016,
-        spikeRate: 0.003,
-        spikeGain: [0.15, 0.35],
-        spikeSec: [2, 5],
-        fadeShare: [0.4, 0.7],
+        drift: -0.0004,
+        spikeRate: 0.002,
+        spikeGain: [0.15, 0.4],
+        spikeSec: [1, 2.5],
+        fadeShare: [0.5, 0.8],
         fadeSec: [15, 35],
       },
     },
@@ -177,23 +194,23 @@ export const CONFIG: GameConfig = {
       ticker: 'GGME',
       start: 10,
       decimals: 2,
-      risk: 5,
+      difficulty: 5,
       description: '대형 헤지펀드 공매도 세력과 개미들의 피비린내 나는 전투 현장. 미쳐버린 저세상 차트를 보여준다',
-      bounds: [0.2, 30],
+      bounds: [0.05, 30],
+      noise: { vol: 0.01, wander: 0.4, wanderSec: 10, jumpRate: 0, jumpSize: [0, 0] },
       model: {
         kind: 'squeeze',
-        revert: 3,
+        drift: -0.00265,
+        squeezeRate: 0.018,
+        squeezeGain: [0.15, 0.5],
+        crashRate: 0.018,
+        crashDrop: [0.15, 0.45],
+        jumpSec: [0.1, 0.4],
+        revert: 15,
         vol: 0.22,
         jumpRate: 0.8,
-        jumpSize: [0.05, 0.2],
-        jumpUp: 0.55,
-        calmSec: [8, 20],
-        calmVol: 0.02,
-        squeezeChance: 0.4,
-        squeezeGain: [0.4, 1.1],
-        squeezeSec: [6, 14],
-        dumpTo: [-0.3, 0.2],
-        dumpSec: [4, 10],
+        jumpSize: [0.03, 0.1],
+        jumpUp: 0.5,
       },
     },
   ],

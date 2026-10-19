@@ -174,12 +174,24 @@ button {
   }
 }
 
+.clock-label {
+  margin-left: 0.6rem;
+  color: var(--dim);
+  font-size: 0.75rem;
+  letter-spacing: 0.04em;
+}
+
 .clock {
-  margin-left: 0.4rem;
   color: var(--ink);
   font-variant-numeric: tabular-nums;
   font-size: 1.15rem;
   letter-spacing: 0.06em;
+}
+
+.clock.urgent {
+  color: var(--up);
+  text-shadow: 0 0 0.6rem rgba(255, 69, 96, 0.8);
+  animation: blink 1s steps(2) infinite;
 }
 
 .top-actions {
@@ -368,25 +380,36 @@ button {
   font-size: 0.8rem;
 }
 
-.risk {
+.level-row {
   margin: 0.3rem 0 0.5rem;
   font-size: 0.85rem;
   font-weight: 800;
   letter-spacing: 0.04em;
 }
-.risk[data-risk='1'] {
+
+.level {
+  margin-left: 0.4rem;
+  padding: 0 0.35rem;
+  white-space: nowrap;
+  border-radius: 0.3rem;
+  border: 1px solid currentColor;
+  font-size: 0.65rem;
+  letter-spacing: 0;
+}
+
+[data-level='1'] {
   color: #4dff9a;
 }
-.risk[data-risk='2'] {
+[data-level='2'] {
   color: #b5ff4d;
 }
-.risk[data-risk='3'] {
+[data-level='3'] {
   color: var(--gold);
 }
-.risk[data-risk='4'] {
+[data-level='4'] {
   color: #ff9a3d;
 }
-.risk[data-risk='5'] {
+[data-level='5'] {
   color: var(--up);
   text-shadow: 0 0 0.6rem rgba(255, 69, 96, 0.7);
 }
