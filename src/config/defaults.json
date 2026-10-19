@@ -1,11 +1,6 @@
 {
-  "version": 1,
+  "version": 2,
   "pin": "0000",
-  "booth": {
-    "chipsPerVisitor": 10,
-    "expectedVisitors": 300,
-    "chipValueKrw": 200
-  },
   "timing": {
     "showBallMs": 1000,
     "revealMs": 2000,
@@ -17,27 +12,32 @@
     "easy": {
       "label": "쉬움",
       "paid": false,
+      "multiplier": 0,
       "shuffle": { "moves": [4, 5], "moveMs": [600, 700], "mix": { "swap": 1, "rotate": 0, "overlap": 0 }, "cMax": null }
     },
     "normal": {
-      "label": "보통",
-      "paid": false,
-      "shuffle": { "moves": [7, 9], "moveMs": [350, 480], "mix": { "swap": 0.75, "rotate": 0, "overlap": 0.25 }, "cMax": null }
+      "label": "중간",
+      "paid": true,
+      "multiplier": 1.2,
+      "shuffle": { "moves": [7, 9], "moveMs": [350, 480], "mix": { "swap": 0.6, "rotate": 0, "overlap": 0.4 }, "cMax": null }
+    },
+    "high": {
+      "label": "높음",
+      "paid": true,
+      "multiplier": 1.5,
+      "shuffle": { "moves": [10, 12], "moveMs": [260, 380], "mix": { "swap": 0.45, "rotate": 0.2, "overlap": 0.35 }, "cMax": null }
     },
     "hardest": {
       "label": "최상",
       "paid": true,
+      "multiplier": 2,
       "shuffle": { "moves": [14, 18], "moveMs": [170, 300], "mix": { "swap": 0.3, "rotate": 0.3, "overlap": 0.4 }, "cMax": 0.34375 }
     }
   },
   "economy": {
-    "buyIn": 6,
-    "fee": 1,
-    "stake": 1,
-    "returnOnWin": 3,
-    "maxRounds": 8,
-    "maxRoundsRange": [4, 10],
-    "winCap": 10
+    "buyIn": 5,
+    "maxBet": 5,
+    "maxBetRange": [1, 20]
   },
   "sound": { "muted": false, "volume": 0.7 }
 }

@@ -258,6 +258,54 @@ kbd {
   color: #3a1d00;
 }
 
+.seg .btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.pill.stakes b.win {
+  color: #7dffa0;
+}
+
+.pill.stakes b.lose {
+  color: #ff8a9a;
+}
+
+/* paid: bet stepper next to the level picker */
+.bet {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.2rem 0.9rem;
+  border-radius: 99rem;
+  border: 0.1rem solid rgba(245, 197, 66, 0.35);
+  background: rgba(0, 0, 0, 0.35);
+  font-size: 1.15rem;
+}
+
+.bet .btn {
+  padding: 0.1rem 0.9rem;
+  font-size: 1.4rem;
+  box-shadow: none;
+}
+
+.bet .btn:disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+
+.bet-n {
+  min-width: 2ch;
+  text-align: center;
+  color: var(--gold-hi);
+  font-size: 1.7rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.bet small {
+  opacity: 0.7;
+}
+
 /* ------------------------------------------------------------------ table and cups */
 .table {
   min-height: 0;
@@ -536,6 +584,7 @@ kbd {
 
 .controls {
   display: flex;
+  flex-wrap: wrap;
   justify-content: center;
   align-items: center;
   gap: 1.2rem;

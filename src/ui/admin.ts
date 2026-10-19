@@ -1,5 +1,5 @@
 // Admin screen (DESIGN.md section 6): PIN entry, stats (numbers only), settings, data.
-import { CONFIG, LEVEL_IDS, defaultSettings, type Settings } from '../config';
+import { CONFIG, LEVEL_IDS, PAID_LEVELS, defaultSettings, type Settings } from '../config';
 import { END_REASONS, type EndReason } from '../game/session';
 import type { SavedState, Stats } from '../storage';
 import { button, h, signed } from './dom';
@@ -7,13 +7,13 @@ import { button, h, signed } from './dom';
 export interface AdminHost {
   settings(): Settings;
   state(): SavedState;
-  /** Saves (normalized: maxRounds clamped) and returns what was saved. */
+  /** Saves (normalized: maxBet clamped) and returns what was saved. */
   saveSettings(s: Settings): Settings;
   resetStats(): void;
   exit(): void;
 }
 
-const REASON_LABEL: Record<EndReason, string> = { clear: '클리어', broke: '칩 소진', rounds: '최대 판수', quit: '그만하기' };
+const REASON_LABEL: Record<EndReason, string> = { broke: '칩 소진', quit: '정산' };
 
 /** Plain comparison, no lockout. */
 export function pinPanel(pin: string, onOk: () => void, onCancel: () => void): HTMLElement {
@@ -61,8 +61,8 @@ export function adminPanel(host: AdminHost): HTMLElement {
 
   const settingsForm = (): HTMLElement => {
     const s = host.settings();
-    const [lo, hi] = CONFIG.economy.maxRoundsRange;
-    const rounds = h('input', { type: 'number', min: lo, max: hi, step: 1, value: s.maxRounds, 'data-testid': 'set-max-rounds' });
+    const [lo, hi] = CONFIG.economy.maxBetRange;
+    const maxBet = h('input', { type: 'number', min: lo, max: hi, step: 1, value: s.maxBet, 'data-testid': 'set-max-bet' });
     const soundOn = h('input', { type: 'checkbox', checked: !s.sound.muted, 'data-testid': 'set-sound' });
     const vol = h('input', { type: 'range', min: 0, max: 100, step: 5, value: Math.round(s.sound.volume * 100) });
     const volOut = h('output', {}, vol.value);
@@ -72,19 +72,19 @@ export function adminPanel(host: AdminHost): HTMLElement {
     notice = '';
     const save = (): void => {
       const n = host.saveSettings({
-        maxRounds: rounds.value === '' ? s.maxRounds : Number(rounds.value),
+        maxBet: maxBet.value === '' ? s.maxBet : Number(maxBet.value),
         pin: pin.value.trim(),
         sound: { muted: !soundOn.checked, volume: Number(vol.value) / 100 },
       });
-      rounds.value = String(n.maxRounds);
+      maxBet.value = String(n.maxBet);
       pin.value = n.pin;
-      msg.textContent = `저장했어요. 최대 ${n.maxRounds}판은 다음 손님부터 적용돼요.`;
+      msg.textContent = `저장했어요. 최대 판돈 ${n.maxBet}칩은 다음 손님부터 적용돼요.`;
     };
     return h(
       'section',
       { class: 'box' },
       h('h3', {}, '설정'),
-      h('label', { class: 'field' }, h('span', {}, '최대 판수'), rounds, h('small', {}, `${lo}~${hi}판 (기본 ${CONFIG.economy.maxRounds})`)),
+      h('label', { class: 'field' }, h('span', {}, '최대 판돈'), maxBet, h('small', {}, `한 판 ${lo}~${hi}칩 (기본 ${CONFIG.economy.maxBet})`)),
       h('label', { class: 'field' }, h('span', {}, '소리'), soundOn, h('small', {}, '켜기')),
       h('label', { class: 'field' }, h('span', {}, '음량'), vol, volOut),
       h('label', { class: 'field' }, h('span', {}, 'PIN'), pin),
@@ -126,7 +126,7 @@ export function adminPanel(host: AdminHost): HTMLElement {
       h(
         'p',
         { class: 'note' },
-        `고정값: 받는 칩 ${e.buyIn} · 참가비 ${e.fee} · 판돈 ${e.stake} · 맞히면 ${e.returnOnWin}칩 · 클리어 +${e.winCap}. `,
+        `고정값: 시작 칩 ${e.buyIn} · 배율 ${PAID_LEVELS.map((id) => `${CONFIG.levels[id].label} ×${CONFIG.levels[id].multiplier}`).join(' · ')}. `,
         '셔플·배당·연출 시간은 src/config/defaults.json에서 바꾸고 npm run sim으로 확인한 뒤 다시 빌드합니다.',
       ),
     );
@@ -183,9 +183,8 @@ function statsView(st: Stats): HTMLElement {
 }
 
 function histogram(nets: Record<string, number>): HTMLElement {
-  const e = CONFIG.economy;
-  let lo = -e.buyIn;
-  let hi = e.winCap + (e.returnOnWin - e.stake) - 1; // the best a session can end on: −6 … +11
+  let lo = -CONFIG.economy.buyIn;
+  let hi = CONFIG.economy.buyIn;
   for (const k of Object.keys(nets)) {
     lo = Math.min(lo, Number(k));
     hi = Math.max(hi, Number(k));

@@ -1,9 +1,10 @@
 // localStorage persistence. Every read and write is wrapped so a blocked or corrupt store falls back to defaults.
-import type { LevelId } from './config';
+import { LEVEL_IDS, type LevelId } from './config';
 import { END_REASONS, sessionNet, type EndReason, type Session } from './game/session';
 
-export const SETTINGS_KEY = 'yabawi:v1:settings';
-export const STATE_KEY = 'yabawi:v1:state';
+// v2: per-round level and bet; a v1 session from the old rules is not resumed.
+export const SETTINGS_KEY = 'yabawi:v2:settings';
+export const STATE_KEY = 'yabawi:v2:state';
 
 export interface Stats {
   levels: Record<LevelId, { rounds: number; hits: number }>; // updated every round
@@ -20,11 +21,11 @@ export interface SavedState {
 
 export function emptyStats(): Stats {
   return {
-    levels: { easy: { rounds: 0, hits: 0 }, normal: { rounds: 0, hits: 0 }, hardest: { rounds: 0, hits: 0 } },
+    levels: Object.fromEntries(LEVEL_IDS.map((id) => [id, { rounds: 0, hits: 0 }])) as Stats['levels'],
     sessions: 0,
     chipsIn: 0,
     chipsOut: 0,
-    endReasons: { clear: 0, broke: 0, rounds: 0, quit: 0 },
+    endReasons: { broke: 0, quit: 0 },
     nets: {},
   };
 }

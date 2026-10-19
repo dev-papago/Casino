@@ -26,9 +26,16 @@ export async function stackShown(page: Page): Promise<number> {
 
 export async function startPaidSession(page: Page): Promise<void> {
   await page.getByTestId('new-guest').click();
-  await expect(page.getByTestId('confirm')).toContainText('손님에게 칩 6개를 받으세요 (참가비 1 + 게임 칩 5)');
+  await expect(page.getByTestId('confirm')).toContainText('손님에게 칩 5개를 받으세요');
   await page.getByTestId('confirm-start').click();
-  await expect(page.getByTestId('stack')).toHaveText('게임 칩 5개');
+  await expect(page.getByTestId('stack')).toHaveText('칩 5개');
+}
+
+/** The chips a hit wins (and a miss loses) for the chosen level and bet, read from the status bar. */
+export async function stakeShown(page: Page): Promise<number> {
+  const m = /맞히면 \+(\d+)/.exec((await page.getByTestId('stakes').textContent()) ?? '');
+  if (!m) throw new Error('no stakes shown');
+  return Number(m[1]);
 }
 
 export async function openAdmin(page: Page, pin = '0000'): Promise<void> {
