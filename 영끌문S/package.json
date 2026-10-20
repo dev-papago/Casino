@@ -1,7 +1,7 @@
 {
   "name": "yeongkkeulmoon-s",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "description": "영끌문S 모의 트레이딩 게임 (offline, single-file build)",
   "author": "casion",
@@ -37,6 +37,10 @@
     "directories": {
       "output": "release"
     },
+    "electronLanguages": [
+      "ko",
+      "en-US"
+    ],
     "files": [
       "dist/index.html",
       "electron/main.cjs",

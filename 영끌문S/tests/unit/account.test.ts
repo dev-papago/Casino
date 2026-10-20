@@ -29,7 +29,7 @@ describe('account', () => {
   });
 
   it('buy takes margin plus fee and opens margin × leverage of stock', () => {
-    const a = ok(buy(newAccount(econ), 'kingka', 50, 100, 10, econ));
+    const a = ok(buy(newAccount(econ), { stockId: 'kingka', price: 50, margin: 100, leverage: 10 }, econ));
     const pos = a.positions.kingka;
     expect(a.cash).toBe(1000 - 100 - 1); // fee 0.1% of $1,000
     expect(pos.qty).toBeCloseTo(20); // $1,000 / $50
@@ -39,27 +39,30 @@ describe('account', () => {
 
   it('rejects bad orders', () => {
     const a = newAccount(econ);
-    expect(buy(a, 'kingka', 50, 5, 1, econ)).toEqual({ ok: false, error: 'amount' });
-    expect(buy(a, 'kingka', 50, Number.NaN, 1, econ)).toEqual({ ok: false, error: 'amount' });
-    expect(buy(a, 'kingka', 50, 1000, 1, econ)).toEqual({ ok: false, error: 'cash' }); // no room for the fee
-    expect(buy(a, 'kingka', 50, 100, 7, econ)).toEqual({ ok: false, error: 'leverage' });
-    const held = ok(buy(a, 'kingka', 50, 100, 5, econ));
-    expect(buy(held, 'kingka', 50, 100, 10, econ)).toEqual({ ok: false, error: 'leverage' });
+    expect(buy(a, { stockId: 'kingka', price: 50, margin: 5, leverage: 1 }, econ)).toEqual({ ok: false, error: 'amount' });
+    expect(buy(a, { stockId: 'kingka', price: 50, margin: Number.NaN, leverage: 1 }, econ)).toEqual({ ok: false, error: 'amount' });
+    expect(buy(a, { stockId: 'kingka', price: 50, margin: 1000, leverage: 1 }, econ)).toEqual({ ok: false, error: 'cash' }); // no room for the fee
+    expect(buy(a, { stockId: 'kingka', price: 50, margin: 100, leverage: 20 }, econ)).toEqual({ ok: false, error: 'leverage' }); // up to 10×
+    const held = ok(buy(a, { stockId: 'kingka', price: 50, margin: 100, leverage: 5 }, econ));
+    expect(buy(held, { stockId: 'kingka', price: 50, margin: 100, leverage: 10 }, econ)).toEqual({ ok: false, error: 'leverage' });
+    const order = { stockId: 'gamestop', price: 10, margin: 100, maxLeverage: 2 };
+    expect(buy(a, { ...order, leverage: 5 }, econ)).toEqual({ ok: false, error: 'limit' }); // the stock's own limit
+    expect(buy(a, { ...order, leverage: 2 }, econ).ok).toBe(true);
     expect(sell(a, 'kingka', 50, 1, econ)).toEqual({ ok: false, error: 'position' });
   });
 
   it('leverage above 1× needs the equity to reach leverageFrom', () => {
     const real = CONFIG.economy;
     const a = newAccount(real);
-    expect(buy(a, 'kingka', 50, 100, 5, real)).toEqual({ ok: false, error: 'locked' }); // defaults to cash
-    expect(buy(a, 'kingka', 50, 100, 5, real, real.leverageFrom - 0.01)).toEqual({ ok: false, error: 'locked' });
-    expect(buy(a, 'kingka', 50, 100, 5, real, real.leverageFrom).ok).toBe(true);
-    expect(buy(a, 'kingka', 50, 100, 1, real, 0).ok).toBe(true); // 1× is always open
+    expect(buy(a, { stockId: 'kingka', price: 50, margin: 100, leverage: 5 }, real)).toEqual({ ok: false, error: 'locked' }); // defaults to cash
+    expect(buy(a, { stockId: 'kingka', price: 50, margin: 100, leverage: 5 }, real, real.leverageFrom - 0.01)).toEqual({ ok: false, error: 'locked' });
+    expect(buy(a, { stockId: 'kingka', price: 50, margin: 100, leverage: 5 }, real, real.leverageFrom).ok).toBe(true);
+    expect(buy(a, { stockId: 'kingka', price: 50, margin: 100, leverage: 1 }, real, 0).ok).toBe(true); // 1× is always open
   });
 
   it('adding to a position averages the entry and keeps margin = qty × entry / leverage', () => {
-    let a = ok(buy(newAccount(econ), 'lownix', 100, 100, 5, econ));
-    a = ok(buy(a, 'lownix', 120, 200, 5, econ));
+    let a = ok(buy(newAccount(econ), { stockId: 'lownix', price: 100, margin: 100, leverage: 5 }, econ));
+    a = ok(buy(a, { stockId: 'lownix', price: 120, margin: 200, leverage: 5 }, econ));
     const pos = a.positions.lownix;
     expect(pos.qty).toBeCloseTo(5 + 1000 / 120);
     expect(pos.margin).toBe(300);
@@ -67,7 +70,7 @@ describe('account', () => {
   });
 
   it('selling returns margin plus profit minus fee', () => {
-    const a = ok(buy(newAccount(econ), 'kingka', 50, 100, 10, econ));
+    const a = ok(buy(newAccount(econ), { stockId: 'kingka', price: 50, margin: 100, leverage: 10 }, econ));
     const up = sell(a, 'kingka', 55, 1, econ);
     if (!up.ok) throw new Error();
     // 20 shares × $5 = +$100; fee 0.1% of $1,100 = $1.10
@@ -81,7 +84,7 @@ describe('account', () => {
   });
 
   it('liquidates at the liquidation price and loses exactly the margin', () => {
-    const a = ok(buy(newAccount(econ), 'gamestop', 10, 100, 20, econ));
+    const a = ok(buy(newAccount(econ), { stockId: 'gamestop', price: 10, margin: 100, leverage: 10 }, econ));
     const liq = liquidationPrice(a.positions.gamestop, econ);
     expect(liquidate(a, { gamestop: liq + 0.01 }, econ).fills).toHaveLength(0);
     const r = liquidate(a, { gamestop: liq * 0.5 }, econ);
@@ -92,17 +95,47 @@ describe('account', () => {
   });
 
   it('never liquidates a 1× position, however far it falls', () => {
-    const a = ok(buy(newAccount(econ), 'gamestop', 10, 100, 1, econ));
+    const a = ok(buy(newAccount(econ), { stockId: 'gamestop', price: 10, margin: 100, leverage: 1 }, econ));
     expect(liquidationPrice(a.positions.gamestop, econ)).toBe(0);
     expect(liquidate(a, { gamestop: 0.01 }, econ).fills).toHaveLength(0);
   });
 
   it('never pays out below zero, even after a gap through the liquidation price', () => {
-    const a = ok(buy(newAccount(econ), 'gamestop', 10, 100, 20, econ));
+    const a = ok(buy(newAccount(econ), { stockId: 'gamestop', price: 10, margin: 100, leverage: 10 }, econ));
     const r = sell(a, 'gamestop', 1, 1, econ);
     if (!r.ok) throw new Error();
     expect(r.fill.cashDelta).toBe(0);
     expect(equity(a, { gamestop: 1 })).toBe(a.cash);
+  });
+
+  it('인버스 gains when the price falls and loses when it rises', () => {
+    const a = ok(buy(newAccount(econ), { stockId: 'mwodna', price: 50, margin: 100, leverage: 10, inverse: true }, econ));
+    expect(a.positions.mwodna.inverse).toBe(true);
+    const down = sell(a, 'mwodna', 45, 1, econ);
+    if (!down.ok) throw new Error();
+    // 20 shares × $5 = +$100; fee 0.1% of 20 × $45 = $0.90
+    expect(down.fill.cashDelta).toBeCloseTo(199.1);
+    expect(equity(a, { mwodna: 55 })).toBeCloseTo(a.cash); // −$100: the whole margin
+  });
+
+  it('liquidates an 인버스 above the entry, at every leverage', () => {
+    for (const L of econ.leverages) {
+      const a = ok(buy(newAccount(econ), { stockId: 'gamestop', price: 10, margin: 100, leverage: L, inverse: true }, econ));
+      const liq = liquidationPrice(a.positions.gamestop, econ);
+      expect(liq).toBeCloseTo(10 * (1 + (1 - econ.maintenance) / L));
+      expect(liquidate(a, { gamestop: liq - 0.01 }, econ).fills).toHaveLength(0);
+      const r = liquidate(a, { gamestop: liq * 2 }, econ);
+      expect(r.fills).toHaveLength(1);
+      expect(r.account.cash).toBe(a.cash); // the margin is gone, nothing more
+    }
+  });
+
+  it('adds only in the direction already held', () => {
+    const long = ok(buy(newAccount(econ), { stockId: 'kingka', price: 50, margin: 100, leverage: 2 }, econ));
+    expect(buy(long, { stockId: 'kingka', price: 50, margin: 100, leverage: 2, inverse: true }, econ)).toEqual({ ok: false, error: 'side' });
+    const inv = ok(buy(newAccount(econ), { stockId: 'kingka', price: 50, margin: 100, leverage: 2, inverse: true }, econ));
+    expect(buy(inv, { stockId: 'kingka', price: 50, margin: 100, leverage: 2 }, econ)).toEqual({ ok: false, error: 'side' });
+    expect(ok(buy(inv, { stockId: 'kingka', price: 40, margin: 100, leverage: 2, inverse: true }, econ)).positions.kingka.inverse).toBe(true);
   });
 
   it('the max button always fits the cash, fee included', () => {
@@ -110,7 +143,7 @@ describe('account', () => {
       for (const L of econ.leverages) {
         const m = maxMargin(cash, L, econ);
         expect(m + openFee(m, L, econ)).toBeLessThanOrEqual(cash);
-        if (m >= econ.minOrder) expect(buy({ ...newAccount(econ), cash }, 'kingka', 64, m, L, econ).ok).toBe(true);
+        if (m >= econ.minOrder) expect(buy({ ...newAccount(econ), cash }, { stockId: 'kingka', price: 64, margin: m, leverage: L }, econ).ok).toBe(true);
       }
     }
   });
@@ -123,7 +156,7 @@ describe('account', () => {
   it('is broke with no position and less than the smallest order', () => {
     expect(isBroke({ ...newAccount(econ), cash: 9.99 }, econ)).toBe(true);
     expect(isBroke({ ...newAccount(econ), cash: 50 }, econ)).toBe(false);
-    const held = ok(buy({ ...newAccount(econ), cash: 20 }, 'kingka', 64, 15, 1, econ));
+    const held = ok(buy({ ...newAccount(econ), cash: 20 }, { stockId: 'kingka', price: 64, margin: 15, leverage: 1 }, econ));
     expect(isBroke(held, econ)).toBe(false);
   });
 });

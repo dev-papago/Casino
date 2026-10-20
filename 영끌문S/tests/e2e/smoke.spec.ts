@@ -1,4 +1,4 @@
-// One full game: start, pick a stock, buy, sell, settle, back to the title.
+// One full game: start, pick a stock, buy, sell, 인버스, settle, back to the title.
 import { expect, test } from '@playwright/test';
 
 test('a game from the title screen to the settlement', async ({ page }) => {
@@ -12,10 +12,10 @@ test('a game from the title screen to the settlement', async ({ page }) => {
   await expect(app).toHaveAttribute('data-screen', 'trade');
   await expect(page.getByTestId('cash')).toHaveText('$1,000.00');
 
-  // Tabs run from the easiest stock to the hardest, and the game clock counts down to the close.
+  // Tabs run from the easiest stock to the hardest; there is no close, the clock shows the time played.
   const order = await page.locator('.tab').evaluateAll((els) => els.map((e) => e.getAttribute('data-testid')));
   expect(order).toEqual(['tab-kingka', 'tab-lownix', 'tab-dolge', 'tab-mwodna', 'tab-gamestop']);
-  await expect(page.getByTestId('clock')).toHaveText(/^0[45]:\d\d$/);
+  await expect(page.getByTestId('clock')).toHaveText(/^00:\d\d$/);
 
   // Leverage stays locked until the equity reaches econ.leverageFrom ($2,000).
   await expect(page.getByTestId('lev-5')).toBeDisabled();
@@ -54,13 +54,25 @@ test('a game from the title screen to the settlement', async ({ page }) => {
   await expect(page.getByTestId('sell')).toHaveText('체결 중…');
   await expect(page.getByTestId('holdings')).not.toContainText('게이임스탑');
 
-  // Selecting a tab shows that stock's description; there is nothing to sell there yet.
+  // Selecting a tab shows that stock's description and leverage limit; there is nothing to sell there yet.
   await page.getByTestId('tab-mwodna').click();
   await expect(page.getByTestId('detail-desc')).toContainText('암 백신');
+  await expect(page.getByTestId('detail-limit')).toHaveText('2배');
   await expect(page.getByTestId('sell')).toBeDisabled();
 
-  // Too large an order is refused before it reaches the account.
+  // 인버스 gains when the price falls. Holding it, the same stock cannot be bought the other way.
+  await page.getByTestId('side-inverse').click();
+  await expect(page.getByTestId('side-note')).toContainText('내리면 이익');
+  await page.getByTestId('amount').fill('100');
+  await page.getByTestId('buy').click();
+  await expect(page.getByTestId('tab-mwodna')).toContainText('인버스 1×');
+  await expect(page.getByTestId('holdings')).toContainText('인버스 1×');
   await page.getByTestId('side-buy').click();
+  await expect(page.getByTestId('buy')).toBeDisabled();
+  await expect(page.getByTestId('buy-msg')).toContainText('반대 방향');
+
+  // Too large an order is refused before it reaches the account.
+  await page.getByTestId('tab-dolge').click();
   await page.getByTestId('amount').fill('5000');
   await expect(page.getByTestId('buy')).toBeDisabled();
   await expect(page.getByTestId('buy-msg')).toHaveText('예탁금이 부족합니다');
@@ -69,7 +81,7 @@ test('a game from the title screen to the settlement', async ({ page }) => {
   await expect(page.getByTestId('confirm')).toBeVisible();
   await page.getByTestId('confirm-settle').click();
   await expect(page.getByTestId('result')).toContainText('정산 결과');
-  await expect(page.getByTestId('result')).toContainText('거래 횟수4회'); // 킹카콜라 is sold at the settlement
+  await expect(page.getByTestId('result')).toContainText('거래 횟수6회'); // 킹카콜라 and the 인버스 are sold at the settlement
 
   await page.getByTestId('restart').click();
   await expect(app).toHaveAttribute('data-screen', 'title');

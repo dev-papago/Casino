@@ -11,6 +11,7 @@
   --down: #3d8bff;
   --gold: #f5c542;
   --violet: #c04dff;
+  --inverse: #b46bff; /* 인버스: gains when the price falls */
   --neon: #3df5ff;
   color-scheme: dark;
   font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif;
@@ -188,12 +189,6 @@ button {
   letter-spacing: 0.06em;
 }
 
-.clock.urgent {
-  color: var(--up);
-  text-shadow: 0 0 0.6rem rgba(255, 69, 96, 0.8);
-  animation: blink 1s steps(2) infinite;
-}
-
 .top-actions {
   justify-self: end;
   display: flex;
@@ -323,6 +318,11 @@ button {
   background: var(--gold);
   border-radius: 99rem;
   padding: 0.05rem 0.45rem;
+}
+
+.tab-hold.inverse {
+  color: #fff;
+  background: var(--inverse);
 }
 
 .tab-ticker {
@@ -535,6 +535,10 @@ button {
   color: var(--ink);
 }
 
+.float.inverse {
+  color: var(--inverse);
+}
+
 @keyframes float-up {
   0% {
     opacity: 0;
@@ -630,6 +634,9 @@ button {
 .toast.down {
   border-left-color: var(--down);
 }
+.toast.inverse {
+  border-left-color: var(--inverse);
+}
 .toast.warn {
   border-left-color: var(--gold);
   color: var(--gold);
@@ -691,7 +698,7 @@ button {
 
 .side-tabs {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1fr 1fr 1fr;
   gap: 0.3rem;
   margin-bottom: 0.55rem;
 }
@@ -711,6 +718,26 @@ button {
   background: rgba(255, 69, 96, 0.16);
   border-color: var(--up);
   color: var(--up);
+}
+
+.side-tab.inverse.active {
+  background: rgba(180, 107, 255, 0.16);
+  border-color: var(--inverse);
+  color: var(--inverse);
+}
+
+.side-note {
+  font-size: 0.75rem;
+  font-weight: 700;
+  color: var(--up);
+}
+
+.side-note.inverse {
+  color: var(--inverse);
+}
+
+dd.inverse {
+  color: var(--inverse);
 }
 
 .side-tab.sell.active {
@@ -857,6 +884,11 @@ button {
   box-shadow: 0 0 1.2rem rgba(255, 69, 96, 0.45);
 }
 
+.big-btn.inverse {
+  background: linear-gradient(180deg, #c99bff, #8a3ee6);
+  box-shadow: 0 0 1.2rem rgba(180, 107, 255, 0.45);
+}
+
 .big-btn.sell {
   background: linear-gradient(180deg, #6aa8ff, #1f68e0);
   box-shadow: 0 0 1.2rem rgba(61, 139, 255, 0.45);
@@ -914,6 +946,10 @@ button {
 
 .h-lev {
   color: var(--gold);
+}
+
+.holding.inverse .h-lev {
+  color: var(--inverse);
 }
 
 .h-pnl {
@@ -1023,6 +1059,11 @@ button {
   font-size: 3.4rem;
   font-weight: 900;
   font-variant-numeric: tabular-nums;
+}
+
+.result-time {
+  color: var(--dim);
+  font-size: 0.85rem;
 }
 
 .result-net {

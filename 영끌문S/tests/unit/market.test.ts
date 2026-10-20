@@ -62,12 +62,12 @@ describe('market', () => {
     expect(changes.kingka).toBeLessThan(changes.gamestop / 5);
   });
 
-  it('keeps each tendency over a game while the next seconds stay a coin flip (many games)', () => {
+  it('keeps each tendency over 5 minutes, pays neither direction, and the next seconds stay a coin flip', () => {
     const rng = seededRng(4);
-    const N = 200;
-    const GAME = T.sessionSec * SEC;
+    const N = 300;
+    const GAME = 300 * SEC;
     const ups: Record<string, number> = {};
-    const mean: Record<string, number> = {};
+    const ends: Record<string, number[]> = {};
     const persist: Record<string, [number, number]> = {};
     for (let g = 0; g < N; g++) {
       const m = new Market(rng);
@@ -84,7 +84,7 @@ describe('market', () => {
       m.stocks.forEach((s, k) => {
         const id = s.def.id;
         ups[id] = (ups[id] ?? 0) + (s.price > s.def.start ? 1 / N : 0);
-        mean[id] = (mean[id] ?? 0) + (s.price / s.def.start - 1) / N;
+        (ends[id] ??= []).push(s.price / s.def.start);
         const p = (persist[id] ??= [0, 0]);
         for (let j = 1; j < moves[k].length; j++) {
           p[0] += moves[k][j] === moves[k][j - 1] ? 1 : 0;
@@ -92,10 +92,15 @@ describe('market', () => {
         }
       });
     }
-    expect(ups.kingka).toBeGreaterThan(0.65); // safe climb
-    expect(mean.lownix).toBeGreaterThan(mean.kingka); // climbs faster on average
+    expect(ups.kingka).toBeGreaterThan(0.52); // mostly climbs (and sometimes drops hard)
     expect(ups.lownix).toBeGreaterThan(0.55);
-    expect(ups.mwodna).toBeLessThan(0.35); // declines
+    expect(ups.mwodna).toBeLessThan(0.4); // mostly slides (and sometimes spikes)
+    for (const [id, xs] of Object.entries(ends)) {
+      // 인버스 exists and the market never closes, so the expected price must not move either way.
+      const mean = xs.reduce((s, x) => s + x, 0) / N;
+      const sd = Math.sqrt(xs.reduce((s, x) => s + (x - mean) ** 2, 0) / N);
+      expect(Math.abs(mean - 1), id).toBeLessThan((3 * sd) / Math.sqrt(N));
+    }
     for (const id of ['kingka', 'lownix', 'dolge', 'mwodna']) {
       const [same, all] = persist[id];
       expect(same / all, id).toBeLessThan(0.58); // the last 10 s say little about the next 10 s
