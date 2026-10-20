@@ -1,7 +1,9 @@
 // Candle chart on a canvas: price bars only, no indicators. Each candle is timing.ticksPerCandle ticks of quotes
-// (3 seconds); the last one is still forming. The mouse wheel zooms: fewer, wider candles or more, thinner ones.
-// The price range eases toward the visible candles so the chart does not jump. A low-volume stock gets a wider
-// range around them (volume.chartPad), so its candles look short and a busy stock's look long.
+// (3 seconds); the last one is still forming. Holding the mouse button and dragging resizes the candles:
+// left / right makes them narrower / wider (more or fewer on screen), down / up makes them shorter / taller.
+// A double click restores the default size. The price range eases toward the visible candles so the chart does
+// not jump. A low-volume stock gets a wider range around them (volume.chartPad), so its candles look short and a
+// busy stock's look long; the vertical size multiplies that for every stock.
 // Extra horizontal lines mark the player's average entry and liquidation price.
 import type { Range } from '../config.ts';
 import type { Candle, Stock } from '../game/market.ts';
@@ -18,13 +20,18 @@ const DOWN = '#3d8bff';
 const GRID = 'rgba(140, 170, 255, 0.08)';
 const AXIS_TEXT = 'rgba(200, 215, 255, 0.6)';
 const FONT = "'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif";
-const ZOOM_PER_DELTA = 0.0015; // one wheel notch (deltaY ≈ 100) changes the candle count by about 16%
+const DRAG_PER_PX = 0.006; // 100 px of drag scales the candles by about 1.8×
+const STRETCH: Range = [0.3, 5]; // vertical size, relative to the default
+const KEEP_IN_VIEW = 0.85; // when stretched, the newest price stays within this share of the half range
 
 export class CandleChart {
   readonly el: HTMLDivElement;
   private readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D;
   private visible: number;
+  private stretch = 1; // vertical candle size, relative to the default
+  private dragging = false;
+  private readonly defaultVisible: number;
   private readonly candleSec: number;
   private lo = Number.NaN;
   private hi = Number.NaN;
@@ -32,7 +39,7 @@ export class CandleChart {
   private last = { x: 0, y: 0 };
 
   constructor(visible: number, zoom: Range, candleSec: number) {
-    this.visible = visible;
+    this.visible = this.defaultVisible = visible;
     this.candleSec = candleSec;
     this.canvas = document.createElement('canvas');
     this.canvas.className = 'chart-canvas';
@@ -40,17 +47,42 @@ export class CandleChart {
     this.el = document.createElement('div');
     this.el.className = 'chart';
     this.el.dataset.candles = String(visible);
+    this.el.dataset.stretch = '1.00';
     this.el.append(this.canvas);
-    this.el.addEventListener(
-      'wheel',
-      (e) => {
-        e.preventDefault(); // no page scroll, no browser zoom
-        const delta = clamp(e.deltaY, -200, 200);
-        this.visible = Math.round(clamp(this.visible * Math.exp(delta * ZOOM_PER_DELTA), zoom[0], zoom[1]));
-        this.el.dataset.candles = String(this.visible);
-      },
-      { passive: false },
-    );
+
+    let start = { x: 0, y: 0, visible: 0, stretch: 1 };
+    this.el.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      this.el.setPointerCapture(e.pointerId);
+      this.dragging = true;
+      this.el.classList.add('dragging');
+      start = { x: e.clientX, y: e.clientY, visible: this.visible, stretch: this.stretch };
+    });
+    this.el.addEventListener('pointermove', (e) => {
+      if (!this.dragging) return;
+      const dx = e.clientX - start.x;
+      const dy = e.clientY - start.y;
+      this.setSize(start.visible * Math.exp(-dx * DRAG_PER_PX), start.stretch * Math.exp(-dy * DRAG_PER_PX), zoom);
+    });
+    const end = (e: PointerEvent): void => {
+      if (!this.dragging) return;
+      this.dragging = false;
+      this.el.classList.remove('dragging');
+      if (this.el.hasPointerCapture(e.pointerId)) this.el.releasePointerCapture(e.pointerId);
+    };
+    this.el.addEventListener('pointerup', end);
+    this.el.addEventListener('pointercancel', end);
+    this.el.addEventListener('dblclick', () => this.setSize(this.defaultVisible, 1, zoom));
+    // No page scroll and no browser zoom (Ctrl + wheel) over the chart.
+    this.el.addEventListener('wheel', (e) => e.preventDefault(), { passive: false });
+  }
+
+  private setSize(visible: number, stretch: number, zoom: Range): void {
+    this.visible = Math.round(clamp(visible, zoom[0], zoom[1]));
+    this.stretch = clamp(stretch, STRETCH[0], STRETCH[1]);
+    this.el.dataset.candles = String(this.visible);
+    this.el.dataset.stretch = this.stretch.toFixed(2);
   }
 
   /** Snap the price range on the next draw (another stock was selected or a new game started). */
@@ -83,7 +115,7 @@ export class CandleChart {
     const P = this.plot;
 
     const candles: Candle[] = [...stock.candles.slice(-(this.visible - 1)), stock.live];
-    this.ease(candles, stock.def.volume.chartPad);
+    this.ease(candles, stock.def.volume.chartPad / this.stretch, stock.price);
     const span = this.hi - this.lo;
     const yOf = (p: number): number => P.y + (1 - (p - this.lo) / span) * P.h;
     const d = stock.def.decimals;
@@ -95,11 +127,6 @@ export class CandleChart {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(stock.def.ticker, P.x + P.w / 2, P.y + P.h / 2);
-    ctx.font = `600 ${rem * 0.7}px ${FONT}`;
-    ctx.fillStyle = AXIS_TEXT;
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'bottom';
-    ctx.fillText(`봉 ${this.candleSec}초 · ${this.visible}개 · 마우스 휠로 확대/축소`, P.x + rem * 0.3, h - rem * 0.25);
     ctx.restore();
 
     // Price grid and axis labels
@@ -124,7 +151,7 @@ export class CandleChart {
     const body = Math.max(1, slot * 0.66);
     ctx.save();
     ctx.beginPath();
-    ctx.rect(P.x, 0, P.w, h);
+    ctx.rect(P.x, P.y, P.w, P.h); // stretched candles run off the top and bottom, not over the labels
     ctx.clip();
     candles.forEach((c, i) => {
       // A game starts with only the live candle: candles fill in from the left edge, then scroll.
@@ -149,6 +176,18 @@ export class CandleChart {
     });
     ctx.restore();
 
+    // How to resize, on a dark strip over the candles
+    ctx.save();
+    ctx.font = `600 ${rem * 0.7}px ${FONT}`;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'bottom';
+    const hint = `봉 ${this.candleSec}초 · ${this.visible}개 · 높이 ×${this.stretch.toFixed(1)} · 끌기: 좌우 폭 / 상하 높이 · 더블클릭: 원래대로`;
+    ctx.fillStyle = 'rgba(3, 6, 14, 0.8)';
+    ctx.fillRect(P.x, h - rem * 1.15, ctx.measureText(hint).width + rem * 0.6, rem * 1.15);
+    ctx.fillStyle = AXIS_TEXT;
+    ctx.fillText(hint, P.x + rem * 0.3, h - rem * 0.25);
+    ctx.restore();
+
     // Position lines, then the last price on top
     for (const line of lines) this.hline(line.price, line.color, line.label, d, rem, yOf, true);
     const live = stock.live;
@@ -157,18 +196,20 @@ export class CandleChart {
     this.last = { x: P.x + (candles.length - 0.5) * slot, y: clamp(yOf(stock.price), P.y, P.y + P.h) };
   }
 
-  private ease(candles: readonly Candle[], chartPad: number): void {
+  private ease(candles: readonly Candle[], chartPad: number, price: number): void {
     let lo = Infinity;
     let hi = -Infinity;
     for (const c of candles) {
       if (c.l < lo) lo = c.l;
       if (c.h > hi) hi = c.h;
     }
-    const mid = (lo + hi) / 2;
-    const half = Math.max((hi - lo) / 2, mid * 0.004) * chartPad;
+    const half = Math.max((hi - lo) / 2, ((lo + hi) / 2) * 0.004) * chartPad;
+    // Stretched taller than the candles fit, the view follows the newest price instead of their middle.
+    const keep = half * KEEP_IN_VIEW;
+    const mid = clamp((lo + hi) / 2, price - keep, price + keep);
     const tLo = mid - half;
     const tHi = mid + half;
-    if (Number.isNaN(this.lo)) {
+    if (Number.isNaN(this.lo) || this.dragging) {
       this.lo = tLo;
       this.hi = tHi;
       return;

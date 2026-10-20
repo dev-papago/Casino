@@ -110,9 +110,6 @@ export function mountApp(root: HTMLElement): void {
   const detailHigh = h('dd', { class: 'up' });
   const detailLow = h('dd', { class: 'down' });
   const detailVolume = h('dd', { 'data-testid': 'detail-volume' });
-  const detailQuote = h('dd', {});
-  const detailFill = h('dd', { 'data-testid': 'detail-fill' });
-  const detailLimit = h('dd', { 'data-testid': 'detail-limit' });
 
   // Center: chart header
   const headName = h('span', { class: 'head-name' });
@@ -139,7 +136,7 @@ export function mountApp(root: HTMLElement): void {
     h('button', { class: 'seg-btn', type: 'button', 'data-testid': `lev-${L}`, onclick: () => setLeverage(L) }, `${L}×`),
   );
   const sideNote = h('div', { class: 'side-note', 'data-testid': 'side-note' });
-  const levNote = h('div', { class: 'note' });
+  const levNote = h('div', { class: 'note', hidden: true }, '보유 중인 레버리지로 고정');
   const levLockNote = h('div', { class: 'note', 'data-testid': 'lev-lock', hidden: true }, `평가 자산 ${usd(econ.leverageFrom, 0)}부터 레버리지 사용 가능`);
   const amountInput = h('input', {
     class: 'amount-input',
@@ -256,12 +253,6 @@ export function mountApp(root: HTMLElement): void {
           detailLow,
           h('dt', {}, '거래량'),
           detailVolume,
-          h('dt', {}, '시세 갱신'),
-          detailQuote,
-          h('dt', {}, '체결'),
-          detailFill,
-          h('dt', {}, '레버리지 한도'),
-          detailLimit,
         ),
       ),
     ),
@@ -312,7 +303,7 @@ export function mountApp(root: HTMLElement): void {
   }
 
   function setLeverage(L: number): void {
-    if (account.positions[selected] || (L > 1 && leverageLocked()) || L > current().def.maxLeverage) return;
+    if (account.positions[selected] || (L > 1 && leverageLocked())) return;
     leverage = L;
     sfx.play('click');
     render();
@@ -343,7 +334,7 @@ export function mountApp(root: HTMLElement): void {
   }
 
   /** The held position's leverage, else the chosen one within the stock's limit (one of econ.leverages). */
-  const effectiveLeverage = (): number => account.positions[selected]?.leverage ?? Math.min(leverage, current().def.maxLeverage);
+  const effectiveLeverage = (): number => account.positions[selected]?.leverage ?? leverage;
   /** Leverage above 1× opens once the equity reaches econ.leverageFrom. */
   const leverageLocked = (): boolean => equity(account, market.prices()) < econ.leverageFrom;
   const current = (): Stock => market.get(selected);
@@ -377,7 +368,7 @@ export function mountApp(root: HTMLElement): void {
     const { id, margin, leverage: L, inverse } = order;
     const r =
       order.kind === 'buy'
-        ? buy(account, { stockId: id, price: st.price, margin, leverage: L, inverse, maxLeverage: st.def.maxLeverage }, econ, equity(account, market.prices()))
+        ? buy(account, { stockId: id, price: st.price, margin, leverage: L, inverse }, econ, equity(account, market.prices()))
         : sell(account, id, st.price, order.fraction, econ);
     applyTrade(r, st);
   }
@@ -510,10 +501,9 @@ export function mountApp(root: HTMLElement): void {
               h('b', {}, usd(econ.leverageFrom, 0)),
               `부터 레버리지 최대 `,
               h('b', {}, `${Math.max(...econ.leverages)}배`),
-              ' (종목마다 한도) — 청산가에 닿으면 증거금 전액 손실',
+              ' — 청산가에 닿으면 증거금 전액 손실',
             ),
             h('li', {}, `매수·매도 때 주문 규모의 ${num(econ.feeRate * 100, 1)}% 수수료`),
-            h('li', {}, '거래량이 많은 종목일수록 시세가 빨리 바뀌고 체결이 늦다 (킹카콜라 즉시 … 게이임스탑 0.4~1초)'),
             h('li', {}, h('b', {}, '장 마감 없음'), ' — 원할 때 정산하기를 눌러 끝냅니다'),
           ),
           button('게임 시작', () => startGame(), { kind: 'primary', key: 'Enter', testid: 'start' }),
@@ -606,9 +596,6 @@ export function mountApp(root: HTMLElement): void {
     setText(detailLow, usd(extremes[selected].lo, d));
     const vol = def.volume;
     setText(detailVolume, `${'▮'.repeat(vol.level)}${'▯'.repeat(5 - vol.level)} ${VOLUME_LABEL[vol.level]}`);
-    setText(detailQuote, vol.quoteSec >= 1 ? `약 ${num(vol.quoteSec, 0)}초마다` : `초당 약 ${num(1 / vol.quoteSec, 0)}번`);
-    setText(detailFill, vol.fillDelay[1] > 0 ? `${num(vol.fillDelay[0], 1)}~${num(vol.fillDelay[1], 1)}초 뒤 그때 가격` : '즉시 (보이는 가격)');
-    setText(detailLimit, `${def.maxLeverage}배`);
 
     // Chart head
     setText(headName, def.name);
@@ -645,10 +632,9 @@ export function mountApp(root: HTMLElement): void {
     levBtns.forEach((b, i) => {
       const Li = econ.leverages[i];
       b.classList.toggle('active', Li === L);
-      b.disabled = pos ? Li !== L : (locked && Li > 1) || Li > def.maxLeverage;
+      b.disabled = pos ? Li !== L : locked && Li > 1;
     });
-    setText(levNote, pos ? '보유 중인 레버리지로 고정' : `이 종목은 최대 ${def.maxLeverage}배`);
-    levNote.hidden = !pos && def.maxLeverage >= Math.max(...econ.leverages);
+    levNote.hidden = !pos;
     levLockNote.hidden = !locked;
     if (document.activeElement !== amountInput && amountInput.value !== (amount ? String(amount) : '')) {
       amountInput.value = amount ? String(amount) : '';

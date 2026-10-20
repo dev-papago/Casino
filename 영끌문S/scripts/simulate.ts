@@ -31,7 +31,6 @@ const STOCKS = [...CONFIG.stocks].sort((a, b) => a.difficulty - b.difficulty);
 const IDS = STOCKS.map((s) => s.id);
 const NAME: Record<string, string> = Object.fromEntries(STOCKS.map((s) => [s.id, s.name]));
 const FILL: Record<string, Range> = Object.fromEntries(STOCKS.map((s) => [s.id, s.volume.fillDelay]));
-const LIMIT: Record<string, number> = Object.fromEntries(STOCKS.map((s) => [s.id, s.maxLeverage]));
 const DEP = econ.deposit;
 const MAX_LEV = Math.max(...econ.leverages);
 const REACTION: Range = [2, 4]; // ticks between seeing the chart and the click
@@ -83,11 +82,11 @@ function fill(b: Bot, v: View, o: Omit<Order, 'fillAt'>): void {
     if (r.ok) b.acc = r.account;
     return;
   }
-  // Above the stock's limit the app greys the button out; a bot gets the highest leverage the stock allows.
-  const L = b.acc.positions[o.id]?.leverage ?? Math.max(...econ.leverages.filter((x) => x <= Math.min(o.leverage, LIMIT[o.id])));
+  // A bot asking for a leverage the game does not offer gets the highest one below it.
+  const L = b.acc.positions[o.id]?.leverage ?? Math.max(...econ.leverages.filter((x) => x <= o.leverage));
   const margin = Math.floor(maxMargin(b.acc.cash, L, econ) * o.share * 100) / 100;
   if (margin < econ.minOrder) return;
-  const order = { stockId: o.id, price: v.prices[o.id], margin, leverage: L, inverse: o.inverse, maxLeverage: LIMIT[o.id] };
+  const order = { stockId: o.id, price: v.prices[o.id], margin, leverage: L, inverse: o.inverse };
   const r = buy(b.acc, order, econ, equity(b.acc, v.prices));
   if (r.ok) {
     b.acc = r.account;
@@ -362,8 +361,8 @@ function makeBots(): Bot[] {
     peakBot(1),
     peakBot(MAX_LEV),
     gamblerBot(),
-    ...IDS.map((id) => doubleThenHoldBot(id, LIMIT[id], false)),
-    ...IDS.map((id) => doubleThenHoldBot(id, LIMIT[id], true)),
+    ...IDS.map((id) => doubleThenHoldBot(id, MAX_LEV, false)),
+    ...IDS.map((id) => doubleThenHoldBot(id, MAX_LEV, true)),
   ];
 }
 

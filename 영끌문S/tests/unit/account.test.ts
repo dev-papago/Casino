@@ -45,9 +45,7 @@ describe('account', () => {
     expect(buy(a, { stockId: 'kingka', price: 50, margin: 100, leverage: 20 }, econ)).toEqual({ ok: false, error: 'leverage' }); // up to 10×
     const held = ok(buy(a, { stockId: 'kingka', price: 50, margin: 100, leverage: 5 }, econ));
     expect(buy(held, { stockId: 'kingka', price: 50, margin: 100, leverage: 10 }, econ)).toEqual({ ok: false, error: 'leverage' });
-    const order = { stockId: 'gamestop', price: 10, margin: 100, maxLeverage: 2 };
-    expect(buy(a, { ...order, leverage: 5 }, econ)).toEqual({ ok: false, error: 'limit' }); // the stock's own limit
-    expect(buy(a, { ...order, leverage: 2 }, econ).ok).toBe(true);
+    expect(buy(a, { stockId: 'gamestop', price: 10, margin: 100, leverage: 10 }, econ).ok).toBe(true); // every stock goes up to 10×
     expect(sell(a, 'kingka', 50, 1, econ)).toEqual({ ok: false, error: 'position' });
   });
 

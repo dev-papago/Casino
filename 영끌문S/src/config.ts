@@ -79,7 +79,6 @@ export interface StockDef {
   difficulty: Difficulty; // the tabs are sorted by this, easiest first
   description: string;
   bounds: Range; // soft price range as multiples of start; outside it the price is pulled back
-  maxLeverage: number; // leverage stops here for this stock: a 급등·급락 must not jump past the liquidation price
   volume: VolumeDef;
   wave?: WaveDef;
   noise: NoiseDef;
@@ -101,7 +100,7 @@ export interface GameConfig {
     tickMs: number;
     ticksPerCandle: number;
     historyCandles: number; // drawn before the game starts, ending at the start price (0: the chart starts empty)
-    visibleCandles: number; // candles on screen at first; the mouse wheel zooms within zoomCandles
+    visibleCandles: number; // candles on screen at first; dragging the chart sideways changes it within zoomCandles
     zoomCandles: Range;
     keepCandles: number;
     eventWindowSec: number; // each stock may get one 급등·급락 event per window
@@ -131,7 +130,6 @@ export const CONFIG: GameConfig = {
       difficulty: 1,
       description: '세계적인 필수소비재주. 장기적으로 우상향 하지만 조금 작은 확률로 우하향 한다. 가장 안전한 종목',
       bounds: [0.5, 3],
-      maxLeverage: 10,
       volume: { level: 1, quoteSec: 2, fillDelay: [0, 0], chartPad: 2.6 },
       noise: { vol: 0.001, wander: 0.3, wanderSec: 20, jumpRate: 0.01, jumpSize: [0.003, 0.008] },
       patterns: { amp: 0.008, sec: [45, 90], gapSec: [10, 30], bubble: 0, bubbleSec: [150, 240], bubbleAmp: 0 },
@@ -146,7 +144,6 @@ export const CONFIG: GameConfig = {
       difficulty: 2,
       description: '최근 수요가 폭증하고 있는 HBM의 선두주자. 가파르게 우상향 하지만 적은 확률로 단기간에 하락 가능',
       bounds: [0.4, 5],
-      maxLeverage: 2,
       volume: { level: 3, quoteSec: 0.6, fillDelay: [0.2, 0.5], chartPad: 1.5 },
       noise: { vol: 0.003, wander: 0.35, wanderSec: 15, jumpRate: 0.02, jumpSize: [0.005, 0.015] },
       patterns: { amp: 0.02, sec: [40, 90], gapSec: [10, 30], bubble: 0.05, bubbleSec: [150, 240], bubbleAmp: 0.12 },
@@ -161,7 +158,6 @@ export const CONFIG: GameConfig = {
       difficulty: 3,
       description: '최근 자금 유입이 높아진 크립토. 변동성이 큰 자산이므로 투자에 주의하자.',
       bounds: [0.35, 3],
-      maxLeverage: 10,
       volume: { level: 4, quoteSec: 0.3, fillDelay: [0.3, 0.7], chartPad: 1.2 },
       wave: {
         waves: [
@@ -184,7 +180,6 @@ export const CONFIG: GameConfig = {
       difficulty: 4,
       description: '암 백신 치료제를 개발하는 바이오주. 장기적으로 우하향 하지만 적은 확률로 급등 가능',
       bounds: [0.15, 3],
-      maxLeverage: 2,
       volume: { level: 2, quoteSec: 1, fillDelay: [0.1, 0.3], chartPad: 2 },
       noise: { vol: 0.004, wander: 0.35, wanderSec: 15, jumpRate: 0.03, jumpSize: [0.006, 0.02] },
       patterns: { amp: 0.022, sec: [40, 90], gapSec: [10, 30], bubble: 0, bubbleSec: [150, 240], bubbleAmp: 0 },
@@ -199,7 +194,6 @@ export const CONFIG: GameConfig = {
       difficulty: 5,
       description: '대형 헤지펀드 공매도 세력과 개미들의 피비린내 나는 전투 현장. 미쳐버린 저세상 차트를 보여준다',
       bounds: [0.03, 30],
-      maxLeverage: 2,
       volume: { level: 5, quoteSec: 0.1, fillDelay: [0.4, 1], chartPad: 1.12 },
       noise: {
         vol: 0.02,

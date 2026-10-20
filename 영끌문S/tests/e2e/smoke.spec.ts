@@ -21,17 +21,36 @@ test('a game from the title screen to the settlement', async ({ page }) => {
   await expect(page.getByTestId('lev-5')).toBeDisabled();
   await expect(page.getByTestId('lev-lock')).toBeVisible();
 
-  // The mouse wheel zooms the chart: down shows more (thinner) candles, up fewer (wider) ones.
+  // Hold and drag on the chart: right makes the candles wider (fewer on screen), up makes them taller.
+  // Left and down do the opposite, and a double click restores the default size.
   const chart = page.locator('.chart');
   await expect(chart).toHaveAttribute('data-candles', '100');
-  await chart.hover();
-  await page.mouse.wheel(0, 300);
-  await expect.poll(async () => Number(await chart.getAttribute('data-candles'))).toBeGreaterThan(100);
-  for (let i = 0; i < 4; i++) await page.mouse.wheel(0, -100); // one notch each
-  await expect.poll(async () => Number(await chart.getAttribute('data-candles'))).toBeLessThan(100);
+  await expect(chart).toHaveAttribute('data-stretch', '1.00');
+  const box = (await chart.boundingBox())!;
+  const cx = box.x + box.width / 2;
+  const cy = box.y + box.height / 2;
+  const drag = async (dx: number, dy: number): Promise<void> => {
+    await page.mouse.move(cx, cy);
+    await page.mouse.down();
+    await page.mouse.move(cx + dx, cy + dy, { steps: 5 });
+    await page.mouse.up();
+  };
+  const candles = async (): Promise<number> => Number(await chart.getAttribute('data-candles'));
+  const stretch = async (): Promise<number> => Number(await chart.getAttribute('data-stretch'));
+  await drag(120, -80);
+  expect(await candles()).toBeLessThan(100);
+  expect(await stretch()).toBeGreaterThan(1);
+  await chart.dblclick({ position: { x: box.width / 2, y: box.height / 2 } });
+  await expect(chart).toHaveAttribute('data-candles', '100');
+  await expect(chart).toHaveAttribute('data-stretch', '1.00');
+  await drag(-120, 80);
+  expect(await candles()).toBeGreaterThan(100);
+  expect(await stretch()).toBeLessThan(1);
 
   // 킹카콜라 trades little: it fills at once, at the shown price. $100 at 1× pays a $0.10 fee.
-  await expect(page.getByTestId('detail-fill')).toContainText('즉시');
+  // The detail panel no longer lists the quote rate, the fill delay or a leverage limit.
+  await expect(page.getByTestId('detail')).not.toContainText('시세 갱신');
+  await expect(page.getByTestId('detail')).not.toContainText('레버리지 한도');
   await page.getByTestId('lev-1').click();
   await page.getByTestId('amount').fill('100');
   await page.getByTestId('buy').click();
@@ -43,7 +62,6 @@ test('a game from the title screen to the settlement', async ({ page }) => {
 
   // 게이임스탑 trades frantically: the order waits 0.4-1 s, then fills at the price of that moment.
   await page.getByTestId('tab-gamestop').click();
-  await expect(page.getByTestId('detail-fill')).toContainText('0.4~1.0초');
   await page.getByTestId('buy').click();
   await expect(page.getByTestId('buy')).toHaveText('체결 중…');
   await expect(page.getByTestId('holdings')).toContainText('게이임스탑');
@@ -54,10 +72,9 @@ test('a game from the title screen to the settlement', async ({ page }) => {
   await expect(page.getByTestId('sell')).toHaveText('체결 중…');
   await expect(page.getByTestId('holdings')).not.toContainText('게이임스탑');
 
-  // Selecting a tab shows that stock's description and leverage limit; there is nothing to sell there yet.
+  // Selecting a tab shows that stock's description; there is nothing to sell there yet.
   await page.getByTestId('tab-mwodna').click();
   await expect(page.getByTestId('detail-desc')).toContainText('암 백신');
-  await expect(page.getByTestId('detail-limit')).toHaveText('2배');
   await expect(page.getByTestId('sell')).toBeDisabled();
 
   // 인버스 gains when the price falls. Holding it, the same stock cannot be bought the other way.

@@ -38,14 +38,13 @@ export interface Fill {
   cashDelta: number;
 }
 
-export type TradeError = 'amount' | 'cash' | 'leverage' | 'limit' | 'locked' | 'position' | 'price' | 'side';
+export type TradeError = 'amount' | 'cash' | 'leverage' | 'locked' | 'position' | 'price' | 'side';
 export type TradeResult = { ok: true; account: Account; fill: Fill } | { ok: false; error: TradeError };
 
 export const TRADE_ERROR_TEXT: Record<TradeError, string> = {
   amount: '주문 금액을 확인하세요',
   cash: '예탁금이 부족합니다',
   leverage: '보유 중인 레버리지로만 추가 매수할 수 있습니다',
-  limit: '이 종목의 레버리지 한도를 넘었습니다',
   locked: `레버리지는 평가 자산 $${CONFIG.economy.leverageFrom.toLocaleString('en-US')}부터 쓸 수 있습니다`,
   position: '보유 수량이 없습니다',
   price: '가격 오류',
@@ -96,12 +95,11 @@ export interface BuyOrder {
   margin: number;
   leverage: number;
   inverse?: boolean; // 인버스: gains when the price falls
-  maxLeverage?: number; // the stock's own limit (StockDef.maxLeverage)
 }
 
 export function buy(
   acc: Account,
-  { stockId, price, margin, leverage, inverse = false, maxLeverage = Infinity }: BuyOrder,
+  { stockId, price, margin, leverage, inverse = false }: BuyOrder,
   econ: EconomyConfig,
   assets = acc.cash, // equity at the current prices; leverage above 1× needs econ.leverageFrom
 ): TradeResult {
@@ -109,7 +107,6 @@ export function buy(
   margin = cents(margin);
   if (!Number.isFinite(margin) || margin < econ.minOrder) return { ok: false, error: 'amount' };
   if (!econ.leverages.includes(leverage)) return { ok: false, error: 'leverage' };
-  if (leverage > maxLeverage) return { ok: false, error: 'limit' };
   if (leverage > 1 && !(assets >= econ.leverageFrom)) return { ok: false, error: 'locked' };
   const held = acc.positions[stockId];
   if (held && held.inverse !== inverse) return { ok: false, error: 'side' };
