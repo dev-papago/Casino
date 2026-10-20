@@ -1,19 +1,14 @@
 // Price simulation (DESIGN.md section 2). Every stock moves on the same tick clock. Each tick the log of its true
-// price changes by its trend, the noise every stock gets, the chart formation being played (patterns.ts) and any
-// running 급등·급락 event (events.ts). What players see and trade is the quote: it catches up with the true price
-// only when the stock trades, which a busy stock does every tick and a quiet one every few seconds (volume).
-// Candles are built from quotes, so a candle's high and low are the extreme quotes inside it.
-// The RNG is injected: crypto in the app, seeded in tests and the sim.
-import {
-  CONFIG,
-  type GameConfig,
-  type NoiseDef,
-  type SteadyTrend,
-  type StockDef,
-  type TrendDef,
-  type WaveTrend,
-} from '../config.ts';
-import { between, gauss, type Rng } from '../rng.ts';
+// price changes by the noise every stock gets, 돌지코인's waves, the chart formation being played (patterns.ts)
+// and the 급등·급락 events with their drift (events.ts). Each part leaves the expected price (practically) where
+// it is, so with 매수 and 인버스 both open and no market close, neither direction pays on average: a stock's
+// tendency is the shape of its moves (creeps up and sometimes crashes, slides down and sometimes spikes), not
+// free money. What players see and trade is the quote: it catches up with the true price only when the stock
+// trades, which a busy stock does every tick and a quiet one every few seconds (volume). Candles are built from
+// quotes, so a candle's high and low are the extreme quotes inside it. The RNG is injected: crypto in the app,
+// seeded in tests and the sim.
+import { CONFIG, type GameConfig, type NoiseDef, type Range, type StockDef, type WaveDef } from '../config.ts';
+import { between, gauss, meanExp, type Rng } from '../rng.ts';
 import { makeEvents } from './events.ts';
 import { makePatterns } from './patterns.ts';
 
@@ -25,7 +20,7 @@ export interface Candle {
 }
 
 export interface Trend {
-  /** Log-price change for one tick from the trend alone, given the current log price. */
+  /** Log-price change for one tick from the waves alone, given the current log price. */
   step(x: number): number;
   /** Moves the trend's internal log levels by d (the history is shifted to end at the start price). */
   shift(d: number): void;
@@ -68,7 +63,7 @@ export class Market {
     this.engines = cfg.stocks.map((s) => {
       const quoteTicks = s.volume.quoteSec / dt;
       return {
-        trend: makeTrend(s.trend, rng, dt),
+        trend: s.wave ? wave(s.wave, rng, dt) : FLAT,
         noise: makeNoise(s.noise, rng, dt),
         patterns: makePatterns(s.patterns, rng, dt),
         events: makeEvents(s.events, rng, dt, cfg.timing.eventWindowSec),
@@ -152,21 +147,12 @@ export class Market {
 }
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
-
-export function makeTrend(m: TrendDef, rng: Rng, dt: number): Trend {
-  switch (m.kind) {
-    case 'steady':
-      return steady(m, rng, dt);
-    case 'wave':
-      return wave(m, rng, dt);
-    case 'drift':
-      return { step: () => m.drift * dt, shift() {} };
-  }
-}
+const FLAT: Trend = { step: () => 0, shift() {} };
 
 /**
  * One tick of noise. The log volatility is an Ornstein-Uhlenbeck process (stationary spread `wander`), scaled so
  * the average variance stays vol²: calm and choppy stretches come and go without changing the overall size.
+ * Each Gaussian step and each jump carries the small drift that keeps the expected price where it is.
  * Needles are a separate fast mean-reverting deviation, so they snap back instead of adding up.
  */
 function makeNoise(n: NoiseDef, rng: Rng, dt: number): () => number {
@@ -174,11 +160,14 @@ function makeNoise(n: NoiseDef, rng: Rng, dt: number): () => number {
   const kick = n.wander * Math.sqrt(2 * keep);
   const scale = n.vol * Math.sqrt(dt);
   const needle = n.needle;
+  const neg: Range = [-n.jumpSize[1], -n.jumpSize[0]];
+  const jumpDrift = -Math.log1p(n.jumpRate * dt * ((meanExp(n.jumpSize) + meanExp(neg)) / 2 - 1));
   let h = n.wander * gauss(rng); // start somewhere in the stationary spread
   let dev = 0;
   return () => {
     h += -h * keep + kick * gauss(rng);
-    let dx = scale * Math.exp(h - n.wander * n.wander) * gauss(rng);
+    const sd = scale * Math.exp(h - n.wander * n.wander);
+    let dx = sd * gauss(rng) - (sd * sd) / 2 + jumpDrift;
     if (n.jumpRate > 0 && rng.float() < n.jumpRate * dt) dx += (rng.coin() ? 1 : -1) * between(rng, n.jumpSize);
     if (needle) {
       const before = dev;
@@ -190,28 +179,7 @@ function makeNoise(n: NoiseDef, rng: Rng, dt: number): () => number {
   };
 }
 
-/** Ticks in a random duration: exponential with the given mean (seconds), at least one tick. */
-const expTicks = (rng: Rng, meanSec: number, dt: number): number =>
-  Math.max(1, Math.round((-Math.log(1 - rng.float()) * meanSec) / dt));
-
-function steady(m: SteadyTrend, rng: Rng, dt: number): Trend {
-  let up = rng.float() < m.up.meanSec / (m.up.meanSec + m.down.meanSec);
-  let left = expTicks(rng, up ? m.up.meanSec : m.down.meanSec, dt);
-  let strength = between(rng, [0.5, 1.5]);
-  return {
-    step() {
-      if (left-- <= 0) {
-        up = !up;
-        left = expTicks(rng, up ? m.up.meanSec : m.down.meanSec, dt);
-        strength = between(rng, [0.5, 1.5]);
-      }
-      return (up ? m.up.drift : m.down.drift) * strength * dt;
-    },
-    shift() {},
-  };
-}
-
-function wave(m: WaveTrend, rng: Rng, dt: number): Trend {
+function wave(m: WaveDef, rng: Rng, dt: number): Trend {
   const comps = m.waves.map((w) => ({ w, phase: rng.float() * TAU, speed: 0, amp: 0 }));
   const renew = (c: (typeof comps)[number]): void => {
     c.speed = (TAU / between(rng, c.w.periodSec)) * dt;
@@ -237,3 +205,4 @@ function wave(m: WaveTrend, rng: Rng, dt: number): Trend {
     },
   };
 }
+

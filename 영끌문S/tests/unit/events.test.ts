@@ -6,46 +6,54 @@ import { seededRng } from '../../src/rng.ts';
 
 const DT = 0.1;
 const WINDOW = 120;
+const TICKS = WINDOW / DT;
 
-/** An event that is one 1-tick jump of +0.1, nothing before or after it. */
-const JUMP: EventDef = {
-  chance: 1,
-  up: 1,
-  gain: [0.1, 0.1],
-  drop: [0, 0],
-  sec: [0.1, 0.1],
-  lead: [0, 0],
-  leadSec: [0, 0],
-  giveBack: [0, 0],
-  giveBackSec: [0, 0],
-};
+/** An event that is one 1-tick jump of +0.1, in 9 windows out of 10. */
+const JUMP: EventDef = { chance: 0.9, up: 1, gain: [0.1, 0.1], drop: [0, 0], sec: [0.1, 0.1] };
 
 describe('events', () => {
   it('fire at most once per 2-minute window, at any moment of it, so two can come back to back', () => {
     let backToBack = 0;
+    let windows = 0;
     for (let seed = 1; seed <= 200; seed++) {
       const next = makeEvents(JUMP, seededRng(seed), DT, WINDOW);
       const fires: number[] = [];
-      for (let t = 0; t < 5 * WINDOW * 10; t++) if (next() !== 0) fires.push(t * DT);
+      for (let t = 0; t < 5 * TICKS; t++) if (next() > 0.05) fires.push(t * DT);
       const perWindow = new Map<number, number>();
       for (const at of fires) perWindow.set(Math.floor(at / WINDOW), (perWindow.get(Math.floor(at / WINDOW)) ?? 0) + 1);
       expect([...perWindow.values()].every((n) => n === 1)).toBe(true);
-      expect(perWindow.size).toBe(5); // chance 1: every window has its event
+      windows += perWindow.size;
       for (let i = 1; i < fires.length; i++) if (fires[i] - fires[i - 1] < 20) backToBack++;
     }
+    expect(windows / 1000).toBeCloseTo(0.9, 1);
     expect(backToBack).toBeGreaterThan(0); // e.g. 1:50 and then 2:05
   });
 
   it('never fire with chance 0', () => {
     const next = makeEvents({ ...JUMP, chance: 0 }, seededRng(1), DT, WINDOW);
-    for (let t = 0; t < 3 * WINDOW * 10; t++) expect(next()).toBe(0);
+    for (let t = 0; t < 3 * TICKS; t++) expect(next()).toBe(0);
   });
 
-  it('add up to the drawn move, then give back the drawn share', () => {
-    const next = makeEvents({ ...JUMP, sec: [1, 2], giveBack: [0.5, 0.5], giveBackSec: [5, 5] }, seededRng(3), DT, WINDOW);
-    let total = 0;
-    for (let t = 0; t < WINDOW * 10; t++) total += next();
-    expect(total).toBeCloseTo(0.05, 1); // +0.1, then half of it back
+  it('are paid for: the expected price stays put, and nothing moves once the window has had its event', () => {
+    const def: EventDef = { chance: 0.6, up: 0.3, gain: [0.2, 0.45], drop: [0.1, 0.3], sec: [0.1, 0.4] };
+    const ends: number[] = [];
+    for (let seed = 1; seed <= 4000; seed++) {
+      const next = makeEvents(def, seededRng(seed), DT, WINDOW);
+      let x = 0;
+      let quietAfter = true;
+      let fired = -1;
+      for (let t = 0; t < TICKS; t++) {
+        const d = next();
+        if (fired < 0 && Math.abs(d) > 0.01) fired = t;
+        else if (fired >= 0 && t > fired + 4 && d !== 0) quietAfter = false;
+        x += d;
+      }
+      expect(quietAfter).toBe(true); // no drift left to time after the event
+      ends.push(Math.exp(x));
+    }
+    const mean = ends.reduce((s, v) => s + v, 0) / ends.length;
+    const sd = Math.sqrt(ends.reduce((s, v) => s + (v - mean) ** 2, 0) / ends.length);
+    expect(Math.abs(mean - 1)).toBeLessThan((3 * sd) / Math.sqrt(ends.length));
   });
 });
 

@@ -72,3 +72,8 @@ export function gauss(rng: Rng): number {
 
 /** Uniform in [lo, hi]. */
 export const between = (rng: Rng, [lo, hi]: readonly [number, number]): number => lo + (hi - lo) * rng.float();
+
+/** E[e^x] for x uniform on the range. */
+export function meanExp([a, b]: readonly [number, number]): number {
+  return b - a > 1e-12 ? (Math.exp(b) - Math.exp(a)) / (b - a) : Math.exp(a);
+}

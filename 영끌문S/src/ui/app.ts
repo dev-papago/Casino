@@ -1,8 +1,8 @@
 // Screen layout and game flow (DESIGN.md sections 1 and 5): stock tabs on the left (easiest first), the chart
-// in the middle, account and orders on the right. The market never pauses while a game runs (not even behind
-// the 정산 dialog); every tick moves all stocks, then liquidates positions that touched their price. When the
-// game time runs out the market closes and everything is settled at the closing prices. Orders on a busy stock
-// fill after its fill delay, at the price of that moment (DESIGN.md section 3).
+// in the middle, account and orders (매수 · 인버스 · 매도) on the right. The market never closes and never pauses
+// while a game runs (not even behind the 정산 dialog); every tick moves all stocks, then liquidates positions
+// that touched their price. The game ends when the player settles or goes broke. Orders on a busy stock fill
+// after its fill delay, at the price of that moment (DESIGN.md section 3).
 import { Sfx } from '../audio.ts';
 import { CONFIG, DIFFICULTY_LABEL, VOLUME_LABEL, type StockDef } from '../config.ts';
 import {
@@ -29,14 +29,15 @@ import { button, h } from './dom.ts';
 import { clock, num, pct, qty, signedUsd, tone, usd } from './format.ts';
 
 export type Screen = 'title' | 'trade' | 'confirm' | 'result';
-type Side = 'buy' | 'sell';
-type EndReason = 'settle' | 'broke' | 'close';
+type Side = 'buy' | 'inverse' | 'sell';
+type EndReason = 'settle' | 'broke';
 /** An order waiting for its fill. */
 interface PendingOrder {
   id: string;
   kind: 'buy' | 'sell';
   margin: number; // buy
   leverage: number; // buy
+  inverse: boolean; // buy
   fraction: number; // sell
   fillAt: number; // market tick
 }
@@ -50,9 +51,7 @@ const MAX_CATCHUP = 600; // ticks; after a longer stall the market skips ahead i
 const ENTRY_COLOR = '#f5c542';
 const LIQ_COLOR = '#c04dff';
 const STOCKS: readonly StockDef[] = [...CONFIG.stocks].sort((a, b) => a.difficulty - b.difficulty);
-const URGENT_SEC = 30; // the countdown turns red
 const FLOAT_MIN_X = 180; // px: room for a floating "+$123.45" left of the newest candle
-const WARN_SEC = 60; // one toast before the close
 const stars = (n: number): string => `${'★'.repeat(n)}${'☆'.repeat(5 - n)}`;
 
 export function mountApp(root: HTMLElement): void {
@@ -81,8 +80,8 @@ export function mountApp(root: HTMLElement): void {
 
   const muteBtn = h('button', { class: 'icon-btn', type: 'button', 'data-testid': 'mute', title: '소리 (M)' });
   const settleBtn = button('정산하기', () => openConfirm(), { kind: 'ghost', testid: 'settle' });
-  const clockLabel = h('span', { class: 'clock-label' }, T.sessionSec > 0 ? '장 마감까지' : '경과');
-  const clockEl = h('div', { class: 'clock', 'data-testid': 'clock' }, clock(T.sessionSec));
+  const clockLabel = h('span', { class: 'clock-label' }, '경과');
+  const clockEl = h('div', { class: 'clock', 'data-testid': 'clock' }, clock(0));
 
   // Left: stock tabs + detail
   const tabs = STOCKS.map((def) => {
@@ -113,6 +112,7 @@ export function mountApp(root: HTMLElement): void {
   const detailVolume = h('dd', { 'data-testid': 'detail-volume' });
   const detailQuote = h('dd', {});
   const detailFill = h('dd', { 'data-testid': 'detail-fill' });
+  const detailLimit = h('dd', { 'data-testid': 'detail-limit' });
 
   // Center: chart header
   const headName = h('span', { class: 'head-name' });
@@ -129,11 +129,17 @@ export function mountApp(root: HTMLElement): void {
 
   // Right: order
   const sideBuy = h('button', { class: 'side-tab buy', type: 'button', 'data-testid': 'side-buy', onclick: () => setSide('buy') }, '매수');
+  const sideInverse = h(
+    'button',
+    { class: 'side-tab inverse', type: 'button', 'data-testid': 'side-inverse', title: '가격이 내리면 이익', onclick: () => setSide('inverse') },
+    '인버스',
+  );
   const sideSell = h('button', { class: 'side-tab sell', type: 'button', 'data-testid': 'side-sell', onclick: () => setSide('sell') }, '매도');
   const levBtns = econ.leverages.map((L) =>
     h('button', { class: 'seg-btn', type: 'button', 'data-testid': `lev-${L}`, onclick: () => setLeverage(L) }, `${L}×`),
   );
-  const levNote = h('div', { class: 'note', hidden: true }, '보유 중인 레버리지로 고정');
+  const sideNote = h('div', { class: 'side-note', 'data-testid': 'side-note' });
+  const levNote = h('div', { class: 'note' });
   const levLockNote = h('div', { class: 'note', 'data-testid': 'lev-lock', hidden: true }, `평가 자산 ${usd(econ.leverageFrom, 0)}부터 레버리지 사용 가능`);
   const amountInput = h('input', {
     class: 'amount-input',
@@ -152,6 +158,7 @@ export function mountApp(root: HTMLElement): void {
   const pvLiq = h('dd', { class: 'liq' });
   const buyMsg = h('div', { class: 'order-msg', 'data-testid': 'buy-msg' });
   const buyBtn = h('button', { class: 'big-btn buy', type: 'button', 'data-testid': 'buy', onclick: () => doBuy() }, '매수');
+  const hvSide = h('dd', {});
 
   const hvQty = h('dd', {});
   const hvEntry = h('dd', {});
@@ -169,6 +176,7 @@ export function mountApp(root: HTMLElement): void {
   const buyPane = h(
     'div',
     { class: 'pane' },
+    sideNote,
     h('div', { class: 'field-label' }, '레버리지'),
     h('div', { class: 'seg' }, ...levBtns),
     levNote,
@@ -200,7 +208,7 @@ export function mountApp(root: HTMLElement): void {
   const sellPane = h(
     'div',
     { class: 'pane', hidden: true },
-    h('dl', { class: 'rows' }, h('dt', {}, '보유 수량'), hvQty, h('dt', {}, '평균 단가'), hvEntry, h('dt', {}, '레버리지'), hvLev, h('dt', {}, '평가 손익'), hvPnl, h('dt', {}, '청산가'), hvLiq),
+    h('dl', { class: 'rows' }, h('dt', {}, '방향'), hvSide, h('dt', {}, '보유 수량'), hvQty, h('dt', {}, '평균 단가'), hvEntry, h('dt', {}, '레버리지'), hvLev, h('dt', {}, '평가 손익'), hvPnl, h('dt', {}, '청산가'), hvLiq),
     h('div', { class: 'field-label' }, '매도 비율'),
     h('div', { class: 'seg' }, ...sellStepBtns),
     h('dl', { class: 'rows' }, h('dt', {}, '매도 수량'), svQty, h('dt', {}, '예상 정산금'), svCash),
@@ -252,6 +260,8 @@ export function mountApp(root: HTMLElement): void {
           detailQuote,
           h('dt', {}, '체결'),
           detailFill,
+          h('dt', {}, '레버리지 한도'),
+          detailLimit,
         ),
       ),
     ),
@@ -273,7 +283,7 @@ export function mountApp(root: HTMLElement): void {
         accPnl,
         h('dl', { class: 'rows' }, h('dt', {}, '주문 가능 예탁금'), accCash, h('dt', {}, '투자 중 (평가)'), accInvested),
       ),
-      h('div', { class: 'panel order' }, h('div', { class: 'side-tabs' }, sideBuy, sideSell), buyPane, sellPane),
+      h('div', { class: 'panel order' }, h('div', { class: 'side-tabs' }, sideBuy, sideInverse, sideSell), buyPane, sellPane),
       h('div', { class: 'panel holdings' }, h('div', { class: 'panel-title' }, '보유 종목'), holdingsList),
     ),
     flash,
@@ -302,7 +312,7 @@ export function mountApp(root: HTMLElement): void {
   }
 
   function setLeverage(L: number): void {
-    if (account.positions[selected] || (L > 1 && leverageLocked())) return;
+    if (account.positions[selected] || (L > 1 && leverageLocked()) || L > current().def.maxLeverage) return;
     leverage = L;
     sfx.play('click');
     render();
@@ -332,7 +342,8 @@ export function mountApp(root: HTMLElement): void {
     render();
   }
 
-  const effectiveLeverage = (): number => account.positions[selected]?.leverage ?? leverage;
+  /** The held position's leverage, else the chosen one within the stock's limit (one of econ.leverages). */
+  const effectiveLeverage = (): number => account.positions[selected]?.leverage ?? Math.min(leverage, current().def.maxLeverage);
   /** Leverage above 1× opens once the equity reaches econ.leverageFrom. */
   const leverageLocked = (): boolean => equity(account, market.prices()) < econ.leverageFrom;
   const current = (): Stock => market.get(selected);
@@ -340,13 +351,13 @@ export function mountApp(root: HTMLElement): void {
   const isPending = (id: string): boolean => pending.some((o) => o.id === id);
 
   function doBuy(): void {
-    if (screen !== 'trade' || isPending(selected)) return;
-    place({ id: selected, kind: 'buy', margin: amount, leverage: effectiveLeverage(), fraction: 0 });
+    if (screen !== 'trade' || side === 'sell' || isPending(selected)) return;
+    place({ id: selected, kind: 'buy', margin: amount, leverage: effectiveLeverage(), inverse: side === 'inverse', fraction: 0 });
   }
 
   function doSell(): void {
     if (screen !== 'trade' || isPending(selected)) return;
-    place({ id: selected, kind: 'sell', margin: 0, leverage: 0, fraction: sellFraction });
+    place({ id: selected, kind: 'sell', margin: 0, leverage: 0, inverse: false, fraction: sellFraction });
   }
 
   /** A quiet stock fills at once at the shown price; a busy one after its fill delay, at the price by then. */
@@ -356,17 +367,18 @@ export function mountApp(root: HTMLElement): void {
     if (delay <= 0) return fill(order);
     pending.push({ ...order, fillAt: market.ticks + delay });
     sfx.play('click');
-    toast(`${def.name} ${order.kind === 'buy' ? '매수' : '매도'} 주문 접수 · 체결 대기 중`, 'flat');
+    toast(`${def.name} ${order.kind === 'sell' ? '매도' : order.inverse ? '인버스' : '매수'} 주문 접수 · 체결 대기 중`, 'flat');
     render();
   }
 
   function fill(order: Omit<PendingOrder, 'fillAt'>): void {
     if (screen !== 'trade' && screen !== 'confirm') return; // the game ended in the meantime
     const st = market.get(order.id);
+    const { id, margin, leverage: L, inverse } = order;
     const r =
       order.kind === 'buy'
-        ? buy(account, order.id, st.price, order.margin, order.leverage, econ, equity(account, market.prices()))
-        : sell(account, order.id, st.price, order.fraction, econ);
+        ? buy(account, { stockId: id, price: st.price, margin, leverage: L, inverse, maxLeverage: st.def.maxLeverage }, econ, equity(account, market.prices()))
+        : sell(account, id, st.price, order.fraction, econ);
     applyTrade(r, st);
   }
 
@@ -380,15 +392,16 @@ export function mountApp(root: HTMLElement): void {
     const f = r.fill;
     const name = st.def.name;
     if (f.kind === 'buy') {
+      const what = f.inverse ? '인버스' : '매수';
       sfx.play('buy');
-      toast(`${name} ${qty(f.qty)}주 매수 체결 · ${usd(f.price, st.def.decimals)}`, 'up');
-      floatText(`매수 ${usd(f.margin)}`, 'up');
+      toast(`${name} ${qty(f.qty)}주 ${what} 체결 · ${usd(f.price, st.def.decimals)}`, f.inverse ? 'inverse' : 'up');
+      floatText(`${what} ${usd(f.margin)}`, f.inverse ? 'inverse' : 'up');
       // A fresh buy cannot exceed what is left; keep the amount sane for the next order.
       if (amount > account.cash) setAmount(maxMargin(account.cash, effectiveLeverage(), econ));
     } else {
       sfx.play('sell');
       sfx.play(f.pnl >= 0 ? 'profit' : 'loss', 120);
-      toast(`${name} ${qty(f.qty)}주 매도 · 손익 ${signedUsd(f.pnl)}`, tone(f.pnl) === 'down' ? 'down' : 'up');
+      toast(`${name}${f.inverse ? ' 인버스' : ''} ${qty(f.qty)}주 매도 · 손익 ${signedUsd(f.pnl)}`, tone(f.pnl) === 'down' ? 'down' : 'up');
       floatText(signedUsd(f.pnl), tone(f.pnl));
       if (!account.positions[selected]) sellFraction = 1;
     }
@@ -406,7 +419,7 @@ export function mountApp(root: HTMLElement): void {
     flash.classList.add('on');
     for (const f of fills) {
       const def = market.get(f.stockId).def;
-      toast(`강제청산! ${def.name} 증거금 ${usd(f.margin)} 손실`, 'liq');
+      toast(`강제청산! ${def.name}${f.inverse ? ' 인버스' : ''} 증거금 ${usd(f.margin)} 손실`, 'liq');
       if (f.stockId === selected) banner('강제청산', `${def.name} −${usd(f.margin)}`);
     }
   }
@@ -489,12 +502,19 @@ export function mountApp(root: HTMLElement): void {
             { class: 'rules' },
             h('li', {}, `기본예탁금 `, h('b', {}, usd(econ.deposit, 0)), '으로 시작합니다'),
             h('li', {}, '좌측 종목을 골라 차트를 보고 우측에서 매수 / 매도'),
-            h('li', {}, `평가 자산 `, h('b', {}, usd(econ.leverageFrom, 0)), `부터 레버리지 최대 `, h('b', {}, `${Math.max(...econ.leverages)}배`), ' — 청산가에 닿으면 증거금 전액 손실'),
+            h('li', {}, h('b', {}, '인버스'), '는 가격이 내리면 이익, 오르면 손실'),
+            h(
+              'li',
+              {},
+              `평가 자산 `,
+              h('b', {}, usd(econ.leverageFrom, 0)),
+              `부터 레버리지 최대 `,
+              h('b', {}, `${Math.max(...econ.leverages)}배`),
+              ' (종목마다 한도) — 청산가에 닿으면 증거금 전액 손실',
+            ),
             h('li', {}, `매수·매도 때 주문 규모의 ${num(econ.feeRate * 100, 1)}% 수수료`),
             h('li', {}, '거래량이 많은 종목일수록 시세가 빨리 바뀌고 체결이 늦다 (킹카콜라 즉시 … 게이임스탑 0.4~1초)'),
-            T.sessionSec > 0
-              ? h('li', {}, '게임 시간 ', h('b', {}, `${clock(T.sessionSec)}`), ' — 장이 마감되면 보유 종목을 종가로 자동 정산')
-              : null,
+            h('li', {}, h('b', {}, '장 마감 없음'), ' — 원할 때 정산하기를 눌러 끝냅니다'),
           ),
           button('게임 시작', () => startGame(), { kind: 'primary', key: 'Enter', testid: 'start' }),
         ),
@@ -526,7 +546,8 @@ export function mountApp(root: HTMLElement): void {
         h(
           'div',
           { class: `card result-card is-${tone(net)}`, 'data-testid': 'result' },
-          h('h2', {}, ending.reason === 'broke' ? '파산했습니다…' : ending.reason === 'close' ? '장 마감 · 정산 결과' : '정산 결과'),
+          h('h2', {}, ending.reason === 'broke' ? '파산했습니다…' : '정산 결과'),
+          h('div', { class: 'result-time' }, `플레이 시간 ${clock((market.ticks * T.tickMs) / 1000)}`),
           h('div', { class: 'result-total', 'data-testid': 'result-total' }, usd(total)),
           h('div', { class: `result-net ${tone(net)}` }, `${signedUsd(net)} (${pct(net / econ.deposit)})`),
           h(
@@ -570,7 +591,8 @@ export function mountApp(root: HTMLElement): void {
       setTone(t.price, p - prevPrices[t.def.id]);
       const held = account.positions[t.def.id];
       t.hold.hidden = !held;
-      if (held) setText(t.hold, `보유 ${held.leverage}×`);
+      if (held) setText(t.hold, `${held.inverse ? '인버스' : '보유'} ${held.leverage}×`);
+      t.hold.classList.toggle('inverse', !!held?.inverse);
     }
 
     // Detail
@@ -586,6 +608,7 @@ export function mountApp(root: HTMLElement): void {
     setText(detailVolume, `${'▮'.repeat(vol.level)}${'▯'.repeat(5 - vol.level)} ${VOLUME_LABEL[vol.level]}`);
     setText(detailQuote, vol.quoteSec >= 1 ? `약 ${num(vol.quoteSec, 0)}초마다` : `초당 약 ${num(1 / vol.quoteSec, 0)}번`);
     setText(detailFill, vol.fillDelay[1] > 0 ? `${num(vol.fillDelay[0], 1)}~${num(vol.fillDelay[1], 1)}초 뒤 그때 가격` : '즉시 (보이는 가격)');
+    setText(detailLimit, `${def.maxLeverage}배`);
 
     // Chart head
     setText(headName, def.name);
@@ -608,18 +631,24 @@ export function mountApp(root: HTMLElement): void {
     setText(accInvested, usd(eq - account.cash));
 
     // Order
+    const inverse = side === 'inverse';
     sideBuy.classList.toggle('active', side === 'buy');
+    sideInverse.classList.toggle('active', inverse);
     sideSell.classList.toggle('active', side === 'sell');
-    buyPane.hidden = side !== 'buy';
+    buyPane.hidden = side === 'sell';
     sellPane.hidden = side !== 'sell';
+    setText(sideNote, inverse ? '인버스: 가격이 내리면 이익, 오르면 손실' : '매수: 가격이 오르면 이익, 내리면 손실');
+    sideNote.classList.toggle('inverse', inverse);
     const locked = eq < econ.leverageFrom;
     if (!pos && locked) leverage = 1; // fell below the line: back to 1×
     const L = effectiveLeverage();
     levBtns.forEach((b, i) => {
-      b.classList.toggle('active', econ.leverages[i] === L);
-      b.disabled = pos ? econ.leverages[i] !== L : locked && econ.leverages[i] > 1;
+      const Li = econ.leverages[i];
+      b.classList.toggle('active', Li === L);
+      b.disabled = pos ? Li !== L : (locked && Li > 1) || Li > def.maxLeverage;
     });
-    levNote.hidden = !pos;
+    setText(levNote, pos ? '보유 중인 레버리지로 고정' : `이 종목은 최대 ${def.maxLeverage}배`);
+    levNote.hidden = !pos && def.maxLeverage >= Math.max(...econ.leverages);
     levLockNote.hidden = !locked;
     if (document.activeElement !== amountInput && amountInput.value !== (amount ? String(amount) : '')) {
       amountInput.value = amount ? String(amount) : '';
@@ -631,9 +660,11 @@ export function mountApp(root: HTMLElement): void {
     setText(pvFee, usd(fee));
     // After this order the entry is the average of what is held and what is bought.
     const entryAfter = pos ? (pos.qty * pos.entry + size) / (pos.qty + size / st.price) : st.price;
-    setText(pvLiq, liqText(liquidationPrice({ entry: entryAfter, leverage: L }, econ), d));
+    setText(pvLiq, liqText(liquidationPrice({ entry: entryAfter, leverage: L, inverse }, econ), d));
     const buyError =
-      L > 1 && locked
+      pos && pos.inverse !== inverse
+        ? TRADE_ERROR_TEXT.side
+        : L > 1 && locked
         ? TRADE_ERROR_TEXT.locked
         : amount < econ.minOrder
           ? `최소 주문 ${usd(econ.minOrder, 0)}`
@@ -643,10 +674,14 @@ export function mountApp(root: HTMLElement): void {
     setText(buyMsg, buyError);
     const busy = isPending(selected);
     buyBtn.disabled = screen !== 'trade' || !!buyError || busy;
-    setText(buyBtn, busy ? '체결 중…' : '매수');
+    setText(buyBtn, busy ? '체결 중…' : inverse ? '인버스' : '매수');
+    buyBtn.classList.toggle('buy', !inverse);
+    buyBtn.classList.toggle('inverse', inverse);
 
     if (pos) {
       const pnl = unrealized(pos, st.price);
+      setText(hvSide, pos.inverse ? '인버스 (내리면 이익)' : '매수 (오르면 이익)');
+      hvSide.className = pos.inverse ? 'inverse' : 'up';
       setText(hvQty, `${qty(pos.qty)}주`);
       setText(hvEntry, usd(pos.entry, d));
       setText(hvLev, `${pos.leverage}×`);
@@ -658,7 +693,8 @@ export function mountApp(root: HTMLElement): void {
       setText(svQty, `${qty(sellQty)}주`);
       setText(svCash, usd(Math.max(0, back)));
     } else {
-      for (const el of [hvQty, hvEntry, hvLev, hvPnl, hvLiq, svQty, svCash]) setText(el, '—');
+      for (const el of [hvSide, hvQty, hvEntry, hvLev, hvPnl, hvLiq, svQty, svCash]) setText(el, '—');
+      hvSide.className = '';
       hvPnl.className = '';
     }
     sellStepBtns.forEach((b, i) => b.classList.toggle('active', SELL_STEPS[i] === sellFraction));
@@ -696,7 +732,8 @@ export function mountApp(root: HTMLElement): void {
       if (!pos) continue;
       const pnl = unrealized(pos, prices[id]);
       row.classList.toggle('active', id === selected);
-      setText(row.querySelector('.h-lev')!, `${pos.leverage}×`);
+      setText(row.querySelector('.h-lev')!, `${pos.inverse ? '인버스 ' : ''}${pos.leverage}×`);
+      row.classList.toggle('inverse', pos.inverse);
       setText(row.querySelector('.h-val')!, usd(positionValue(pos, prices[id])));
       const pnlEl = row.querySelector<HTMLElement>('.h-pnl')!;
       setText(pnlEl, pct(pnl / pos.margin, 1));
@@ -707,14 +744,14 @@ export function mountApp(root: HTMLElement): void {
   function chartLines(): ChartLine[] {
     const pos = account.positions[selected];
     if (!pos || screen === 'title') return [];
-    const lines: ChartLine[] = [{ price: pos.entry, label: `평단 ${pos.leverage}×`, color: ENTRY_COLOR }];
+    const lines: ChartLine[] = [{ price: pos.entry, label: `${pos.inverse ? '인버스 ' : ''}평단 ${pos.leverage}×`, color: ENTRY_COLOR }];
     const liq = liquidationPrice(pos, econ);
     if (liq > 0) lines.push({ price: liq, label: '청산가', color: LIQ_COLOR });
     return lines;
   }
 
   // ------------------------------------------------------------ effects
-  function toast(text: string, kind: 'up' | 'down' | 'flat' | 'warn' | 'liq'): void {
+  function toast(text: string, kind: 'up' | 'down' | 'inverse' | 'flat' | 'warn' | 'liq'): void {
     const el = h('div', { class: `toast ${kind}` }, text);
     toasts.append(el);
     while (toasts.children.length > 4) toasts.firstElementChild?.remove();
@@ -807,20 +844,12 @@ export function mountApp(root: HTMLElement): void {
         pending = pending.filter((o) => o.fillAt > market.ticks);
         for (const o of due) fill(o);
       }
-      if (T.sessionSec > 0) {
-        const left = T.sessionSec - (market.ticks * T.tickMs) / 1000;
-        if (left <= 0) finish('close');
-        else if (Math.abs(left - WARN_SEC) < T.tickMs / 2000) toast(`장 마감 ${WARN_SEC}초 전!`, 'warn');
-      }
     }
   }
 
+  /** Time played: the market has no close. */
   function renderClock(): void {
-    const sec = (market.ticks * T.tickMs) / 1000;
-    const left = Math.max(0, T.sessionSec - sec);
-    setText(clockEl, clock(T.sessionSec > 0 ? Math.ceil(left) : sec));
-    const playing = screen === 'trade' || screen === 'confirm';
-    clockEl.classList.toggle('urgent', playing && T.sessionSec > 0 && left <= URGENT_SEC);
+    setText(clockEl, clock((market.ticks * T.tickMs) / 1000));
   }
 
   let lastAt = performance.now();
