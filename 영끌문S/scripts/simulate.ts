@@ -3,16 +3,19 @@
 // lasts timing.sessionSec unless another length is given.
 //
 // Part A, the charts: return after the game, how often each stock ends up, and how readable the chart is:
-//   persist  P(the next 10 s go the same way as the last 10 s). A coin flip is 50%; a smooth trend is 80%+.
-//   smooth   |net move| / path length over 30-second windows (efficiency ratio). A random walk is about 0.18.
+//   persist  P(the next 10 s go the same way as the last 10 s), and the same for 30 s (the scale of the chart
+//            formations). A coin flip is 50%; a smooth trend is 80%+.
+//   smooth   |net move| / path length over 30-second windows (efficiency ratio). A random walk sampled every
+//            second is about 0.18; a stock that quotes only every few seconds reads higher.
 // Part B, the players: bots play the whole game through the real account rules (fees, liquidation, leverage
-// unlocked at econ.leverageFrom) and settle at the end. Like a person, a bot looks at the chart once a second
-// and its order fills 0.3-0.6 s later at the price of that moment. Columns are over the games: how often they
-// finish with a profit, with 2× or more and with 10× or more, and the average finish.
-import { CONFIG } from '../src/config.ts';
+// unlocked at econ.leverageFrom) and settle at the end. Like a person, a bot looks at the chart once a second,
+// clicks 0.2-0.4 s later, and the order fills after the stock's fill delay (volume.fillDelay) at the price of
+// that moment. Columns are over the games: how often they finish with a profit, with 2× or more and with
+// 10× or more, and the average finish.
+import { CONFIG, type Range } from '../src/config.ts';
 import { buy, equity, liquidate, maxMargin, newAccount, sell, type Account } from '../src/game/account.ts';
 import { Market } from '../src/game/market.ts';
-import { seededRng, type Rng } from '../src/rng.ts';
+import { between, seededRng, type Rng } from '../src/rng.ts';
 
 const GAMES = Number(process.argv[2]) || 1000;
 const SECONDS = Number(process.argv[3]) || CONFIG.timing.sessionSec || 300;
@@ -22,21 +25,31 @@ const TPS = 1000 / CONFIG.timing.tickMs;
 const STOCKS = [...CONFIG.stocks].sort((a, b) => a.difficulty - b.difficulty);
 const IDS = STOCKS.map((s) => s.id);
 const NAME: Record<string, string> = Object.fromEntries(STOCKS.map((s) => [s.id, s.name]));
+const FILL: Record<string, Range> = Object.fromEntries(STOCKS.map((s) => [s.id, s.volume.fillDelay]));
 const DEP = econ.deposit;
-const LATENCY: readonly [number, number] = [3, 6]; // ticks between seeing the chart and the fill
+const REACTION: Range = [2, 4]; // ticks between seeing the chart and the click
 
 // ------------------------------------------------------------------ bots
 interface View {
+  tick: number;
   sec: number;
   seen: Record<string, number>; // prices at the last whole second: what the decision is based on
   prices: Record<string, number>; // prices now: what an order fills at
   hist: Record<string, number[]>; // price at every whole second, index = second
   rng: Rng;
 }
+interface Order {
+  fillAt: number; // tick
+  id: string;
+  kind: 'buy' | 'sell';
+  leverage: number;
+  share: number; // of the cash (buy) or of the position (sell), taken at the fill
+}
 interface Bot {
   name: string;
   acc: Account;
   stopped: boolean;
+  orders: Order[]; // waiting for their fill; the bot does not decide again until they are done
   nextAt?: number; // tick of the next decision
   memo: { entrySec?: number; phase?: number };
   brain: (b: Bot, v: View) => void;
@@ -49,20 +62,30 @@ const holding = (b: Bot): string[] => Object.keys(b.acc.positions);
 const allowedLeverage = (b: Bot, v: View, cap: number): number =>
   eq(b, v) >= econ.leverageFrom ? Math.max(...econ.leverages.filter((L) => L <= cap)) : 1;
 
-function buyShare(b: Bot, v: View, id: string, leverage: number, share = 1): void {
-  const L = b.acc.positions[id]?.leverage ?? leverage;
-  const margin = Math.floor(maxMargin(b.acc.cash, L, econ) * share * 100) / 100;
+/** Sends an order: it fills now on a stock without fill delay, else after the delay at the price by then. */
+function place(b: Bot, v: View, order: Omit<Order, 'fillAt'>): void {
+  const delay = Math.round(between(v.rng, FILL[order.id]) * TPS);
+  if (delay <= 0) fill(b, v, order);
+  else b.orders.push({ ...order, fillAt: v.tick + delay });
+}
+function fill(b: Bot, v: View, o: Omit<Order, 'fillAt'>): void {
+  if (o.kind === 'sell') {
+    const r = sell(b.acc, o.id, v.prices[o.id], o.share, econ);
+    if (r.ok) b.acc = r.account;
+    return;
+  }
+  const L = b.acc.positions[o.id]?.leverage ?? o.leverage;
+  const margin = Math.floor(maxMargin(b.acc.cash, L, econ) * o.share * 100) / 100;
   if (margin < econ.minOrder) return;
-  const r = buy(b.acc, id, v.prices[id], margin, L, econ, equity(b.acc, v.prices));
+  const r = buy(b.acc, o.id, v.prices[o.id], margin, L, econ, equity(b.acc, v.prices));
   if (r.ok) {
     b.acc = r.account;
     b.memo.entrySec = v.sec;
   }
 }
-function sellShare(b: Bot, v: View, id: string, share = 1): void {
-  const r = sell(b.acc, id, v.prices[id], share, econ);
-  if (r.ok) b.acc = r.account;
-}
+const buyShare = (b: Bot, v: View, id: string, leverage: number, share = 1): void =>
+  place(b, v, { id, kind: 'buy', leverage, share });
+const sellShare = (b: Bot, v: View, id: string, share = 1): void => place(b, v, { id, kind: 'sell', leverage: 0, share });
 const sellAll = (b: Bot, v: View): void => holding(b).forEach((id) => sellShare(b, v, id));
 function stop(b: Bot, v: View): void {
   sellAll(b, v);
@@ -100,10 +123,14 @@ const holdBot = (id: string, target = Infinity, label = '존버'): Bot => ({
   name: `${label} ${NAME[id]}`,
   acc: newAccount(econ),
   stopped: false,
+  orders: [],
   memo: {},
   brain(b, v) {
     if (eq(b, v) >= target) return stop(b, v);
-    if (holding(b).length === 0 && b.memo.entrySec === undefined) buyShare(b, v, id, 1);
+    if (holding(b).length === 0 && !b.memo.phase) {
+      b.memo.phase = 1; // buys once
+      buyShare(b, v, id, 1);
+    }
   },
 });
 
@@ -112,6 +139,7 @@ const momentumBot = (cap: number): Bot => ({
   name: `추세 추종 (최대 ${cap}×)`,
   acc: newAccount(econ),
   stopped: false,
+  orders: [],
   memo: {},
   brain(b, v) {
     if (v.sec < 12) return;
@@ -137,6 +165,7 @@ const dipBot = (cap: number): Bot => ({
   name: `저점 매수 (최대 ${cap}×)`,
   acc: newAccount(econ),
   stopped: false,
+  orders: [],
   memo: {},
   brain(b, v) {
     if (v.sec < 12) return;
@@ -159,11 +188,54 @@ const dipBot = (cap: number): Bot => ({
   },
 });
 
+/** The last n seconds' high and low. */
+function range(v: View, id: string, n: number): { hi: number; lo: number } {
+  const h = v.hist[id];
+  let hi = -Infinity;
+  let lo = Infinity;
+  for (let t = Math.max(0, v.sec - n); t <= v.sec; t++) {
+    hi = Math.max(hi, h[t]);
+    lo = Math.min(lo, h[t]);
+  }
+  return { hi, lo };
+}
+
+/** Trades the box: buys at the bottom of the last 30 seconds' range, sells at its top (or after 30 s). */
+const rangeBot = (cap: number): Bot => ({
+  name: `박스권 매매 (최대 ${cap}×)`,
+  acc: newAccount(econ),
+  stopped: false,
+  orders: [],
+  memo: {},
+  brain(b, v) {
+    if (v.sec < 32) return;
+    if (eq(b, v) >= 10 * DEP) return stop(b, v);
+    const [held] = holding(b);
+    if (held) {
+      const { hi, lo } = range(v, held, 30);
+      const at = (v.seen[held] - lo) / (hi - lo || 1);
+      if (at >= 0.8 || v.seen[held] < b.acc.positions[held].entry * (1 - 1.5 * vol10(v, held)) || v.sec - (b.memo.entrySec ?? 0) >= 30)
+        sellShare(b, v, held);
+      return;
+    }
+    let pick = '';
+    let lowest = 0.15;
+    for (const id of IDS) {
+      const { hi, lo } = range(v, id, 30);
+      if ((hi - lo) / lo < 1.5 * vol10(v, id)) continue; // no box worth trading
+      const at = (v.seen[id] - lo) / (hi - lo);
+      if (at < lowest) [pick, lowest] = [id, at];
+    }
+    if (pick) buyShare(b, v, pick, allowedLeverage(b, v, cap));
+  },
+});
+
 /** A festival player clicking around: a random trade every few seconds, random stock, size and leverage. */
 const antBot = (): Bot => ({
   name: '개미 (무작위)',
   acc: newAccount(econ),
   stopped: false,
+  orders: [],
   memo: {},
   brain(b, v) {
     if (v.rng.float() >= 0.2) return;
@@ -196,6 +268,7 @@ const gamblerBot = (lev: number): Bot => ({
   name: `한방 (2배 후 추세 ${lev}×)`,
   acc: newAccount(econ),
   stopped: false,
+  orders: [],
   memo: {},
   brain(b, v) {
     if (eq(b, v) >= 10 * DEP) return stop(b, v);
@@ -221,6 +294,7 @@ const doubleThenHoldBot = (id: string, lev: number): Bot => ({
   name: `2배 후 ${NAME[id]} ${lev}× 존버`,
   acc: newAccount(econ),
   stopped: false,
+  orders: [],
   memo: {},
   brain(b, v) {
     if (eq(b, v) >= 10 * DEP) return stop(b, v);
@@ -238,6 +312,8 @@ function makeBots(): Bot[] {
     momentumBot(10),
     dipBot(1),
     dipBot(10),
+    rangeBot(1),
+    rangeBot(10),
     gamblerBot(10),
     gamblerBot(20),
     doubleThenHoldBot('kingka', 20),
@@ -252,12 +328,13 @@ function makeBots(): Bot[] {
 interface Chart {
   ret: number[];
   persist: [number, number];
+  persist30: [number, number];
   smooth: [number, number];
   rise5: number[];
   fall5: number[];
 }
 const charts: Record<string, Chart> = Object.fromEntries(
-  IDS.map((id) => [id, { ret: [], persist: [0, 0], smooth: [0, 0], rise5: [], fall5: [] }]),
+  IDS.map((id) => [id, { ret: [], persist: [0, 0], persist30: [0, 0], smooth: [0, 0], rise5: [], fall5: [] }]),
 );
 const finals: Record<string, number[]> = {};
 
@@ -269,37 +346,48 @@ for (let g = 0; g < GAMES; g++) {
   const prices = market.prices();
   const hist: Record<string, number[]> = Object.fromEntries(IDS.map((id) => [id, [prices[id]]]));
   const seen = { ...prices };
-  const view: View = { sec: 0, seen, prices, hist, rng: botRng };
+  const view: View = { tick: 0, sec: 0, seen, prices, hist, rng: botRng };
   for (let t = 1; t <= SECONDS * TPS; t++) {
     market.step();
+    view.tick = t;
     for (const s of market.stocks) prices[s.def.id] = s.price;
     for (const b of bots) {
-      if (b.stopped || holding(b).length === 0) continue;
-      const r = liquidate(b.acc, prices, econ);
-      if (r.fills.length) b.acc = r.account;
+      if (holding(b).length) {
+        const r = liquidate(b.acc, prices, econ);
+        if (r.fills.length) b.acc = r.account;
+      }
+      if (b.orders.length && b.orders[0].fillAt <= t) {
+        const due = b.orders.filter((o) => o.fillAt <= t);
+        b.orders = b.orders.filter((o) => o.fillAt > t);
+        for (const o of due) fill(b, view, o);
+      }
     }
     if (t % TPS === 0) {
       view.sec = t / TPS;
       for (const id of IDS) hist[id].push((seen[id] = prices[id]));
-      for (const b of bots) b.nextAt = t + LATENCY[0] + botRng.int(LATENCY[1] - LATENCY[0] + 1);
+      for (const b of bots) b.nextAt = t + REACTION[0] + botRng.int(REACTION[1] - REACTION[0] + 1);
     }
-    // Decide on what the chart showed at the last whole second, trade at today's price.
-    for (const b of bots) if (!b.stopped && b.nextAt === t) b.brain(b, view);
+    // Decide on what the chart showed at the last whole second; the order goes in at the click.
+    for (const b of bots) if (!b.stopped && !b.orders.length && b.nextAt === t) b.brain(b, view);
   }
   for (const b of bots) {
-    sellAll(b, view);
+    // The close: orders still waiting are dropped and everything held is sold at the closing price.
+    b.orders = [];
+    for (const id of holding(b)) fill(b, view, { id, kind: 'sell', leverage: 0, share: 1 });
     (finals[b.name] ??= []).push(b.acc.cash / DEP);
   }
   for (const id of IDS) {
     const h = hist[id];
     const c = charts[id];
     c.ret.push(h[SECONDS] / h[0] - 1);
-    for (let s = 10; s + 10 <= SECONDS; s += 10) {
-      const a = h[s] - h[s - 10];
-      const z = h[s + 10] - h[s];
-      if (a && z) {
-        c.persist[0] += Math.sign(a) === Math.sign(z) ? 1 : 0;
-        c.persist[1]++;
+    for (const [n, p] of [[10, c.persist], [30, c.persist30]] as const) {
+      for (let s = n; s + n <= SECONDS; s += n) {
+        const a = h[s] - h[s - n];
+        const z = h[s + n] - h[s];
+        if (a && z) {
+          p[0] += Math.sign(a) === Math.sign(z) ? 1 : 0;
+          p[1]++;
+        }
       }
     }
     for (let s = 0; s + 30 <= SECONDS; s += 30) {
@@ -329,12 +417,12 @@ const times = (v: number): string => `${v.toFixed(2)}×`;
 
 console.log(`\n영끌문S 시뮬레이션 — seed ${SEED}, ${GAMES}게임, 게임당 ${SECONDS}초\n`);
 console.log('A. 차트\n');
-console.log('| 종목 | 난이도 | 평균 | p5 / p50 / p95 | 오른 게임 | 10초 방향 지속 | 매끄러움 | 5초 최대 상승 / 하락 (평균) |');
+console.log('| 종목 | 난이도 | 평균 | p5 / p50 / p95 | 오른 게임 | 방향 지속 10초 / 30초 | 매끄러움 | 5초 최대 상승 / 하락 (평균) |');
 console.log('|---|---|---|---|---|---|---|---|');
 for (const s of STOCKS) {
   const c = charts[s.id];
   console.log(
-    `| ${s.name} | ${'★'.repeat(s.difficulty)} | ${pct(mean(c.ret))} | ${pct(q(c.ret, 0.05))} / ${pct(q(c.ret, 0.5))} / ${pct(q(c.ret, 0.95))} | ${share(c.ret, (r) => r > 0)} | ${((c.persist[0] / c.persist[1]) * 100).toFixed(1)}% | ${(c.smooth[0] / c.smooth[1]).toFixed(2)} | ${pct(mean(c.rise5))} / ${pct(mean(c.fall5))} |`,
+    `| ${s.name} | ${'★'.repeat(s.difficulty)} | ${pct(mean(c.ret))} | ${pct(q(c.ret, 0.05))} / ${pct(q(c.ret, 0.5))} / ${pct(q(c.ret, 0.95))} | ${share(c.ret, (r) => r > 0)} | ${((c.persist[0] / c.persist[1]) * 100).toFixed(1)}% / ${((c.persist30[0] / c.persist30[1]) * 100).toFixed(1)}% | ${(c.smooth[0] / c.smooth[1]).toFixed(2)} | ${pct(mean(c.rise5))} / ${pct(mean(c.fall5))} |`,
   );
 }
 console.log('\nB. 플레이어 (게임 끝에 정산한 금액 ÷ 기본예탁금)\n');
