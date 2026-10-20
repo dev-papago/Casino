@@ -1,6 +1,7 @@
 // Candle chart on a canvas: price bars only, no indicators. Each candle is timing.ticksPerCandle ticks of quotes
 // (3 seconds); the last one is still forming. The mouse wheel zooms: fewer, wider candles or more, thinner ones.
-// The price range eases toward the visible candles so the chart does not jump.
+// The price range eases toward the visible candles so the chart does not jump. A low-volume stock gets a wider
+// range around them (volume.chartPad), so its candles look short and a busy stock's look long.
 // Extra horizontal lines mark the player's average entry and liquidation price.
 import type { Range } from '../config.ts';
 import type { Candle, Stock } from '../game/market.ts';
@@ -82,7 +83,7 @@ export class CandleChart {
     const P = this.plot;
 
     const candles: Candle[] = [...stock.candles.slice(-(this.visible - 1)), stock.live];
-    this.ease(candles);
+    this.ease(candles, stock.def.volume.chartPad);
     const span = this.hi - this.lo;
     const yOf = (p: number): number => P.y + (1 - (p - this.lo) / span) * P.h;
     const d = stock.def.decimals;
@@ -156,7 +157,7 @@ export class CandleChart {
     this.last = { x: P.x + (candles.length - 0.5) * slot, y: clamp(yOf(stock.price), P.y, P.y + P.h) };
   }
 
-  private ease(candles: readonly Candle[]): void {
+  private ease(candles: readonly Candle[], chartPad: number): void {
     let lo = Infinity;
     let hi = -Infinity;
     for (const c of candles) {
@@ -164,7 +165,7 @@ export class CandleChart {
       if (c.h > hi) hi = c.h;
     }
     const mid = (lo + hi) / 2;
-    const half = Math.max((hi - lo) / 2, mid * 0.004) * 1.12;
+    const half = Math.max((hi - lo) / 2, mid * 0.004) * chartPad;
     const tLo = mid - half;
     const tHi = mid + half;
     if (Number.isNaN(this.lo)) {
