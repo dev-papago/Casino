@@ -1,9 +1,10 @@
 // Screen layout and game flow (DESIGN.md sections 1 and 5): stock tabs on the left (easiest first), the chart
 // in the middle, account and orders on the right. The market never pauses while a game runs (not even behind
 // the 정산 dialog); every tick moves all stocks, then liquidates positions that touched their price. When the
-// game time runs out the market closes and everything is settled at the closing prices.
+// game time runs out the market closes and everything is settled at the closing prices. Orders on a busy stock
+// fill after its fill delay, at the price of that moment (DESIGN.md section 3).
 import { Sfx } from '../audio.ts';
-import { CONFIG, DIFFICULTY_LABEL, type StockDef } from '../config.ts';
+import { CONFIG, DIFFICULTY_LABEL, VOLUME_LABEL, type StockDef } from '../config.ts';
 import {
   TRADE_ERROR_TEXT,
   buy,
@@ -22,7 +23,7 @@ import {
   type TradeResult,
 } from '../game/account.ts';
 import { Market, type Stock } from '../game/market.ts';
-import { cryptoRng } from '../rng.ts';
+import { between, cryptoRng } from '../rng.ts';
 import { CandleChart, type ChartLine } from './chart.ts';
 import { button, h } from './dom.ts';
 import { clock, num, pct, qty, signedUsd, tone, usd } from './format.ts';
@@ -30,6 +31,15 @@ import { clock, num, pct, qty, signedUsd, tone, usd } from './format.ts';
 export type Screen = 'title' | 'trade' | 'confirm' | 'result';
 type Side = 'buy' | 'sell';
 type EndReason = 'settle' | 'broke' | 'close';
+/** An order waiting for its fill. */
+interface PendingOrder {
+  id: string;
+  kind: 'buy' | 'sell';
+  margin: number; // buy
+  leverage: number; // buy
+  fraction: number; // sell
+  fillAt: number; // market tick
+}
 
 const MUTE_KEY = 'yeongkkeul:v1:muted';
 const BUY_STEPS = [0.1, 0.25, 0.5, 1] as const;
@@ -41,6 +51,7 @@ const ENTRY_COLOR = '#f5c542';
 const LIQ_COLOR = '#c04dff';
 const STOCKS: readonly StockDef[] = [...CONFIG.stocks].sort((a, b) => a.difficulty - b.difficulty);
 const URGENT_SEC = 30; // the countdown turns red
+const FLOAT_MIN_X = 180; // px: room for a floating "+$123.45" left of the newest candle
 const WARN_SEC = 60; // one toast before the close
 const stars = (n: number): string => `${'★'.repeat(n)}${'☆'.repeat(5 - n)}`;
 
@@ -60,10 +71,11 @@ export function mountApp(root: HTMLElement): void {
   let sellFraction = 1;
   let prevPrices = market.prices();
   let ending: { reason: EndReason; account: Account } | null = null;
+  let pending: PendingOrder[] = [];
 
   // ------------------------------------------------------------ skeleton
   root.classList.add('app');
-  const chart = new CandleChart(T.visibleCandles);
+  const chart = new CandleChart(T.visibleCandles, T.zoomCandles, (T.ticksPerCandle * T.tickMs) / 1000);
   const fx = h('div', { class: 'fx' });
   chart.el.append(fx);
 
@@ -98,6 +110,9 @@ export function mountApp(root: HTMLElement): void {
   const detailStart = h('dd', {});
   const detailHigh = h('dd', { class: 'up' });
   const detailLow = h('dd', { class: 'down' });
+  const detailVolume = h('dd', { 'data-testid': 'detail-volume' });
+  const detailQuote = h('dd', {});
+  const detailFill = h('dd', { 'data-testid': 'detail-fill' });
 
   // Center: chart header
   const headName = h('span', { class: 'head-name' });
@@ -222,7 +237,22 @@ export function mountApp(root: HTMLElement): void {
         h('div', { class: 'detail-head' }, detailName, detailTicker),
         detailLevel,
         detailDesc,
-        h('dl', { class: 'rows' }, h('dt', {}, '시작가'), detailStart, h('dt', {}, '게임 중 최고'), detailHigh, h('dt', {}, '게임 중 최저'), detailLow),
+        h(
+          'dl',
+          { class: 'rows' },
+          h('dt', {}, '시작가'),
+          detailStart,
+          h('dt', {}, '게임 중 최고'),
+          detailHigh,
+          h('dt', {}, '게임 중 최저'),
+          detailLow,
+          h('dt', {}, '거래량'),
+          detailVolume,
+          h('dt', {}, '시세 갱신'),
+          detailQuote,
+          h('dt', {}, '체결'),
+          detailFill,
+        ),
       ),
     ),
     h(
@@ -307,17 +337,37 @@ export function mountApp(root: HTMLElement): void {
   const leverageLocked = (): boolean => equity(account, market.prices()) < econ.leverageFrom;
   const current = (): Stock => market.get(selected);
 
+  const isPending = (id: string): boolean => pending.some((o) => o.id === id);
+
   function doBuy(): void {
-    if (screen !== 'trade') return;
-    const st = current();
-    const r = buy(account, selected, st.price, amount, effectiveLeverage(), econ, equity(account, market.prices()));
-    applyTrade(r, st);
+    if (screen !== 'trade' || isPending(selected)) return;
+    place({ id: selected, kind: 'buy', margin: amount, leverage: effectiveLeverage(), fraction: 0 });
   }
 
   function doSell(): void {
-    if (screen !== 'trade') return;
-    const st = current();
-    applyTrade(sell(account, selected, st.price, sellFraction, econ), st);
+    if (screen !== 'trade' || isPending(selected)) return;
+    place({ id: selected, kind: 'sell', margin: 0, leverage: 0, fraction: sellFraction });
+  }
+
+  /** A quiet stock fills at once at the shown price; a busy one after its fill delay, at the price by then. */
+  function place(order: Omit<PendingOrder, 'fillAt'>): void {
+    const def = market.get(order.id).def;
+    const delay = Math.round((between(rng, def.volume.fillDelay) * 1000) / T.tickMs);
+    if (delay <= 0) return fill(order);
+    pending.push({ ...order, fillAt: market.ticks + delay });
+    sfx.play('click');
+    toast(`${def.name} ${order.kind === 'buy' ? '매수' : '매도'} 주문 접수 · 체결 대기 중`, 'flat');
+    render();
+  }
+
+  function fill(order: Omit<PendingOrder, 'fillAt'>): void {
+    if (screen !== 'trade' && screen !== 'confirm') return; // the game ended in the meantime
+    const st = market.get(order.id);
+    const r =
+      order.kind === 'buy'
+        ? buy(account, order.id, st.price, order.margin, order.leverage, econ, equity(account, market.prices()))
+        : sell(account, order.id, st.price, order.fraction, econ);
+    applyTrade(r, st);
   }
 
   function applyTrade(r: TradeResult, st: Stock): void {
@@ -378,6 +428,7 @@ export function mountApp(root: HTMLElement): void {
     leverage = econ.leverages[0];
     sellFraction = 1;
     ending = null;
+    pending = [];
     setAmount(DEFAULT_AMOUNT);
     chart.reset();
     holdingsKey = '';
@@ -395,6 +446,7 @@ export function mountApp(root: HTMLElement): void {
   /** Sells everything at the current prices and shows the result. */
   function finish(reason: EndReason): void {
     if (screen !== 'trade' && screen !== 'confirm') return;
+    pending = []; // orders still waiting are dropped; everything held is sold below
     for (const id of Object.keys(account.positions)) {
       const r = sell(account, id, market.get(id).price, 1, econ);
       if (r.ok) account = r.account;
@@ -439,6 +491,7 @@ export function mountApp(root: HTMLElement): void {
             h('li', {}, '좌측 종목을 골라 차트를 보고 우측에서 매수 / 매도'),
             h('li', {}, `평가 자산 `, h('b', {}, usd(econ.leverageFrom, 0)), `부터 레버리지 최대 `, h('b', {}, `${Math.max(...econ.leverages)}배`), ' — 청산가에 닿으면 증거금 전액 손실'),
             h('li', {}, `매수·매도 때 주문 규모의 ${num(econ.feeRate * 100, 1)}% 수수료`),
+            h('li', {}, '거래량이 많은 종목일수록 시세가 빨리 바뀌고 체결이 늦다 (킹카콜라 즉시 … 게이임스탑 0.4~1초)'),
             T.sessionSec > 0
               ? h('li', {}, '게임 시간 ', h('b', {}, `${clock(T.sessionSec)}`), ' — 장이 마감되면 보유 종목을 종가로 자동 정산')
               : null,
@@ -529,6 +582,10 @@ export function mountApp(root: HTMLElement): void {
     setText(detailStart, usd(def.start, d));
     setText(detailHigh, usd(extremes[selected].hi, d));
     setText(detailLow, usd(extremes[selected].lo, d));
+    const vol = def.volume;
+    setText(detailVolume, `${'▮'.repeat(vol.level)}${'▯'.repeat(5 - vol.level)} ${VOLUME_LABEL[vol.level]}`);
+    setText(detailQuote, vol.quoteSec >= 1 ? `약 ${num(vol.quoteSec, 0)}초마다` : `초당 약 ${num(1 / vol.quoteSec, 0)}번`);
+    setText(detailFill, vol.fillDelay[1] > 0 ? `${num(vol.fillDelay[0], 1)}~${num(vol.fillDelay[1], 1)}초 뒤 그때 가격` : '즉시 (보이는 가격)');
 
     // Chart head
     setText(headName, def.name);
@@ -584,7 +641,9 @@ export function mountApp(root: HTMLElement): void {
             ? TRADE_ERROR_TEXT.cash
             : '';
     setText(buyMsg, buyError);
-    buyBtn.disabled = screen !== 'trade' || !!buyError;
+    const busy = isPending(selected);
+    buyBtn.disabled = screen !== 'trade' || !!buyError || busy;
+    setText(buyBtn, busy ? '체결 중…' : '매수');
 
     if (pos) {
       const pnl = unrealized(pos, st.price);
@@ -604,7 +663,8 @@ export function mountApp(root: HTMLElement): void {
     }
     sellStepBtns.forEach((b, i) => b.classList.toggle('active', SELL_STEPS[i] === sellFraction));
     setText(sellMsg, pos ? '' : '이 종목을 보유하고 있지 않습니다');
-    sellBtn.disabled = screen !== 'trade' || !pos;
+    sellBtn.disabled = screen !== 'trade' || !pos || busy;
+    setText(sellBtn, busy ? '체결 중…' : '매도');
 
     renderHoldings(prices);
   }
@@ -664,7 +724,8 @@ export function mountApp(root: HTMLElement): void {
 
   function floatText(text: string, kind: string): void {
     const p = chart.lastPoint();
-    const el = h('div', { class: `float ${kind}`, style: `left:${p.x}px;top:${p.y}px` }, text);
+    // The text ends at the newest candle; early in a game that candle is at the left edge, so keep it on screen.
+    const el = h('div', { class: `float ${kind}`, style: `left:${Math.max(p.x, FLOAT_MIN_X)}px;top:${p.y}px` }, text);
     fx.append(el);
     setTimeout(() => el.remove(), 1400);
   }
@@ -740,6 +801,11 @@ export function mountApp(root: HTMLElement): void {
         account = r.account;
         onLiquidated(r.fills);
         if (isBroke(account, econ)) finish('broke');
+      }
+      const due = pending.filter((o) => o.fillAt <= market.ticks);
+      if (due.length) {
+        pending = pending.filter((o) => o.fillAt > market.ticks);
+        for (const o of due) fill(o);
       }
       if (T.sessionSec > 0) {
         const left = T.sessionSec - (market.ticks * T.tickMs) / 1000;

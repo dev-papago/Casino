@@ -1,20 +1,21 @@
-// Price simulation (DESIGN.md section 2). Every stock moves on the same tick clock; each tick the log price
-// changes by the stock's model (its tendency and events) plus the noise every stock gets (Gaussian noise whose
-// size wanders, plus rare jumps). Candles are built from tick prices, so a candle's high and low are the
-// extreme ticks inside it. The RNG is injected: crypto in the app, seeded in tests and the sim.
+// Price simulation (DESIGN.md section 2). Every stock moves on the same tick clock. Each tick the log of its true
+// price changes by its trend, the noise every stock gets, the chart formation being played (patterns.ts) and any
+// running 급등·급락 event (events.ts). What players see and trade is the quote: it catches up with the true price
+// only when the stock trades, which a busy stock does every tick and a quiet one every few seconds (volume).
+// Candles are built from quotes, so a candle's high and low are the extreme quotes inside it.
+// The RNG is injected: crypto in the app, seeded in tests and the sim.
 import {
   CONFIG,
-  type CrashModel,
-  type DecayModel,
   type GameConfig,
-  type ModelDef,
   type NoiseDef,
-  type SqueezeModel,
-  type SteadyModel,
+  type SteadyTrend,
   type StockDef,
-  type WaveModel,
+  type TrendDef,
+  type WaveTrend,
 } from '../config.ts';
 import { between, gauss, type Rng } from '../rng.ts';
+import { makeEvents } from './events.ts';
+import { makePatterns } from './patterns.ts';
 
 export interface Candle {
   o: number;
@@ -23,19 +24,29 @@ export interface Candle {
   c: number;
 }
 
-export interface PriceModel {
-  /** Log-price change for one tick from the model alone (noise is added by the market), given the current log price. */
+export interface Trend {
+  /** Log-price change for one tick from the trend alone, given the current log price. */
   step(x: number): number;
-  /** Moves the model's internal log levels by d (the history is shifted to end at the start price). */
+  /** Moves the trend's internal log levels by d (the history is shifted to end at the start price). */
   shift(d: number): void;
 }
 
 export interface Stock {
   def: StockDef;
-  x: number; // log price
-  price: number;
+  x: number; // log of the true price, which moves every tick
+  price: number; // the quote: shown and traded; it catches up with the true price whenever the stock trades
   candles: Candle[]; // closed, oldest first
   live: Candle; // being built this candle
+}
+
+/** Everything that moves one stock. */
+interface Engine {
+  trend: Trend;
+  noise: () => number;
+  patterns: () => number;
+  events: () => number;
+  quoteGap: () => number; // ticks until the next quote
+  nextQuote: number;
 }
 
 const SOFT_PULL = 0.05; // per second, outside a stock's bounds
@@ -45,17 +56,27 @@ const TAU = 2 * Math.PI;
 export class Market {
   readonly stocks: Stock[];
   ticks = 0; // since the game started (history excluded)
+  private clock = 0; // ticks since the market was made (history included)
   private sub = 0; // ticks into the live candle
   private readonly cfg: GameConfig;
-  private readonly models: PriceModel[];
-  private readonly noises: Noise[];
+  private readonly engines: Engine[];
   private readonly dt: number;
 
   constructor(rng: Rng, cfg: GameConfig = CONFIG) {
     this.cfg = cfg;
-    this.dt = cfg.timing.tickMs / 1000;
-    this.models = cfg.stocks.map((s) => makeModel(s.model, rng, this.dt));
-    this.noises = cfg.stocks.map((s) => makeNoise(s.noise, rng, this.dt));
+    const dt = (this.dt = cfg.timing.tickMs / 1000);
+    this.engines = cfg.stocks.map((s) => {
+      const quoteTicks = s.volume.quoteSec / dt;
+      return {
+        trend: makeTrend(s.trend, rng, dt),
+        noise: makeNoise(s.noise, rng, dt),
+        patterns: makePatterns(s.patterns, rng, dt),
+        events: makeEvents(s.events, rng, dt, cfg.timing.eventWindowSec),
+        quoteGap: () => (quoteTicks <= 1 ? 1 : Math.max(1, Math.round(-Math.log(1 - rng.float()) * quoteTicks))),
+        nextQuote: 0,
+      };
+    });
+    this.engines.forEach((e) => (e.nextQuote = e.quoteGap()));
     this.stocks = cfg.stocks.map((def) => {
       const p = def.start;
       return { def, x: Math.log(p), price: p, candles: [], live: { o: p, h: p, l: p, c: p } };
@@ -81,17 +102,22 @@ export class Market {
 
   private advance(): void {
     const { ticksPerCandle, keepCandles } = this.cfg.timing;
+    this.clock++;
     this.sub = (this.sub + 1) % ticksPerCandle;
     const closeCandle = this.sub === 0;
     this.stocks.forEach((s, i) => {
+      const e = this.engines[i];
       const { start, bounds } = s.def;
       const lo = Math.log(start * bounds[0]);
       const hi = Math.log(start * bounds[1]);
-      let dx = this.models[i].step(s.x) + this.noises[i]();
+      let dx = e.trend.step(s.x) + e.noise() + e.patterns() + e.events();
       if (s.x < lo) dx += SOFT_PULL * (lo - s.x) * this.dt;
       else if (s.x > hi) dx -= SOFT_PULL * (s.x - hi) * this.dt;
       s.x = clamp(s.x + (Number.isFinite(dx) ? dx : 0), Math.log(start * HARD_LIMIT[0]), Math.log(start * HARD_LIMIT[1]));
-      s.price = Math.exp(s.x);
+      if (this.clock >= e.nextQuote) {
+        s.price = Math.exp(s.x);
+        e.nextQuote = this.clock + e.quoteGap();
+      }
       const c = s.live;
       c.c = s.price;
       if (s.price > c.h) c.h = s.price;
@@ -104,12 +130,12 @@ export class Market {
     });
   }
 
-  /** Runs the models through the history candles, then scales each history so it ends at the start price. */
+  /** Runs the market through the history candles, then scales each history so it ends at the start price. */
   private buildHistory(): void {
     const n = this.cfg.timing.historyCandles * this.cfg.timing.ticksPerCandle;
     for (let t = 0; t < n; t++) this.advance();
     this.stocks.forEach((s, i) => {
-      const d = Math.log(s.def.start) - s.x;
+      const d = Math.log(s.def.start) - Math.log(s.price);
       const k = Math.exp(d);
       for (const c of s.candles) {
         c.o *= k;
@@ -117,7 +143,7 @@ export class Market {
         c.l *= k;
         c.c *= k;
       }
-      this.models[i].shift(d);
+      this.engines[i].trend.shift(Math.log(s.def.start) - s.x);
       s.x = Math.log(s.def.start);
       s.price = s.def.start;
       s.live = { o: s.price, h: s.price, l: s.price, c: s.price };
@@ -127,35 +153,39 @@ export class Market {
 
 const clamp = (v: number, lo: number, hi: number): number => Math.min(hi, Math.max(lo, v));
 
-export function makeModel(m: ModelDef, rng: Rng, dt: number): PriceModel {
+export function makeTrend(m: TrendDef, rng: Rng, dt: number): Trend {
   switch (m.kind) {
     case 'steady':
       return steady(m, rng, dt);
-    case 'crash':
-      return crash(m, rng, dt);
     case 'wave':
       return wave(m, rng, dt);
-    case 'decay':
-      return decay(m, rng, dt);
-    case 'squeeze':
-      return squeeze(m, rng, dt);
+    case 'drift':
+      return { step: () => m.drift * dt, shift() {} };
   }
 }
 
 /**
  * One tick of noise. The log volatility is an Ornstein-Uhlenbeck process (stationary spread `wander`), scaled so
  * the average variance stays vol²: calm and choppy stretches come and go without changing the overall size.
+ * Needles are a separate fast mean-reverting deviation, so they snap back instead of adding up.
  */
-type Noise = () => number;
-function makeNoise(n: NoiseDef, rng: Rng, dt: number): Noise {
+function makeNoise(n: NoiseDef, rng: Rng, dt: number): () => number {
   const keep = dt / n.wanderSec;
   const kick = n.wander * Math.sqrt(2 * keep);
   const scale = n.vol * Math.sqrt(dt);
+  const needle = n.needle;
   let h = n.wander * gauss(rng); // start somewhere in the stationary spread
+  let dev = 0;
   return () => {
     h += -h * keep + kick * gauss(rng);
     let dx = scale * Math.exp(h - n.wander * n.wander) * gauss(rng);
     if (n.jumpRate > 0 && rng.float() < n.jumpRate * dt) dx += (rng.coin() ? 1 : -1) * between(rng, n.jumpSize);
+    if (needle) {
+      const before = dev;
+      dev += -needle.revert * dev * dt + needle.vol * Math.sqrt(dt) * gauss(rng);
+      if (rng.float() < needle.rate * dt) dev += (rng.coin() ? 1 : -1) * between(rng, needle.size);
+      dx += dev - before;
+    }
     return dx;
   };
 }
@@ -163,10 +193,8 @@ function makeNoise(n: NoiseDef, rng: Rng, dt: number): Noise {
 /** Ticks in a random duration: exponential with the given mean (seconds), at least one tick. */
 const expTicks = (rng: Rng, meanSec: number, dt: number): number =>
   Math.max(1, Math.round((-Math.log(1 - rng.float()) * meanSec) / dt));
-const ticksIn = (rng: Rng, sec: readonly [number, number], dt: number): number =>
-  Math.max(1, Math.round(between(rng, sec) / dt));
 
-function steady(m: SteadyModel, rng: Rng, dt: number): PriceModel {
+function steady(m: SteadyTrend, rng: Rng, dt: number): Trend {
   let up = rng.float() < m.up.meanSec / (m.up.meanSec + m.down.meanSec);
   let left = expTicks(rng, up ? m.up.meanSec : m.down.meanSec, dt);
   let strength = between(rng, [0.5, 1.5]);
@@ -183,31 +211,7 @@ function steady(m: SteadyModel, rng: Rng, dt: number): PriceModel {
   };
 }
 
-function crash(m: CrashModel, rng: Rng, dt: number): PriceModel {
-  let low = Number.NaN; // log bottom since the last crash
-  let left = 0; // crash ticks remaining
-  let perTick = 0;
-  return {
-    step(x) {
-      if (Number.isNaN(low) || x < low) low = x;
-      if (left === 0) {
-        const hazard = m.hazardBase + m.hazardSlope * Math.max(0, x - low - m.rallyFree);
-        if (rng.float() >= hazard * dt) return m.drift * dt;
-        left = ticksIn(rng, m.crashSec, dt);
-        perTick = -between(rng, m.crashDrop) / left;
-      }
-      left--;
-      const dx = perTick * (0.4 + 1.2 * rng.float()); // jagged, same total on average
-      if (left === 0) low = x + dx;
-      return dx;
-    },
-    shift(d) {
-      low += d;
-    },
-  };
-}
-
-function wave(m: WaveModel, rng: Rng, dt: number): PriceModel {
+function wave(m: WaveTrend, rng: Rng, dt: number): Trend {
   const comps = m.waves.map((w) => ({ w, phase: rng.float() * TAU, speed: 0, amp: 0 }));
   const renew = (c: (typeof comps)[number]): void => {
     c.speed = (TAU / between(rng, c.w.periodSec)) * dt;
@@ -231,62 +235,5 @@ function wave(m: WaveModel, rng: Rng, dt: number): PriceModel {
     shift(d) {
       anchor += d;
     },
-  };
-}
-
-function decay(m: DecayModel, rng: Rng, dt: number): PriceModel {
-  let mode: 'drift' | 'spike' | 'fade' = 'drift';
-  let left = 0;
-  let perTick = 0;
-  let gain = 0;
-  return {
-    step() {
-      if (mode === 'drift') {
-        if (rng.float() >= m.spikeRate * dt) return m.drift * dt;
-        mode = 'spike';
-        gain = between(rng, m.spikeGain);
-        left = ticksIn(rng, m.spikeSec, dt);
-        perTick = gain / left;
-      }
-      const dx = perTick * (0.4 + 1.2 * rng.float());
-      if (--left === 0) {
-        if (mode === 'spike') {
-          mode = 'fade';
-          left = ticksIn(rng, m.fadeSec, dt);
-          perTick = (-gain * between(rng, m.fadeShare)) / left + m.drift * dt;
-        } else {
-          mode = 'drift';
-        }
-      }
-      return dx;
-    },
-    shift() {},
-  };
-}
-
-function squeeze(m: SqueezeModel, rng: Rng, dt: number): PriceModel {
-  const noise = m.vol * Math.sqrt(dt);
-  const rate = m.squeezeRate + m.crashRate;
-  let dev = 0;
-  let left = 0;
-  let perTick = 0;
-  return {
-    step() {
-      let d = m.drift * dt;
-      if (left === 0 && rng.float() < rate * dt) {
-        const up = rng.float() * rate < m.squeezeRate;
-        left = ticksIn(rng, m.jumpSec, dt);
-        perTick = (up ? between(rng, m.squeezeGain) : -between(rng, m.crashDrop)) / left;
-      }
-      if (left > 0) {
-        d += perTick;
-        left--;
-      }
-      const before = dev;
-      dev += -m.revert * dev * dt + noise * gauss(rng);
-      if (rng.float() < m.jumpRate * dt) dev += (rng.float() < m.jumpUp ? 1 : -1) * between(rng, m.jumpSize);
-      return d + dev - before;
-    },
-    shift() {},
   };
 }

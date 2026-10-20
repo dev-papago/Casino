@@ -1,6 +1,8 @@
-// Candle chart on a canvas: price bars only, no indicators. Each candle is one second of ticks; the last
-// one is still forming. The price range eases toward the visible candles so the chart does not jump.
+// Candle chart on a canvas: price bars only, no indicators. Each candle is timing.ticksPerCandle ticks of quotes
+// (3 seconds); the last one is still forming. The mouse wheel zooms: fewer, wider candles or more, thinner ones.
+// The price range eases toward the visible candles so the chart does not jump.
 // Extra horizontal lines mark the player's average entry and liquidation price.
+import type { Range } from '../config.ts';
 import type { Candle, Stock } from '../game/market.ts';
 import { num } from './format.ts';
 
@@ -15,25 +17,39 @@ const DOWN = '#3d8bff';
 const GRID = 'rgba(140, 170, 255, 0.08)';
 const AXIS_TEXT = 'rgba(200, 215, 255, 0.6)';
 const FONT = "'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif";
+const ZOOM_PER_DELTA = 0.0015; // one wheel notch (deltaY ≈ 100) changes the candle count by about 16%
 
 export class CandleChart {
   readonly el: HTMLDivElement;
   private readonly canvas: HTMLCanvasElement;
   private readonly ctx: CanvasRenderingContext2D;
-  private readonly visible: number;
+  private visible: number;
+  private readonly candleSec: number;
   private lo = Number.NaN;
   private hi = Number.NaN;
   private plot = { x: 0, y: 0, w: 0, h: 0 };
   private last = { x: 0, y: 0 };
 
-  constructor(visible: number) {
+  constructor(visible: number, zoom: Range, candleSec: number) {
     this.visible = visible;
+    this.candleSec = candleSec;
     this.canvas = document.createElement('canvas');
     this.canvas.className = 'chart-canvas';
     this.ctx = this.canvas.getContext('2d')!;
     this.el = document.createElement('div');
     this.el.className = 'chart';
+    this.el.dataset.candles = String(visible);
     this.el.append(this.canvas);
+    this.el.addEventListener(
+      'wheel',
+      (e) => {
+        e.preventDefault(); // no page scroll, no browser zoom
+        const delta = clamp(e.deltaY, -200, 200);
+        this.visible = Math.round(clamp(this.visible * Math.exp(delta * ZOOM_PER_DELTA), zoom[0], zoom[1]));
+        this.el.dataset.candles = String(this.visible);
+      },
+      { passive: false },
+    );
   }
 
   /** Snap the price range on the next draw (another stock was selected or a new game started). */
@@ -78,6 +94,11 @@ export class CandleChart {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
     ctx.fillText(stock.def.ticker, P.x + P.w / 2, P.y + P.h / 2);
+    ctx.font = `600 ${rem * 0.7}px ${FONT}`;
+    ctx.fillStyle = AXIS_TEXT;
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(`봉 ${this.candleSec}초 · ${this.visible}개 · 마우스 휠로 확대/축소`, P.x + rem * 0.3, h - rem * 0.25);
     ctx.restore();
 
     // Price grid and axis labels

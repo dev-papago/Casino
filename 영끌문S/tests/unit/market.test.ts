@@ -44,6 +44,24 @@ describe('market', () => {
     }
   });
 
+  it('quotes a quiet stock every few seconds and a busy one every tick', () => {
+    const m = new Market(seededRng(5));
+    const changes: Record<string, number> = {};
+    let last = m.prices();
+    for (let i = 0; i < 60 * SEC; i++) {
+      m.step();
+      const now = m.prices();
+      for (const id of Object.keys(now)) if (now[id] !== last[id]) changes[id] = (changes[id] ?? 0) + 1;
+      last = now;
+    }
+    for (const s of m.stocks) {
+      const expected = 60 / Math.max(s.def.volume.quoteSec, T.tickMs / 1000);
+      expect(changes[s.def.id], s.def.id).toBeGreaterThan(expected * 0.6);
+      expect(changes[s.def.id], s.def.id).toBeLessThan(expected * 1.4 + 3);
+    }
+    expect(changes.kingka).toBeLessThan(changes.gamestop / 5);
+  });
+
   it('keeps each tendency over a game while the next seconds stay a coin flip (many games)', () => {
     const rng = seededRng(4);
     const N = 200;
