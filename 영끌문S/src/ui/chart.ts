@@ -1,7 +1,9 @@
 // Candle chart on a canvas: price bars only, no indicators. Each candle is timing.ticksPerCandle ticks of quotes
-// (3 seconds); the last one is still forming. Holding the mouse button and dragging resizes the candles:
+// (3 seconds); the last one is still forming. Dragging with the left button held resizes the candles:
 // left / right makes them narrower / wider (more or fewer on screen), down / up makes them shorter / taller.
-// A double click restores the default size. The price range eases toward the visible candles so the chart does
+// Dragging with the right button held moves the view like grabbing the chart: sideways back into older candles
+// (which then stay put while new ones close), up and down along the price. A double click restores size and
+// position; picking another stock restores the position. The price range eases toward the visible candles so the chart does
 // not jump. A low-volume stock gets a wider range around them (volume.chartPad), so its candles look short and a
 // busy stock's look long; the vertical size multiplies that for every stock.
 // Extra horizontal lines mark the player's average entry and liquidation price.
@@ -23,6 +25,7 @@ const FONT = "'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR', sans-serif
 const DRAG_PER_PX = 0.006; // 100 px of drag scales the candles by about 1.8×
 const STRETCH: Range = [0.3, 5]; // vertical size, relative to the default
 const KEEP_IN_VIEW = 0.85; // when stretched, the newest price stays within this share of the half range
+const SHIFT_MAX = 1; // the price range moves up or down by at most one chart height
 
 export class CandleChart {
   readonly el: HTMLDivElement;
@@ -30,7 +33,10 @@ export class CandleChart {
   private readonly ctx: CanvasRenderingContext2D;
   private visible: number;
   private stretch = 1; // vertical candle size, relative to the default
-  private dragging = false;
+  private scroll = 0; // candles between the newest one and the right edge (0: following the market)
+  private shift = 0; // price range moved up by this share of its height
+  private seen = 0; // candles there were at the last draw, to keep a scrolled view on the same candles
+  private drag: 'size' | 'pan' | null = null;
   private readonly defaultVisible: number;
   private readonly candleSec: number;
   private lo = Number.NaN;
@@ -48,32 +54,40 @@ export class CandleChart {
     this.el.className = 'chart';
     this.el.dataset.candles = String(visible);
     this.el.dataset.stretch = '1.00';
+    this.setPan(0, 0);
     this.el.append(this.canvas);
 
-    let start = { x: 0, y: 0, visible: 0, stretch: 1 };
+    let start = { x: 0, y: 0, visible: 0, stretch: 1, scroll: 0, shift: 0 };
     this.el.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
+      if ((e.button !== 0 && e.button !== 2) || this.drag) return;
       e.preventDefault();
       this.el.setPointerCapture(e.pointerId);
-      this.dragging = true;
-      this.el.classList.add('dragging');
-      start = { x: e.clientX, y: e.clientY, visible: this.visible, stretch: this.stretch };
+      this.drag = e.button === 0 ? 'size' : 'pan';
+      this.el.classList.add(this.drag === 'size' ? 'dragging' : 'panning');
+      start = { x: e.clientX, y: e.clientY, visible: this.visible, stretch: this.stretch, scroll: this.scroll, shift: this.shift };
     });
     this.el.addEventListener('pointermove', (e) => {
-      if (!this.dragging) return;
       const dx = e.clientX - start.x;
       const dy = e.clientY - start.y;
-      this.setSize(start.visible * Math.exp(-dx * DRAG_PER_PX), start.stretch * Math.exp(-dy * DRAG_PER_PX), zoom);
+      if (this.drag === 'size') {
+        this.setSize(start.visible * Math.exp(-dx * DRAG_PER_PX), start.stretch * Math.exp(-dy * DRAG_PER_PX), zoom);
+      } else if (this.drag === 'pan' && this.plot.w > 0) {
+        // Grab and move: the candles follow the pointer (draw() keeps the scroll inside the chart's history).
+        this.setPan(start.scroll + (dx * this.visible) / this.plot.w, start.shift + dy / this.plot.h);
+      }
     });
     const end = (e: PointerEvent): void => {
-      if (!this.dragging) return;
-      this.dragging = false;
-      this.el.classList.remove('dragging');
+      if (!this.drag) return;
+      this.drag = null;
+      this.el.classList.remove('dragging', 'panning');
       if (this.el.hasPointerCapture(e.pointerId)) this.el.releasePointerCapture(e.pointerId);
     };
     this.el.addEventListener('pointerup', end);
     this.el.addEventListener('pointercancel', end);
-    this.el.addEventListener('dblclick', () => this.setSize(this.defaultVisible, 1, zoom));
+    this.el.addEventListener('dblclick', () => {
+      this.setSize(this.defaultVisible, 1, zoom);
+      this.setPan(0, 0);
+    });
     // No page scroll and no browser zoom (Ctrl + wheel) over the chart.
     this.el.addEventListener('wheel', (e) => e.preventDefault(), { passive: false });
   }
@@ -85,9 +99,18 @@ export class CandleChart {
     this.el.dataset.stretch = this.stretch.toFixed(2);
   }
 
-  /** Snap the price range on the next draw (another stock was selected or a new game started). */
+  private setPan(scroll: number, shift: number): void {
+    this.scroll = Math.max(0, Math.round(scroll));
+    this.shift = clamp(shift, -SHIFT_MAX, SHIFT_MAX);
+    this.el.dataset.scroll = String(this.scroll);
+    this.el.dataset.shift = this.shift.toFixed(2);
+  }
+
+  /** Back to the newest candles and snap the price range (another stock was selected or a new game started). */
   reset(): void {
     this.lo = this.hi = Number.NaN;
+    this.seen = 0;
+    this.setPan(0, 0);
   }
 
   /** Where the newest price sits, in CSS pixels relative to the chart box. */
@@ -114,8 +137,15 @@ export class CandleChart {
     this.plot = { x: pad * 0.5, y: pad, w: w - axisW - pad * 0.5, h: h - pad * 2 };
     const P = this.plot;
 
-    const candles: Candle[] = [...stock.candles.slice(-(this.visible - 1)), stock.live];
-    this.ease(candles, stock.def.volume.chartPad / this.stretch, stock.price);
+    const all: Candle[] = [...stock.candles, stock.live];
+    // Scrolled back, the view stays on the same candles while new ones close; it never goes past the oldest.
+    if (this.scroll > 0 && this.seen > 0 && all.length > this.seen) this.scroll += all.length - this.seen;
+    this.seen = all.length;
+    this.setPan(Math.min(this.scroll, Math.max(0, all.length - this.visible)), this.shift);
+    const following = this.scroll === 0;
+    const end = all.length - this.scroll;
+    const candles = all.slice(Math.max(0, end - this.visible), end);
+    this.ease(candles, stock.def.volume.chartPad / this.stretch, following ? stock.price : undefined);
     const span = this.hi - this.lo;
     const yOf = (p: number): number => P.y + (1 - (p - this.lo) / span) * P.h;
     const d = stock.def.decimals;
@@ -166,7 +196,7 @@ export class CandleChart {
       ctx.moveTo(cx, yOf(c.h));
       ctx.lineTo(cx, yOf(c.l));
       ctx.stroke();
-      const live = i === candles.length - 1;
+      const live = following && i === candles.length - 1;
       if (live) {
         ctx.shadowColor = color;
         ctx.shadowBlur = rem * 0.8;
@@ -181,7 +211,9 @@ export class CandleChart {
     ctx.font = `600 ${rem * 0.7}px ${FONT}`;
     ctx.textAlign = 'left';
     ctx.textBaseline = 'bottom';
-    const hint = `봉 ${this.candleSec}초 · ${this.visible}개 · 높이 ×${this.stretch.toFixed(1)} · 끌기: 좌우 폭 / 상하 높이 · 더블클릭: 원래대로`;
+    const backSec = this.scroll * this.candleSec;
+    const back = following ? '' : backSec < 60 ? `${backSec}초 전 · ` : `${num(backSec / 60, 1)}분 전 · `;
+    const hint = `${back}봉 ${this.candleSec}초 · ${this.visible}개 · 높이 ×${this.stretch.toFixed(1)} · 왼쪽 끌기: 크기 · 오른쪽 끌기: 이동 · 더블클릭: 원래대로`;
     ctx.fillStyle = 'rgba(3, 6, 14, 0.8)';
     ctx.fillRect(P.x, h - rem * 1.15, ctx.measureText(hint).width + rem * 0.6, rem * 1.15);
     ctx.fillStyle = AXIS_TEXT;
@@ -193,10 +225,12 @@ export class CandleChart {
     const live = stock.live;
     const lastColor = live.c >= live.o ? UP : DOWN;
     this.hline(stock.price, lastColor, '', d, rem, yOf, false);
-    this.last = { x: P.x + (candles.length - 0.5) * slot, y: clamp(yOf(stock.price), P.y, P.y + P.h) };
+    const lastX = following ? P.x + (candles.length - 0.5) * slot : P.x + P.w; // scrolled back: the newest is off to the right
+    this.last = { x: lastX, y: clamp(yOf(stock.price), P.y, P.y + P.h) };
   }
 
-  private ease(candles: readonly Candle[], chartPad: number, price: number): void {
+  /** `price`: the newest price to keep in view when stretched (undefined while looking at older candles). */
+  private ease(candles: readonly Candle[], chartPad: number, price?: number): void {
     let lo = Infinity;
     let hi = -Infinity;
     for (const c of candles) {
@@ -206,10 +240,11 @@ export class CandleChart {
     const half = Math.max((hi - lo) / 2, ((lo + hi) / 2) * 0.004) * chartPad;
     // Stretched taller than the candles fit, the view follows the newest price instead of their middle.
     const keep = half * KEEP_IN_VIEW;
-    const mid = clamp((lo + hi) / 2, price - keep, price + keep);
+    const center = price === undefined ? (lo + hi) / 2 : clamp((lo + hi) / 2, price - keep, price + keep);
+    const mid = center + this.shift * 2 * half; // moved by a right-button drag
     const tLo = mid - half;
     const tHi = mid + half;
-    if (Number.isNaN(this.lo) || this.dragging) {
+    if (Number.isNaN(this.lo) || this.drag) {
       this.lo = tLo;
       this.hi = tHi;
       return;

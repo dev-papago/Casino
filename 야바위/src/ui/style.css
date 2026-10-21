@@ -506,6 +506,12 @@ kbd {
   display: none;
 }
 
+.banner[data-reason='cap'] {
+  color: #2a0a00;
+  background: linear-gradient(#fff2b0, var(--gold) 55%, var(--gold-lo));
+  box-shadow: 0 0 2.5rem rgba(245, 197, 66, 0.8);
+}
+
 .banner[data-reason='broke'] {
   color: #fff;
   background: linear-gradient(#e0475d, var(--red-dk));

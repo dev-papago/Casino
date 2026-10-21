@@ -6,7 +6,9 @@
 //   node scripts/simulate.mjs --quick              smoke run
 //   node scripts/simulate.mjs --seed 7 --config my.json
 //
-// A: shuffle hit rates per level, B: expected chips per round, C: whole sessions (Monte Carlo).
+// A: shuffle hit rates per level, B: expected chips per round, C: whole sessions (Monte Carlo),
+// D: a festival day for the booth (many guests). Odds payout, no table limit, auto 정산 above
+// economy.autoSettleAt chips (BALANCE.md).
 // The sim uses a seeded PRNG so results are reproducible; the app uses crypto.getRandomValues.
 
 import { readFileSync } from 'node:fs';
@@ -25,6 +27,8 @@ const ECON = CFG.economy;
 const N_ROUNDS = QUICK ? 20000 : 200000; // shuffle plans per level
 const N_SESSIONS = QUICK ? 20000 : 200000; // simulated sessions per (level, policy)
 const SESSION_ROUNDS = 10; // rounds a simulated player plays before pressing 정산
+const MAX_ROUNDS = 200; // a "play until the target" guest gives up after this many rounds
+const DAY_GUESTS = 300; // paid sessions in one festival day (part D)
 
 // Sim-only assumptions (not game config). Listed in DESIGN.md section 10.
 const ASSUME = {
@@ -165,33 +169,62 @@ function partA() {
 }
 
 // ---------------------------------------------------------------- B. paid rounds (mirrors src/game/session.ts)
-// Bet B chips on a level with multiplier m: a hit wins floor(B·m), a miss loses floor(B·m).
-// Expected chips per round = floor(B·m) · (2p − 1), so a level favors the booth exactly when p < 1/2.
-// B is at most economy.maxBet and never more than the stack can lose.
-const amount = (bet, m) => Math.floor(bet * m + 1e-9);
+// Odds payout: bet B chips on a level with multiplier m; a hit wins floor(B·m), a miss loses B.
+// Expected chips per round ≈ B · (p·(1 + m) − 1), so a level favors the booth when p < 1 / (1 + m).
+// B can be the whole stack as long as a hit stays within economy.autoSettleAt; reaching it ends the session.
+const winAmount = (bet, m) => Math.floor(bet * m + 1e-9);
+const CAP = ECON.autoSettleAt;
 function maxBet(stack, m) {
-  let b = 0;
-  while (b < ECON.maxBet && amount(b + 1, m) <= stack) b++;
+  const room = CAP - stack;
+  let b = Math.max(0, Math.min(stack, Math.ceil((room + 1) / m) - 1));
+  while (b > 0 && winAmount(b, m) > room) b--;
+  while (b < stack && winAmount(b + 1, m) <= room) b++;
   return b;
 }
 
-// One player: starts with buyIn, plays SESSION_ROUNDS rounds (fewer if they cannot bet), then 정산.
+// Guest policies. bet(stack) → chips to bet; rounds: how many rounds at most; target: 정산 once the stack
+// reaches it (chips). Every guest also stops at 0 chips and is settled automatically at CAP. "올인" = the largest bet allowed.
+const POLICIES = [
+  { name: '1칩씩 10판', bet: () => 1, rounds: SESSION_ROUNDS },
+  { name: '절반씩 10판', bet: (st) => Math.max(1, Math.floor(st / 2)), rounds: SESSION_ROUNDS },
+  { name: '올인 10판', bet: (st) => st, rounds: SESSION_ROUNDS },
+  { name: '올인, 2배(10칩)면 정산', bet: (st) => st, rounds: MAX_ROUNDS, target: 2 },
+  { name: '올인, 자동 정산까지', bet: (st) => st, rounds: MAX_ROUNDS },
+];
+
+// One policy on one level: N_SESSIONS guests, each starting with buyIn.
 function mcSessions(m, p, policy) {
   const nets = [];
   let broke = 0;
+  let capped = 0;
+  let rounds = 0;
+  const target = policy.target ? policy.target * ECON.buyIn : Infinity;
   for (let i = 0; i < N_SESSIONS; i++) {
     let stack = ECON.buyIn;
-    for (let r = 0; r < SESSION_ROUNDS; r++) {
-      const mb = maxBet(stack, m);
-      if (mb < 1) break;
-      const bet = policy === 'all-in' ? mb : 1;
-      stack += (rng() < p ? 1 : -1) * amount(bet, m);
+    for (let r = 0; r < policy.rounds && stack < target && stack > 0 && stack < CAP; r++) {
+      const bet = Math.min(maxBet(stack, m), policy.bet(stack));
+      stack += rng() < p ? winAmount(bet, m) : -bet;
+      rounds++;
     }
     if (stack === 0) broke++;
+    if (stack >= CAP) capped++;
     nets.push(stack - ECON.buyIn);
   }
   nets.sort((a, b) => a - b);
-  return { mean: nets.reduce((s, x) => s + x, 0) / nets.length, p5: quant(nets, 0.05), p50: quant(nets, 0.5), p95: quant(nets, 0.95), max: nets[nets.length - 1], broke: broke / N_SESSIONS };
+  const share = (f) => nets.filter(f).length / nets.length;
+  const b = ECON.buyIn;
+  return {
+    mean: nets.reduce((s, x) => s + x, 0) / nets.length,
+    rounds: rounds / N_SESSIONS,
+    win: share((x) => x > 0),
+    x2: share((x) => x + b >= 2 * b),
+    x10: share((x) => x + b >= 10 * b),
+    capped: capped / N_SESSIONS,
+    p99: quant(nets, 0.99),
+    max: nets[nets.length - 1],
+    broke: broke / N_SESSIONS,
+    nets,
+  };
 }
 
 // ---------------------------------------------------------------- output helpers
@@ -215,22 +248,56 @@ console.log(table(
 ));
 console.log('\n이상적 관찰자 = 매 판 사후확률이 가장 큰 칸을 고르는 완벽한 관찰자. 적중률이 0.5보다 낮으면 그 난이도는 부스에 유리하다.\n');
 
-console.log(`## B. 한 판 기대값 (판돈 1칩 / 5칩, 손님 기준 칩)\n`);
+console.log(`## B. 한 판 기대값 (맞히면 +floor(판돈 × 배율), 틀리면 −판돈; 걸린 칩 1개당, 판돈 10칩 기준)\n`);
 console.log(table(
-  ['난이도', '배율', '판돈 1 → ±', '판돈 5 → ±', '기대값 p=1/3', '기대값 캐주얼', '기대값 완벽 지각', '기대값 이상적 관찰자'],
+  ['난이도', '배율', '판돈 1 → + / −', '판돈 5 → + / −', '판돈 10 → + / −', '본전 적중률', '무작위 1/3', '캐주얼', '숙련', '완벽 지각', '이상적 관찰자 (평균 / 최대)'],
   paid.map(([id, lv]) => {
     const r = A[id];
-    const ev = (p) => `${sgf(amount(1, lv.multiplier) * (2 * p - 1))} / ${sgf(amount(5, lv.multiplier) * (2 * p - 1))}`;
-    return [lv.label, `×${lv.multiplier}`, amount(1, lv.multiplier), amount(5, lv.multiplier), ev(1 / 3), ev(r.human['캐주얼']), ev(r.human['완벽지각']), ev(r.ideal)];
+    const m = lv.multiplier;
+    const ev = (p) => sgf((p * winAmount(10, m) - (1 - p) * 10) / 10, 3);
+    return [lv.label, `×${m}`, `+${winAmount(1, m)} / −1`, `+${winAmount(5, m)} / −5`, `+${winAmount(10, m)} / −10`, f(1 / (1 + m), 4),
+      ev(1 / 3), ev(r.human['캐주얼']), ev(r.human['숙련']), ev(r.human['완벽지각']), `${ev(r.ideal)} / ${ev(r.maxCeiling)}`];
   }),
 ));
+console.log('\n본전 적중률 = 1 / (1 + 배율). 적중률이 이보다 낮으면 그 난이도는 부스에 유리하다. 판돈이 작으면 소수점을 버려서 부스에 조금 더 유리하다.\n');
 
-console.log(`\n## C. 세션 (시작 ${ECON.buyIn}칩, 최대 판돈 ${ECON.maxBet}, ${SESSION_ROUNDS}판 하고 정산, 숙련 적중률, ${n0(N_SESSIONS)}세션)\n`);
+console.log(`## C. 세션 (시작 ${ECON.buyIn}칩, 지급 최대 ${CAP}칩 · 되면 자동 정산, 숙련 적중률, ${n0(N_SESSIONS)}세션)\n`);
 const rows = [];
+const results = {};
 for (const [id, lv] of paid) {
-  for (const policy of ['1칩씩', 'all-in']) {
-    const r = mcSessions(lv.multiplier, A[id].human['숙련'], policy);
-    rows.push([lv.label, policy, f(A[id].human['숙련'], 3), sgf(r.mean), `${sg(r.p5)} / ${sg(r.p50)} / ${sg(r.p95)}`, sg(r.max), pct(r.broke)]);
+  for (const pol of POLICIES) {
+    const r = mcSessions(lv.multiplier, A[id].human['숙련'], pol);
+    results[`${id}|${pol.name}`] = r;
+    rows.push([lv.label, pol.name, f(A[id].human['숙련'], 3), f(r.rounds, 1), sgf(r.mean), pct(r.win), pct(r.x2), pct(r.x10, 2), pct(r.capped, 2), sg(r.p99), sg(r.max), pct(r.broke)]);
   }
 }
-console.log(table(['난이도', '베팅', '적중률', '손님 평균', 'p5 / p50 / p95', '최대', '칩 0개로 끝남'], rows));
+console.log(table(['난이도', '손님', '적중률', '평균 판 수', '손님 평균', '이익', '2배 이상', '10배 이상', '자동 정산', 'p99', '최대', '칩 0개'], rows));
+console.log(`\n2배·10배 = 정산할 때 칩이 시작 칩의 2·10배 이상. 자동 정산 = 칩이 ${CAP}개가 되어 그 판에서 바로 끝남.\n`);
+
+// ---------------------------------------------------------------- D. a festival day
+// Every guest of the day plays the same policy on the same level. Days are resampled from the sessions of C.
+console.log(`## D. 하루 운영 (손님 ${DAY_GUESTS}명이 모두 같은 방식, 숙련 적중률, 10,000일)\n`);
+const DAYS = QUICK ? 2000 : 10000;
+const dayRows = [];
+for (const [id, lv] of paid) {
+  for (const pol of POLICIES) {
+    const r = results[`${id}|${pol.name}`];
+    const totals = [];
+    let capPerDay = 0;
+    let paidMax = 0;
+    for (let d = 0; d < DAYS; d++) {
+      let net = 0; // chips the booth gains (guests lose)
+      for (let g = 0; g < DAY_GUESTS; g++) {
+        const x = r.nets[randInt(r.nets.length)];
+        net -= x;
+        if (x + ECON.buyIn >= CAP) capPerDay++;
+        paidMax = Math.max(paidMax, x + ECON.buyIn);
+      }
+      totals.push(net);
+    }
+    totals.sort((a, b) => a - b);
+    dayRows.push([lv.label, pol.name, sgf(totals.reduce((s, x) => s + x, 0) / DAYS, 0), sg(quant(totals, 0.05)), sg(totals[0]), pct(totals.filter((x) => x < 0).length / DAYS), f(capPerDay / DAYS, 2), paidMax]);
+  }
+}
+console.log(table(['난이도', '손님', '부스 순칩 평균', '부스 순칩 p5', '최악의 날', '부스 적자인 날', '자동 정산 손님 (하루 평균)', '한 손님 최대 지급'], dayRows));
+console.log('\n부스 순칩 = 그날 받은 칩 − 돌려준 칩. 한 손님 최대 지급 = 정산 때 돌려준 칩(시작 칩 포함)의 최댓값.');

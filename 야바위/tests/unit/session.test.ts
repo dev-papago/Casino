@@ -1,13 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { CONFIG, loadSettings, normalizeSettings, saveSettings, sessionEconomy, type EconomyConfig } from '../../src/config';
-import { betAmount, maxBetFor, quit, resumePhase, sessionNet, settleRound, startSession, type Session } from '../../src/game/session';
+import { CONFIG, loadSettings, normalizeSettings, saveSettings, sessionEconomy } from '../../src/config';
+import { maxBetFor, quit, resumePhase, sessionNet, settleRound, startSession, winAmount, type Session } from '../../src/game/session';
 import type { Plan, Slot } from '../../src/game/shuffle';
 import { STATE_KEY, emptyStats, loadState, recordPayout, recordRound, saveState } from '../../src/storage';
 
 const ECON = CONFIG.economy;
 const plan: Plan = { level: 'hardest', start: 0, moves: [], final: 0, ceiling: 1, totalMs: 0 };
 const WIN: Slot = 0, LOSE: Slot = 1;
-const econWith = (maxBet: number): EconomyConfig => ({ ...ECON, maxBet });
 
 describe('session', () => {
   it('starts with 5 chips and no rounds', () => {
@@ -18,48 +17,73 @@ describe('session', () => {
     expect(sessionNet(s)).toBe(0);
   });
 
-  it('bet amounts are floor(bet × multiplier): 중간 ×1.2, 높음 ×1.5, 최상 ×2', () => {
-    expect([1, 2, 3, 4, 5].map((b) => betAmount(b, 'normal'))).toEqual([1, 2, 3, 4, 6]);
-    expect([1, 2, 3, 4, 5].map((b) => betAmount(b, 'high'))).toEqual([1, 3, 4, 6, 7]);
-    expect([1, 2, 3, 4, 5].map((b) => betAmount(b, 'hardest'))).toEqual([2, 4, 6, 8, 10]);
+  it('a hit wins floor(bet × multiplier): 중간 ×1, 높음 ×1.2, 최상 ×1.8', () => {
+    expect([1, 2, 3, 4, 5, 10].map((b) => winAmount(b, 'normal'))).toEqual([1, 2, 3, 4, 5, 10]);
+    expect([1, 2, 3, 4, 5, 10].map((b) => winAmount(b, 'high'))).toEqual([1, 2, 3, 4, 6, 12]);
+    expect([1, 2, 3, 4, 5, 10].map((b) => winAmount(b, 'hardest'))).toEqual([1, 3, 5, 7, 9, 18]);
   });
 
-  it('a win adds and a loss takes the same amount', () => {
+  it('odds payout: a win adds bet × multiplier, a loss takes only the bet', () => {
     const s = startSession(ECON, 0);
-    const w = settleRound(s, 'hardest', 2, WIN, plan);
-    expect(w.stack).toBe(9);
-    expect(w.rounds).toEqual([{ level: 'hardest', bet: 2, pick: 0, ball: 0, win: true, delta: 4 }]);
+    const w = settleRound(s, 'hardest', 5, WIN, plan);
+    expect(w.stack).toBe(14);
+    expect(w.rounds).toEqual([{ level: 'hardest', bet: 5, pick: 0, ball: 0, win: true, delta: 9 }]);
     const l = settleRound(s, 'hardest', 2, LOSE, plan);
-    expect(l.stack).toBe(1);
-    expect(l.rounds[0].delta).toBe(-4);
+    expect(l.stack).toBe(3);
+    expect(l.rounds[0].delta).toBe(-2);
     expect(l.ended).toBeNull();
     expect(s.rounds).toEqual([]); // pure
   });
 
-  it('maxBetFor: capped by maxBet and by what the stack can lose; free levels take no bets', () => {
-    const s = startSession(ECON, 0); // 5 chips, maxBet 5
-    expect(maxBetFor(s, 'normal')).toBe(4); // 5 × 1.2 = 6 > 5
-    expect(maxBetFor(s, 'high')).toBe(3); // 4 × 1.5 = 6 > 5
-    expect(maxBetFor(s, 'hardest')).toBe(2);
+  it('maxBetFor: the whole stack unless a hit would pay out more than 50 chips; free levels take none', () => {
+    const s = startSession(ECON, 0); // 5 chips
+    for (const level of ['normal', 'high', 'hardest'] as const) {
+      expect(maxBetFor(s, level)).toBe(5);
+      expect(maxBetFor({ ...s, stack: 1 }, level)).toBe(1);
+    }
     expect(maxBetFor(s, 'easy')).toBe(0);
-    const rich = { ...startSession(econWith(5), 0), stack: 100 };
-    expect(maxBetFor(rich, 'hardest')).toBe(5);
-    const one = { ...s, stack: 1 };
-    expect(maxBetFor(one, 'normal')).toBe(1);
-    expect(maxBetFor(one, 'high')).toBe(1);
-    expect(maxBetFor(one, 'hardest')).toBe(0);
+    expect(maxBetFor({ ...s, stack: 20 }, 'normal')).toBe(20); // 20 + 20 = 40
+    expect(maxBetFor({ ...s, stack: 30 }, 'normal')).toBe(20); // 30 + 20 = 50
+    expect(maxBetFor({ ...s, stack: 30 }, 'high')).toBe(17); // 30 + floor(17 × 1.2) = 50
+    expect(maxBetFor({ ...s, stack: 30 }, 'hardest')).toBe(11); // 30 + floor(11 × 1.8) = 49; 12 → 51
+    expect(maxBetFor({ ...s, stack: 49 }, 'hardest')).toBe(1); // 49 + 1 = 50
+    for (let stack = 1; stack < ECON.autoSettleAt; stack++) {
+      for (const level of ['normal', 'high', 'hardest'] as const) {
+        const b = maxBetFor({ ...s, stack }, level);
+        expect(b).toBeGreaterThanOrEqual(1); // something can always be bet
+        expect(stack + winAmount(b, level)).toBeLessThanOrEqual(ECON.autoSettleAt); // a hit stays within 50
+        if (b < stack) expect(stack + winAmount(b + 1, level)).toBeGreaterThan(ECON.autoSettleAt); // the largest such bet
+      }
+    }
+  });
+
+  it(`never pays out more than ${ECON.autoSettleAt} chips and settles by itself on reaching it`, () => {
+    const s = { ...startSession(ECON, 0), stack: 30 };
+    expect(() => settleRound(s, 'normal', 21, WIN, plan)).toThrow(); // 30 + 21 would pass 50
+    const at50 = settleRound(s, 'normal', 20, WIN, plan);
+    expect(at50.stack).toBe(50);
+    expect(at50.ended).toBe('cap');
+    expect(() => settleRound(at50, 'normal', 1, WIN, plan)).toThrow();
+    expect(quit(at50).ended).toBe('cap');
+    const below = settleRound(s, 'hardest', 11, WIN, plan); // 49: play on
+    expect(below.stack).toBe(49);
+    expect(below.ended).toBeNull();
+    // A session saved before autoSettleAt existed still uses the configured line.
+    const old = { ...s, econ: { buyIn: 5 } } as unknown as Session;
+    expect(maxBetFor(old, 'normal')).toBe(20);
+    expect(settleRound(old, 'normal', 20, WIN, plan).ended).toBe('cap');
   });
 
   it('rejects bets that are not allowed and rounds after the end', () => {
     const s = startSession(ECON, 0);
-    expect(() => settleRound(s, 'hardest', 3, WIN, plan)).toThrow();
+    expect(() => settleRound(s, 'hardest', 6, WIN, plan)).toThrow();
     expect(() => settleRound(s, 'normal', 0, WIN, plan)).toThrow();
     expect(() => settleRound(s, 'normal', 1.5, WIN, plan)).toThrow();
     expect(() => settleRound(s, 'easy', 1, WIN, plan)).toThrow();
     expect(() => settleRound(quit(s), 'normal', 1, WIN, plan)).toThrow();
   });
 
-  it('every bet sequence keeps chips >= 0 and ends as broke exactly at 0', () => {
+  it('every bet sequence keeps chips within 0..50, ends as broke exactly at 0 and as cap exactly at 50', () => {
     const walk = (s: Session, depth: number): void => {
       if (depth === 0) return;
       for (const level of ['normal', 'high', 'hardest'] as const) {
@@ -67,8 +91,9 @@ describe('session', () => {
           for (const pick of [WIN, LOSE]) {
             const n = settleRound(s, level, bet, pick, plan);
             expect(n.stack).toBeGreaterThanOrEqual(0);
-            expect(n.stack - s.stack).toBe((pick === WIN ? 1 : -1) * betAmount(bet, level));
-            expect(n.ended).toBe(n.stack === 0 ? 'broke' : null);
+            expect(n.stack).toBeLessThanOrEqual(ECON.autoSettleAt);
+            expect(n.stack - s.stack).toBe(pick === WIN ? winAmount(bet, level) : -bet);
+            expect(n.ended).toBe(n.stack === 0 ? 'broke' : n.stack === ECON.autoSettleAt ? 'cap' : null);
             if (!n.ended) walk(n, depth - 1);
           }
         }
@@ -88,7 +113,7 @@ describe('session', () => {
   });
 
   it('survives a JSON round trip', () => {
-    let s = startSession(econWith(3), 123);
+    let s = startSession(ECON, 123);
     s = settleRound(settleRound(s, 'high', 2, WIN, plan), 'hardest', 1, LOSE, plan);
     const back = JSON.parse(JSON.stringify(s)) as Session;
     expect(back).toEqual(s);
@@ -142,26 +167,25 @@ describe('persistence', () => {
   it('recordPayout counts chips, reasons and the net histogram', () => {
     let s = startSession(ECON, 0);
     while (!s.ended) s = settleRound(s, 'normal', 1, LOSE, plan);
-    const st = recordPayout(recordPayout(emptyStats(), s), quit(settleRound(startSession(ECON, 1), 'hardest', 2, WIN, plan)));
-    expect(st.sessions).toBe(2);
-    expect(st.chipsIn).toBe(10);
-    expect(st.chipsOut).toBe(0 + 9);
-    expect(st.endReasons).toEqual({ broke: 1, quit: 1 });
-    expect(st.nets).toEqual({ '-5': 1, '4': 1 });
+    const won = quit(settleRound(startSession(ECON, 1), 'hardest', 5, WIN, plan)); // 5 + 9 = 14
+    const capped = settleRound({ ...startSession(ECON, 2), stack: 30 }, 'normal', 20, WIN, plan); // 50 → 자동 정산
+    const st = [s, won, capped].reduce(recordPayout, emptyStats());
+    expect(st.sessions).toBe(3);
+    expect(st.chipsIn).toBe(15);
+    expect(st.chipsOut).toBe(0 + 14 + 50);
+    expect(st.endReasons).toEqual({ broke: 1, quit: 1, cap: 1 });
+    expect(st.nets).toEqual({ '-5': 1, '9': 1, '45': 1 });
     expect(() => recordPayout(st, startSession(ECON, 2))).toThrow();
   });
 
-  it('settings merge over defaults and clamp maxBet to 1..20', () => {
-    expect(loadSettings()).toEqual({ maxBet: 5, pin: '0000', sound: { muted: false, volume: 0.7 } });
-    expect(normalizeSettings({ maxBet: 99 }).maxBet).toBe(20);
-    expect(normalizeSettings({ maxBet: 0 }).maxBet).toBe(1);
-    expect(normalizeSettings({ maxBet: 'x', pin: '', sound: { volume: 3 } })).toEqual({
-      maxBet: 5,
+  it('settings merge over defaults; a maxBet saved by an older version is dropped', () => {
+    expect(loadSettings()).toEqual({ pin: '0000', sound: { muted: false, volume: 0.7 } });
+    expect(normalizeSettings({ maxBet: 3, pin: '', sound: { volume: 3 } })).toEqual({
       pin: '0000',
       sound: { muted: false, volume: 1 },
     });
-    saveSettings({ maxBet: 3, pin: '1234', sound: { muted: true, volume: 0.2 } });
-    expect(loadSettings()).toEqual({ maxBet: 3, pin: '1234', sound: { muted: true, volume: 0.2 } });
-    expect(sessionEconomy(loadSettings())).toEqual({ ...ECON, maxBet: 3 });
+    saveSettings({ pin: '1234', sound: { muted: true, volume: 0.2 } });
+    expect(loadSettings()).toEqual({ pin: '1234', sound: { muted: true, volume: 0.2 } });
+    expect(sessionEconomy(loadSettings())).toEqual({ buyIn: 5, autoSettleAt: 50 });
   });
 });

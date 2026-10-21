@@ -406,6 +406,15 @@ for (let g = 0; g < GAMES; g++) {
         b.orders = b.orders.filter((o) => o.fillAt > t);
         for (const o of due) fill(b, view, o);
       }
+      // 자동 정산 as in the app: above econ.autoSettleAt everything is sold at once and the game ends.
+      if (!b.stopped && holding(b).length && equity(b.acc, prices) > econ.autoSettleAt) {
+        b.orders = [];
+        for (const id of holding(b)) {
+          const r = sell(b.acc, id, prices[id], 1, econ);
+          if (r.ok) b.acc = r.account;
+        }
+        b.stopped = true;
+      }
     }
     if (t % TPS === 0) {
       view.sec = t / TPS;

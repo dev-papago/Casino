@@ -7,13 +7,13 @@ import { button, h, signed } from './dom';
 export interface AdminHost {
   settings(): Settings;
   state(): SavedState;
-  /** Saves (normalized: maxBet clamped) and returns what was saved. */
+  /** Saves (normalized) and returns what was saved. */
   saveSettings(s: Settings): Settings;
   resetStats(): void;
   exit(): void;
 }
 
-const REASON_LABEL: Record<EndReason, string> = { broke: '칩 소진', quit: '정산' };
+const REASON_LABEL: Record<EndReason, string> = { broke: '칩 소진', quit: '정산', cap: '자동 정산' };
 
 /** Plain comparison, no lockout. */
 export function pinPanel(pin: string, onOk: () => void, onCancel: () => void): HTMLElement {
@@ -61,8 +61,6 @@ export function adminPanel(host: AdminHost): HTMLElement {
 
   const settingsForm = (): HTMLElement => {
     const s = host.settings();
-    const [lo, hi] = CONFIG.economy.maxBetRange;
-    const maxBet = h('input', { type: 'number', min: lo, max: hi, step: 1, value: s.maxBet, 'data-testid': 'set-max-bet' });
     const soundOn = h('input', { type: 'checkbox', checked: !s.sound.muted, 'data-testid': 'set-sound' });
     const vol = h('input', { type: 'range', min: 0, max: 100, step: 5, value: Math.round(s.sound.volume * 100) });
     const volOut = h('output', {}, vol.value);
@@ -72,19 +70,16 @@ export function adminPanel(host: AdminHost): HTMLElement {
     notice = '';
     const save = (): void => {
       const n = host.saveSettings({
-        maxBet: maxBet.value === '' ? s.maxBet : Number(maxBet.value),
         pin: pin.value.trim(),
         sound: { muted: !soundOn.checked, volume: Number(vol.value) / 100 },
       });
-      maxBet.value = String(n.maxBet);
       pin.value = n.pin;
-      msg.textContent = `저장했어요. 최대 판돈 ${n.maxBet}칩은 다음 손님부터 적용돼요.`;
+      msg.textContent = '저장했어요.';
     };
     return h(
       'section',
       { class: 'box' },
       h('h3', {}, '설정'),
-      h('label', { class: 'field' }, h('span', {}, '최대 판돈'), maxBet, h('small', {}, `한 판 ${lo}~${hi}칩 (기본 ${CONFIG.economy.maxBet})`)),
       h('label', { class: 'field' }, h('span', {}, '소리'), soundOn, h('small', {}, '켜기')),
       h('label', { class: 'field' }, h('span', {}, '음량'), vol, volOut),
       h('label', { class: 'field' }, h('span', {}, 'PIN'), pin),
@@ -126,7 +121,7 @@ export function adminPanel(host: AdminHost): HTMLElement {
       h(
         'p',
         { class: 'note' },
-        `고정값: 시작 칩 ${e.buyIn} · 배율 ${PAID_LEVELS.map((id) => `${CONFIG.levels[id].label} ×${CONFIG.levels[id].multiplier}`).join(' · ')}. `,
+        `고정값: 시작 칩 ${e.buyIn} · 배율 ${PAID_LEVELS.map((id) => `${CONFIG.levels[id].label} ×${CONFIG.levels[id].multiplier}`).join(' · ')} · 판돈 제한 없음 · 지급은 최대 ${e.autoSettleAt}칩(되면 자동 정산). `,
         '셔플·배당·연출 시간은 src/config/defaults.json에서 바꾸고 npm run sim으로 확인한 뒤 다시 빌드합니다.',
       ),
     );
@@ -182,6 +177,8 @@ function statsView(st: Stats): HTMLElement {
   );
 }
 
+const HIST_BARS = 30; // with no table limit a lucky guest can win hundreds of chips: wider ranges are bucketed
+
 function histogram(nets: Record<string, number>): HTMLElement {
   let lo = -CONFIG.economy.buyIn;
   let hi = CONFIG.economy.buyIn;
@@ -189,17 +186,29 @@ function histogram(nets: Record<string, number>): HTMLElement {
     lo = Math.min(lo, Number(k));
     hi = Math.max(hi, Number(k));
   }
-  const max = Math.max(1, ...Object.values(nets));
+  // Losses never go below −buyIn, so they keep one bar per chip; wins share buckets of `step` chips.
+  const step = Math.max(1, Math.ceil((hi + 1) / (HIST_BARS - (-lo + 1) + 1)));
+  const counts = new Map<number, number>(); // bucket start → sessions
+  for (const [k, c] of Object.entries(nets)) {
+    const n = Number(k);
+    const start = n <= 0 ? n : 1 + Math.floor((n - 1) / step) * step;
+    counts.set(start, (counts.get(start) ?? 0) + c);
+  }
+  const starts: number[] = [];
+  for (let n = lo; n <= 0; n++) starts.push(n);
+  for (let n = 1; n <= hi; n += step) starts.push(n);
+  const max = Math.max(1, ...counts.values());
   const bars: HTMLElement[] = [];
-  for (let n = lo; n <= hi; n++) {
-    const c = nets[String(n)] ?? 0;
+  for (const n of starts) {
+    const c = counts.get(n) ?? 0;
+    const label = n <= 0 || step === 1 ? signed(n) : `${signed(n)}~`;
     bars.push(
       h(
         'div',
         { class: n < 0 ? 'bar neg' : 'bar' },
         h('span', { class: 'cnt' }, c || ''),
         h('span', { class: 'track' }, h('i', { style: `height:${((100 * c) / max).toFixed(1)}%` })),
-        h('span', { class: 'lbl' }, signed(n)),
+        h('span', { class: 'lbl' }, label),
       ),
     );
   }

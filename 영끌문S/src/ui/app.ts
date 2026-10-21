@@ -30,7 +30,7 @@ import { clock, num, pct, qty, signedUsd, tone, usd } from './format.ts';
 
 export type Screen = 'title' | 'trade' | 'confirm' | 'result';
 type Side = 'buy' | 'inverse' | 'sell';
-type EndReason = 'settle' | 'broke';
+type EndReason = 'settle' | 'broke' | 'cap';
 /** An order waiting for its fill. */
 interface PendingOrder {
   id: string;
@@ -505,6 +505,7 @@ export function mountApp(root: HTMLElement): void {
             ),
             h('li', {}, `매수·매도 때 주문 규모의 ${num(econ.feeRate * 100, 1)}% 수수료`),
             h('li', {}, h('b', {}, '장 마감 없음'), ' — 원할 때 정산하기를 눌러 끝냅니다'),
+            h('li', {}, '평가 자산이 ', h('b', {}, usd(econ.autoSettleAt, 0)), `(${chips(econ.autoSettleAt)}칩)을 넘으면 자동 정산 · ${usd(econ.chipValue, 0)} = 1칩, 최대 ${econ.maxChips}칩`),
           ),
           button('게임 시작', () => startGame(), { kind: 'primary', key: 'Enter', testid: 'start' }),
         ),
@@ -536,13 +537,15 @@ export function mountApp(root: HTMLElement): void {
         h(
           'div',
           { class: `card result-card is-${tone(net)}`, 'data-testid': 'result' },
-          h('h2', {}, ending.reason === 'broke' ? '파산했습니다…' : '정산 결과'),
+          h('h2', {}, ending.reason === 'broke' ? '파산했습니다…' : ending.reason === 'cap' ? `${usd(econ.autoSettleAt, 0)} 돌파! 자동 정산` : '정산 결과'),
           h('div', { class: 'result-time' }, `플레이 시간 ${clock((market.ticks * T.tickMs) / 1000)}`),
           h('div', { class: 'result-total', 'data-testid': 'result-total' }, usd(total)),
           h('div', { class: `result-net ${tone(net)}` }, `${signedUsd(net)} (${pct(net / econ.deposit)})`),
           h(
             'dl',
             { class: 'rows' },
+            h('dt', {}, `칩 환산 (${usd(econ.chipValue, 0)} = 1칩, 최대 ${econ.maxChips})`),
+            h('dd', { 'data-testid': 'result-chips' }, `${chips(total)}칩`),
             h('dt', {}, '시작 예탁금'),
             h('dd', {}, usd(econ.deposit)),
             h('dt', {}, '거래 횟수'),
@@ -830,6 +833,8 @@ export function mountApp(root: HTMLElement): void {
         pending = pending.filter((o) => o.fillAt > market.ticks);
         for (const o of due) fill(o);
       }
+      // 자동 정산: like 야바위 above 50 chips, the game ends once the equity goes above econ.autoSettleAt.
+      if ((screen === 'trade' || screen === 'confirm') && equity(account, market.prices()) > econ.autoSettleAt) finish('cap');
     }
   }
 
@@ -870,6 +875,10 @@ export function mountApp(root: HTMLElement): void {
 }
 
 // ------------------------------------------------------------ helpers
+/** Booth chips for a dollar amount ($1,000 = 1 chip), rounded down, never more than economy.maxChips. */
+const chips = (dollars: number): number =>
+  Math.min(CONFIG.economy.maxChips, Math.floor(dollars / CONFIG.economy.chipValue + 1e-9));
+
 function freshExtremes(m: Market): Record<string, { hi: number; lo: number }> {
   return Object.fromEntries(m.stocks.map((s) => [s.def.id, { hi: s.price, lo: s.price }]));
 }

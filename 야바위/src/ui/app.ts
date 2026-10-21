@@ -2,7 +2,7 @@
 // the session and stats are saved at start, at pick (before the reveal), at 정산 and at 지급 완료.
 import { Sfx } from '../audio';
 import { CONFIG, LEVEL_IDS, PAID_LEVELS, saveSettings, sessionEconomy, type LevelId, type Settings } from '../config';
-import { betAmount, maxBetFor, quit, resumePhase, sessionNet, settleRound, startSession, type Session } from '../game/session';
+import { cappedByPayout, maxBetFor, quit, resumePhase, sessionNet, settleRound, startSession, winAmount, type Session } from '../game/session';
 import { generatePlan, moveTimes, type CupId, type Plan, type Slot } from '../game/shuffle';
 import { cryptoRng } from '../rng';
 import { emptyStats, recordPayout, recordRound, saveState, type SavedState } from '../storage';
@@ -111,6 +111,8 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     const digit = '123'.indexOf(e.key);
     if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') return void (e.preventDefault(), stepLevel(e.key === 'ArrowLeft' ? -1 : 1));
     if (e.key === 'ArrowUp' || e.key === 'ArrowDown') return void (e.preventDefault(), stepBet(e.key === 'ArrowUp' ? 1 : -1));
+    if (e.key === 'PageUp' || e.key === 'PageDown') return void (e.preventDefault(), stepBet(e.key === 'PageUp' ? 10 : -10));
+    if (e.key === 'End' || e.key === 'Home') return void (e.preventDefault(), stepBet(e.key === 'End' ? Infinity : -Infinity));
     if (space) void startRound();
     else if (e.key === 'Enter') void next();
     else if (digit >= 0) void pick(digit as Slot);
@@ -163,8 +165,8 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     status.replaceChildren(
       h('div', { class: 'pill' }, chipIcon(), `시작 칩 ${CONFIG.economy.buyIn}개`),
       h('div', { class: 'pill' }, PAID_LEVELS.map((id) => `${CONFIG.levels[id].label} ×${CONFIG.levels[id].multiplier}`).join(' · ')),
-      h('div', { class: 'pill' }, '맞히면 판돈 × 배율만큼 얻고, 틀리면 같은 만큼 잃어요'),
-      h('div', { class: 'pill' }, `한 판 최대 ${settings.maxBet}칩`),
+      h('div', { class: 'pill' }, '맞히면 +판돈 × 배율 · 틀리면 −판돈'),
+      h('div', { class: 'pill' }, `최대 ${CONFIG.economy.autoSettleAt}칩 · 되면 자동 정산`),
     );
     message.replaceChildren(
       h('div', { class: 'msg-main' }, '컵 속의 공을 찾아라!'),
@@ -321,7 +323,7 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     if (win) {
       sfx.play('win');
       if (mode === 'paid') flyChip();
-      if (mode === 'paid' && lastDelta >= 10) sfx.play('clear', 450);
+      if (mode === 'paid' && (lastDelta >= 10 || session()?.ended === 'cap')) sfx.play('clear', 450);
     } else {
       sfx.play('lose');
       cups.shake(picked, ms(T.resultMs * 0.6));
@@ -339,7 +341,7 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
   }
 
   // ------------------------------------------------------------ paid: level and bet for the next round
-  /** Keeps the chosen level playable and the bet within 1..maxBet for the current stack. */
+  /** Keeps the chosen level playable and the bet within 1..(what the stack can lose). */
   function clampChoice(): void {
     const s = session();
     if (mode !== 'paid' || !s) return;
@@ -369,7 +371,8 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     }
   }
 
-  function stepBet(d: -1 | 1): void {
+  /** Changes the bet by `d` (±Infinity: to the minimum or the maximum). */
+  function stepBet(d: number): void {
     const s = session();
     if (screen !== 'game' || phase !== 'ready' || mode !== 'paid' || !s) return;
     bet = Math.max(1, Math.min(bet + d, maxBetFor(s, paidLevel)));
@@ -449,14 +452,14 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
       return;
     }
     if (!s) return status.replaceChildren();
-    const amt = betAmount(bet, paidLevel);
+    const amt = winAmount(bet, paidLevel);
     status.replaceChildren(
       h('div', { class: 'pill big', 'data-testid': 'stack' }, chipIcon(), '칩 ', h('b', { 'data-testid': 'stack-n' }, s.stack), '개'),
       h('div', { class: 'pill' }, '판 ', h('b', { 'data-testid': 'rounds' }, s.rounds.length)),
       h('div', { class: 'pill' }, '손님 결과 ', h('b', { 'data-testid': 'net' }, signed(sessionNet(s)))),
       ...(s.ended || phase === 'result'
         ? []
-        : [h('div', { class: 'pill stakes', 'data-testid': 'stakes' }, `판돈 ${bet} · 맞히면 `, h('b', { class: 'win' }, `+${amt}`), ' · 틀리면 ', h('b', { class: 'lose' }, `−${amt}`))]),
+        : [h('div', { class: 'pill stakes', 'data-testid': 'stakes' }, `판돈 ${bet} · 맞히면 `, h('b', { class: 'win' }, `+${amt}`), ' · 틀리면 ', h('b', { class: 'lose' }, `−${bet}`))]),
     );
   }
 
@@ -533,8 +536,9 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     const max = maxBetFor(s, paidLevel);
     const minus = button('−', () => stepBet(-1), { testid: 'bet-minus' });
     const plus = button('+', () => stepBet(1), { testid: 'bet-plus' });
+    const all = button('최대', () => stepBet(Infinity), { testid: 'bet-max' });
     minus.disabled = bet <= 1;
-    plus.disabled = bet >= max;
+    plus.disabled = all.disabled = bet >= max;
     return h(
       'div',
       { class: 'bet', role: 'group', 'aria-label': '판돈' },
@@ -542,7 +546,8 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
       minus,
       h('b', { class: 'bet-n', 'data-testid': 'bet-n' }, bet),
       plus,
-      h('small', {}, `최대 ${max}`),
+      all,
+      h('small', {}, cappedByPayout(s, paidLevel) ? `최대 ${max} (${s.econ.autoSettleAt ?? CONFIG.economy.autoSettleAt}칩 한도)` : `최대 ${max} · PgUp/PgDn ±10`),
     );
   }
 

@@ -514,6 +514,10 @@ button {
   cursor: grabbing;
 }
 
+.chart.panning {
+  cursor: move;
+}
+
 .chart-canvas {
   position: absolute;
   inset: 0;

@@ -32,7 +32,7 @@ test('reload before the pick voids the round; after the pick it counts; settleme
   await expect(page.locator('#app')).toHaveAttribute('data-phase', 'ready');
   await expect(page.getByTestId('rounds')).toHaveText('3');
   const after = await stackShown(page);
-  expect([stack + amt, stack - amt]).toContain(after);
+  expect([stack + amt.win, stack - amt.lose]).toContain(after);
 
   // [정산하기] → settlement; a reload shows the same number again.
   await page.getByTestId('quit').click();

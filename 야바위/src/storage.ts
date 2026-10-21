@@ -25,7 +25,7 @@ export function emptyStats(): Stats {
     sessions: 0,
     chipsIn: 0,
     chipsOut: 0,
-    endReasons: { broke: 0, quit: 0 },
+    endReasons: { broke: 0, quit: 0, cap: 0 },
     nets: {},
   };
 }

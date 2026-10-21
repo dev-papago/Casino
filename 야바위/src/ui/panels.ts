@@ -4,7 +4,7 @@ import { sessionNet, type EndReason, type Session } from '../game/session';
 import { CHIP_SVG } from './art';
 import { button, fromHtml, h, signed } from './dom';
 
-export const END_TEXT: Record<EndReason, string> = { broke: '칩을 다 썼어요', quit: '정산' };
+export const END_TEXT: Record<EndReason, string> = { broke: '칩을 다 썼어요', quit: '정산', cap: `${CONFIG.economy.autoSettleAt}칩 달성! 자동 정산` };
 
 export const chipIcon = (): Element => fromHtml(CHIP_SVG);
 
@@ -17,7 +17,7 @@ export function confirmCard(e: EconomyConfig, onStart: () => void, onCancel: () 
     h('h2', {}, '새 손님'),
     h('p', { class: 'lead' }, `손님에게 칩 ${e.buyIn}개를 받으세요`),
     h('div', { class: 'chip-row' }, ...chips),
-    h('p', { class: 'note' }, `배율 ${rates} · 맞히면 판돈 × 배율을 얻고 틀리면 같은 만큼 잃어요 · 한 판 최대 ${e.maxBet}칩 · 정산할 때까지 계속`),
+    h('p', { class: 'note' }, `배율 ${rates} · 맞히면 판돈 × 배율을 더 받고 틀리면 판돈을 잃어요 · 판돈 제한 없음(가진 칩까지) · 최대 ${e.autoSettleAt}칩, 되면 자동 정산`),
     h(
       'div',
       { class: 'row' },

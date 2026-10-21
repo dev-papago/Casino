@@ -31,11 +31,11 @@ export async function startPaidSession(page: Page): Promise<void> {
   await expect(page.getByTestId('stack')).toHaveText('칩 5개');
 }
 
-/** The chips a hit wins (and a miss loses) for the chosen level and bet, read from the status bar. */
-export async function stakeShown(page: Page): Promise<number> {
-  const m = /맞히면 \+(\d+)/.exec((await page.getByTestId('stakes').textContent()) ?? '');
+/** The chips a hit wins and a miss loses for the chosen level and bet, read from the status bar. */
+export async function stakeShown(page: Page): Promise<{ win: number; lose: number }> {
+  const m = /맞히면 \+(\d+).*틀리면 −(\d+)/.exec((await page.getByTestId('stakes').textContent()) ?? '');
   if (!m) throw new Error('no stakes shown');
-  return Number(m[1]);
+  return { win: Number(m[1]), lose: Number(m[2]) };
 }
 
 export async function openAdmin(page: Page, pin = '0000'): Promise<void> {

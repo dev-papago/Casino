@@ -93,6 +93,9 @@ export interface EconomyConfig {
   maintenance: number; // leveraged positions are liquidated once the loss reaches (1 − maintenance) of the margin
   minOrder: number; // smallest margin per order ($); below this with no position the game is over
   leverageFrom: number; // leverage above 1× needs at least this much equity ($)
+  chipValue: number; // dollars per booth chip (the same chips as 야바위)
+  autoSettleAt: number; // equity above this ($) sells everything and ends the game (야바위: 50 chips)
+  maxChips: number; // chips paid out at most, whatever the final equity (야바위: 50)
 }
 
 export interface GameConfig {
@@ -119,7 +122,17 @@ export const CONFIG: GameConfig = {
     keepCandles: 600,
     eventWindowSec: 120,
   },
-  economy: { deposit: 1000, leverages: [1, 2, 5, 10], feeRate: 0.001, maintenance: 0.2, minOrder: 10, leverageFrom: 2000 },
+  economy: {
+    deposit: 1000,
+    leverages: [1, 2, 5, 10],
+    feeRate: 0.001,
+    maintenance: 0.2,
+    minOrder: 10,
+    leverageFrom: 2000,
+    chipValue: 1000, // $1,000 = 1 chip
+    autoSettleAt: 50000, // 50 chips
+    maxChips: 50,
+  },
   stocks: [
     {
       id: 'kingka',

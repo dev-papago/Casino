@@ -47,6 +47,17 @@ test('a game from the title screen to the settlement', async ({ page }) => {
   expect(await candles()).toBeGreaterThan(100);
   expect(await stretch()).toBeLessThan(1);
 
+  // Hold the right button to move the view: down moves the candles down (the price range up). Sideways it
+  // scrolls into older candles, but right after the start there are none yet, so it stays on the newest.
+  await page.mouse.move(cx, cy);
+  await page.mouse.down({ button: 'right' });
+  await page.mouse.move(cx + 150, cy + 60, { steps: 5 });
+  await page.mouse.up({ button: 'right' });
+  expect(Number(await chart.getAttribute('data-shift'))).toBeGreaterThan(0);
+  await expect(chart).toHaveAttribute('data-scroll', '0');
+  await chart.dblclick({ position: { x: box.width / 2, y: box.height / 2 } });
+  await expect(chart).toHaveAttribute('data-shift', '0.00');
+
   // 킹카콜라 trades little: it fills at once, at the shown price. $100 at 1× pays a $0.10 fee.
   // The detail panel no longer lists the quote rate, the fill delay or a leverage limit.
   await expect(page.getByTestId('detail')).not.toContainText('시세 갱신');
