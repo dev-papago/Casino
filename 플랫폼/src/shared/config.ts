@@ -28,6 +28,21 @@ export const PLATFORM = {
   activitySaveMs: 300_000, // online time is written to the ledger at least this often
   loginFails: 5, // wrong PINs in a row before that name is locked for a while
   loginLockMs: 30_000,
+  // 온라인판: the same server also answers through a cloudflared Quick Tunnel, on its own port.
+  online: {
+    publicPort: 7780, // the tunnel's way in, on 127.0.0.1 only: player routes, no admin routes
+    pingMs: 2_000, // a Quick Tunnel does not pass server-sent events, so the player app asks this often instead
+    entryDigits: 6, // 입장 코드: signup and login through the tunnel need it (told at the venue); new at every start
+    // A venue's players often share one public IP, so the per-IP limits are loose; the global cap does the real work:
+    // at 100 wrong codes a minute, guessing 6 digits takes days.
+    entryFails: 20, // wrong 입장 코드 in a row from one IP (an IPv6 /64) before it is shut out for a while
+    entryLockMs: 120_000,
+    wrongPerMin: 100, // wrong 입장 코드 a minute from everywhere together; past it no code is checked until it calms down
+    reviewNet: 20, // an online game that wins this many chips or more waits for the admin before it pays out
+    ratePerIp: 120, // signup and login tries per IP (an IPv6 /64) per minute through the tunnel
+    signupsPerMin: 30, // signups through the tunnel per minute, all IPs together
+    tunnelRestartMs: 5_000, // cloudflared stopped: start it again after this long
+  },
   games: [
     {
       id: 'yabawi',

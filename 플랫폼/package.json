@@ -15,7 +15,9 @@
     "test": "vitest run",
     "e2e": "npm run build && playwright test",
     "typecheck": "tsc --noEmit",
-    "exe": "npm run build && vite build --config vite.server.config.ts && electron-builder --win portable --x64 && electron-builder --config electron-builder.player.json --win portable --x64"
+    "exe": "npm run build && vite build --config vite.server.config.ts && electron-builder --win portable --x64 && electron-builder --config electron-builder.player.json --win portable --x64",
+    "get-cloudflared": "node scripts/get-cloudflared.mjs",
+    "exe:online": "npm run build && vite build --config vite.server.config.ts && node scripts/get-cloudflared.mjs && electron-builder --config electron-builder.online.json --win portable --x64 && electron-builder --config electron-builder.player-online.json --win portable --x64"
   },
   "devDependencies": {
     "@playwright/test": "1.56.1",

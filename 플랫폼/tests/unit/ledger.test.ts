@@ -8,6 +8,7 @@ import {
   cancelSettlement,
   closeGame,
   completeSettlement,
+  decideReview,
   directSettlement,
   edit,
   login,
@@ -144,6 +145,58 @@ describe('games', () => {
     store.run((s) => closeGame(s, { id: open.session.id, payout: 4, by: 'admin' }));
     expect(p(store.state, id).chips).toBe(5);
     expect(store.state.log.at(-1)).toMatchObject({ kind: 'gameForce', delta: 0, text: expect.stringContaining('환불') });
+  });
+
+  it('an online game holds a big win for the admin; a Wi-Fi game and a small online win pay out at once', () => {
+    const { store, dir, join } = fresh();
+    const id = join('온라인');
+    const big = PLATFORM.online.reviewNet;
+    const opened = (online: boolean) => {
+      const e = store.run((s) => openGame(s, { playerId: id, game: 'yabawi', stake: 1, key: key(), online }));
+      if (e.type !== 'gameOpen') throw new Error();
+      return e.session;
+    };
+    // Wi-Fi: paid at once, however big (only the game's limit applies), as before.
+    const lan = opened(false);
+    expect(lan).not.toHaveProperty('online');
+    store.run((s) => closeGame(s, { id: lan.id, payout: 1 + big, secret: lan.secret, by: 'player' }));
+    expect(p(store.state, id).chips).toBe(5 + big);
+    // Online, under the line: paid at once.
+    const small = opened(true);
+    store.run((s) => closeGame(s, { id: small.id, payout: big, secret: small.secret, by: 'player' }));
+    expect(p(store.state, id).chips).toBe(4 + 2 * big);
+    // Online, on the line: held. The chips stay staked (잔고 unchanged), the same report gets the same answer.
+    const held = opened(true);
+    const before = totalOf(store.state, p(store.state, id));
+    const r1 = store.run((s) => closeGame(s, { id: held.id, payout: 1 + big, secret: held.secret, by: 'player' }));
+    expect(r1.type).toBe('gameReview');
+    expect(store.state.games.get(held.id)?.review?.payout).toBe(1 + big);
+    expect(totalOf(store.state, p(store.state, id))).toBe(before);
+    expect(store.run((s) => closeGame(s, { id: held.id, payout: 1 + big, secret: held.secret, by: 'player' }))).toEqual(r1);
+    expect(code(() => store.run((s) => closeGame(s, { id: held.id, payout: 2, secret: held.secret, by: 'player' })))).toBe('review');
+    // Approved: paid as reported, and the game's report afterwards is the closed result.
+    const ok = store.run((s) => decideReview(s, { id: held.id, approve: true }));
+    expect(ok).toMatchObject({ type: 'gameClose', payout: 1 + big, review: 'approved' });
+    expect(totalOf(store.state, p(store.state, id))).toBe(before + big);
+    expect(store.run((s) => closeGame(s, { id: held.id, payout: 1 + big, secret: held.secret, by: 'player' }))).toBe(ok);
+    // Turned down: the stake comes back, and the game's report afterwards is refused as already closed.
+    const no = opened(true);
+    store.run((s) => closeGame(s, { id: no.id, payout: 1 + big, secret: no.secret, by: 'player' }));
+    const total = totalOf(store.state, p(store.state, id));
+    store.run((s) => decideReview(s, { id: no.id, approve: false }));
+    expect(totalOf(store.state, p(store.state, id))).toBe(total);
+    expect(store.state.log.at(-1)).toMatchObject({ kind: 'gameForce', delta: 0, text: expect.stringContaining('거절') });
+    expect(code(() => store.run((s) => closeGame(s, { id: no.id, payout: 1 + big, secret: no.secret, by: 'player' })))).toBe('closed');
+    expect(code(() => store.run((s) => decideReview(s, { id: no.id, approve: true })))).toBe('gone');
+    balanced(store.state);
+    // A restart replays the held and decided sessions into the same ledger.
+    const totals = { ...store.state.totals };
+    const review = store.state.games.size;
+    store.close();
+    const again = new Store(dir);
+    expect(again.state.totals).toEqual(totals);
+    expect(again.state.games.size).toBe(review);
+    again.close();
   });
 });
 
@@ -317,7 +370,7 @@ describe('journal', () => {
   it('keeps a second server off the same ledger, and takes over a lock left by a dead one', () => {
     const { store, dir } = fresh();
     store.close();
-    writeFileSync(pathJoin(dir, 'server.lock'), '1'); // PID 1 is always alive (init)
+    writeFileSync(pathJoin(dir, 'server.lock'), String(process.ppid)); // our parent is alive (PID 1 is not, on Windows)
     expect(() => new Store(dir)).toThrow(/이미 이 장부를 쓰고/);
     writeFileSync(pathJoin(dir, 'server.lock'), '999999999');
     const again = new Store(dir);

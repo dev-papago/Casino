@@ -3,12 +3,16 @@
 // PLATFORM.discoveryPort), else a page where staff type the address shown on the admin screen.
 // Reload, dev tools and zoom keys are blocked (a reload in the middle of a game must not be a way out of a loss;
 // the games settle such a stop anyway), and the window never leaves the server's pages.
+// 온라인판 (built with casinoMode "online"): no broadcast search (it cannot cross the internet); the
+// address is the https://….trycloudflare.com one on the admin screen, which changes when the server restarts.
 const { app, BrowserWindow, shell } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const { discover } = require('./discover.cjs');
 
 const HTTP_PORT = 7777;
+const ONLINE = require('../package.json').casinoMode === 'online' || process.env.CASINO_MODE === 'online';
+const ADDRESS_HINT = ONLINE ? '관리자 화면의 인터넷 주소 (https://….trycloudflare.com)' : '관리자 화면의 접속 주소 (예: 192.168.0.12:7777)';
 const SETUP = 'casino-setup:'; // links on the local pages: casino-setup://search, casino-setup://connect?addr=…
 
 if (!app.requestSingleInstanceLock()) app.quit();
@@ -39,14 +43,15 @@ function normalize(raw) {
   if (!v) return '';
   if (!/^https?:\/\//.test(v)) v = `http://${v}`;
   const u = new URL(v);
-  if (!u.port) u.port = String(HTTP_PORT);
+  if (!u.port && u.protocol === 'http:') u.port = String(HTTP_PORT); // https (the tunnel) keeps its own port
   return `${u.protocol}//${u.host}/`;
 }
 
 /** Is the casino server answering at this address? */
 async function reachable(url) {
   try {
-    const res = await fetch(`${url}api/nothing`, { signal: AbortSignal.timeout(2500) });
+    // Through the internet an answer takes longer than on the Wi-Fi.
+    const res = await fetch(`${url}api/nothing`, { signal: AbortSignal.timeout(url.startsWith('https:') ? 6000 : 2500) });
     return res.status === 404; // the server's own "not found": it is there
   } catch {
     return false;
@@ -71,7 +76,7 @@ function showSetup(note) {
     page(
       '카지노 서버 찾기',
       `<h1>♠ 카지노</h1><p>${note}</p>
-       <form action="${SETUP}//connect"><input name="addr" placeholder="관리자 화면의 접속 주소 (예: 192.168.0.12:7777)" autofocus>
+       <form action="${SETUP}//connect"><input name="addr" placeholder="${ADDRESS_HINT}" autofocus>
        <button>연결</button></form><a class="btn" href="${SETUP}//search">다시 찾기</a>`,
     ),
   );
@@ -99,8 +104,17 @@ async function connect(url) {
 }
 
 async function search() {
-  showSetupNote('같은 와이파이에서 카지노 서버를 찾는 중…');
+  showSetupNote(ONLINE ? '카지노 서버에 연결하는 중…' : '같은 와이파이에서 카지노 서버를 찾는 중…');
   if (await connect(savedServer())) return;
+  if (ONLINE) {
+    // A tunnel that just started answers only after a few seconds: keep trying the saved address for a while.
+    for (let i = 0; i < 6 && savedServer(); i++) {
+      showSetupNote(`카지노 서버에 연결하는 중… (${i + 2}번째 시도)`);
+      await new Promise((r) => setTimeout(r, 4000));
+      if (await connect(savedServer())) return;
+    }
+    return showSetup('저장된 인터넷 주소에 연결하지 못했습니다. 관리자 장부를 다시 켜면 주소가 바뀝니다. 새 주소를 입력하세요.');
+  }
   if (await connect(await discover())) return;
   showSetup('서버를 찾지 못했습니다. 관리자 PC가 켜져 있고 같은 와이파이인지 확인하세요.');
 }
@@ -123,7 +137,7 @@ function isBlockedKey(input) {
 async function onSetupLink(url) {
   const u = new URL(url);
   if (u.host === 'search') return search();
-  if (u.host === 'setup') return showSetup('관리자 화면 오른쪽 위의 "플레이어 접속 주소"를 입력하세요.');
+  if (u.host === 'setup') return showSetup(ONLINE ? '관리자 화면의 "인터넷 주소"를 입력하세요.' : '관리자 화면 오른쪽 위의 "플레이어 접속 주소"를 입력하세요.');
   if (u.host === 'retry') {
     if (!(await connect(server))) showOffline();
     return;

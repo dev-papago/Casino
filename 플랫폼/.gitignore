@@ -5,3 +5,4 @@ test-results/
 playwright-report/
 release/
 dist-server/
+vendor/

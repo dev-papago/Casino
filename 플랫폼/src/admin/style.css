@@ -381,6 +381,60 @@ table.grid {
   border-left-color: var(--violet);
 }
 
+.req.review {
+  border-left-color: #5aa7ff;
+  background: rgba(90, 167, 255, 0.08);
+}
+
+/* 온라인판: internet address and 입장 코드, under the Wi-Fi addresses */
+.online-box {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  align-items: center;
+  justify-content: flex-end;
+  font-size: 0.85rem;
+}
+
+.online-box[hidden] {
+  display: none;
+}
+
+.online-box code {
+  padding: 0.15rem 0.5rem;
+  border-radius: 0.4rem;
+  background: rgba(90, 167, 255, 0.15);
+  color: #cfe4ff;
+  font-weight: 700;
+  user-select: all;
+}
+
+.online-box .online-url.up {
+  background: rgba(62, 224, 143, 0.15);
+  color: #c9ffe3;
+}
+
+.online-box .online-code {
+  font-size: 1.1rem;
+  letter-spacing: 0.2em;
+  background: rgba(255, 207, 74, 0.15);
+  color: var(--gold);
+}
+
+.online-status {
+  font-weight: 700;
+  color: var(--dim);
+}
+
+.online-status.up {
+  color: var(--good);
+}
+
+.online-status.stopped {
+  color: var(--bad);
+}
+
 .req.fresh {
   animation: arrive 1.2s ease-out;
 }

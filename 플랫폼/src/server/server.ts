@@ -1,18 +1,26 @@
-// The ledger server on the admin PC (DESIGN.md section 4). Plain node:http, no packages: JSON requests, and
+// The ledger server on the admin PC. Plain node:http, no packages: JSON requests, and
 // server-sent events for live updates to the player apps and the admin screen. Player endpoints are open to the
 // Wi-Fi; the admin page and admin endpoints answer only to the admin PC itself.
 //
 // Online means the player app reported in within PLATFORM.offlineAfterMs (it does every PLATFORM.pingMs). A
 // connection alone proves nothing: a laptop that walks out of the Wi-Fi leaves its connection open for minutes.
+//
+// 온라인판: with `publicPort` a second listener on 127.0.0.1 is the way in for cloudflared. Everything
+// that arrives there came from the internet, whatever its address says (cloudflared connects from 127.0.0.1), so it
+// gets the player routes only: no admin page, no admin API, no live updates (a Quick Tunnel does not pass them).
+// Signup and login there need the 입장 코드 (a new one at every start: the internet address changes then too), are
+// rate-limited per IP, and an IP that gets the code wrong too often is shut out for a while. Big wins wait for the
+// admin. Answers there carry no CORS header (the player app is served from the same address) and a few safety
+// headers.
 import { createSocket } from 'node:dgram';
 import { readFile } from 'node:fs/promises';
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomInt, randomUUID } from 'node:crypto';
 import { PLATFORM, gameDef } from '../shared/config.ts';
-import { ERROR_TEXT, LOG_LABEL, type AdminState, type ErrorCode, type LanUrl } from '../shared/protocol.ts';
+import { ERROR_TEXT, LOG_LABEL, type AdminOnline, type AdminState, type ErrorCode, type Hello, type LanUrl } from '../shared/protocol.ts';
 import {
   LedgerError,
   activity,
@@ -20,6 +28,7 @@ import {
   cleanName,
   closeGame,
   completeSettlement,
+  decideReview,
   directSettlement,
   edit,
   login,
@@ -34,6 +43,7 @@ import {
   type Player,
 } from './ledger.ts';
 import { Store } from './store.ts';
+import { startTunnel, type Tunnel, type TunnelState } from './tunnel.ts';
 import { adminState, playerView, type Live } from './views.ts';
 
 export interface ServerOptions {
@@ -42,6 +52,8 @@ export interface ServerOptions {
   host?: string;
   staticDir?: string; // the built pages and games; without it only the API answers
   discoveryPort?: number | null; // UDP port answering player PCs that look for the server (null: none)
+  publicPort?: number | null; // 온라인판: the player-only listener for cloudflared, on 127.0.0.1 (0: any free port)
+  tunnel?: { exe: string } | null; // 온라인판: run this cloudflared to the public port
   clock?: () => number;
   timing?: Partial<Timing>;
 }
@@ -53,10 +65,13 @@ interface Timing {
   keepAliveMs: number; // comment lines on idle event streams
   adminThrottleMs: number; // admin screen updates at most this often
   loginLockMs: number;
+  entryLockMs: number; // an IP that got the 입장 코드 wrong too often waits this long
 }
 
 export interface RunningServer {
   port: number;
+  publicPort: number | null; // 온라인판
+  tunnel(): TunnelState | null;
   url: string; // on this PC
   urls: LanUrl[]; // for the player PCs on the Wi-Fi
   store: Store;
@@ -87,7 +102,11 @@ const STATUS: Partial<Record<ErrorCode, number>> = {
   name_taken: 409,
   pending: 409,
   closed: 409,
+  review: 409,
+  entry: 403,
+  entry_locked: 429,
   locked: 429,
+  busy: 429,
 };
 
 const TYPES: Record<string, string> = {
@@ -116,6 +135,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
     keepAliveMs: 15_000,
     adminThrottleMs: 150,
     loginLockMs: PLATFORM.loginLockMs,
+    entryLockMs: PLATFORM.online.entryLockMs,
     ...o.timing,
   };
   const store = new Store(o.dataDir, clock);
@@ -128,6 +148,15 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
   let urls: LanUrl[] = [];
   let adminTimer: NodeJS.Timeout | null = null;
   let closing = false;
+
+  // 온라인판: the 입장 코드 lives only in memory (a restart gives a new one with the new address), the tunnel is cloudflared.
+  const online = o.publicPort != null;
+  let entryCode = online ? newCode() : '';
+  let tunnel: Tunnel | null = null;
+  const triesByIp = new Map<string, number[]>(); // signup and login times per IP, through the tunnel
+  const wrongCodes = new Map<string, { count: number; until: number }>(); // wrong 입장 코드 per IP
+  const wrongTimes: number[] = []; // wrong 입장 코드 from everywhere, last minute
+  const signupTimes: number[] = [];
 
   // ------------------------------------------------------------ presence
 
@@ -203,7 +232,50 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
     }
   }
 
-  const adminInfo = (): AdminState => adminState(store.state, live, clock(), { urls, dataDir, startedAt });
+  const onlineInfo = (): AdminOnline | null =>
+    online
+      ? {
+          ...(tunnel?.state() ?? { status: 'stopped', url: null, message: '터널 없이 공개 포트만 열려 있습니다' }),
+          code: entryCode,
+        }
+      : null;
+  const adminInfo = (): AdminState => adminState(store.state, live, clock(), { urls, dataDir, startedAt, online: onlineInfo() });
+
+  /** Drops what is older than a minute; returns how many are left. */
+  function lastMinute(times: number[]): number {
+    const now = clock();
+    while (times.length && now - times[0] >= 60_000) times.shift();
+    return times.length;
+  }
+
+  /** At most `max` in the last minute, or 'busy'. */
+  function limit(times: number[], max: number): void {
+    if (lastMinute(times) >= max) throw new LedgerError('busy');
+    times.push(clock());
+  }
+
+  /** Signup and login through the tunnel: rate-limited per IP, and only with the 입장 코드. */
+  function gate(req: IncomingMessage, b: Body, signingUp: boolean): void {
+    // cloudflared puts the visitor's address here; only the public listener ever reads it (it can be faked elsewhere).
+    // An IPv6 visitor holds a whole /64, so that is what counts as one place.
+    const ip = ipKey(String(req.headers['cf-connecting-ip'] ?? '').split(',')[0].trim());
+    const now = clock();
+    const wrong = wrongCodes.get(ip);
+    if (wrong && wrong.until > now) throw new LedgerError('entry_locked');
+    let times = triesByIp.get(ip);
+    if (!times) triesByIp.set(ip, (times = []));
+    limit(times, PLATFORM.online.ratePerIp);
+    // Someone is guessing from many places at once: check no code at all until the minute calms down.
+    if (lastMinute(wrongTimes) >= PLATFORM.online.wrongPerMin) throw new LedgerError('busy');
+    if (String(b.code ?? '') !== entryCode) {
+      wrongTimes.push(now);
+      const count = (wrong && wrong.until === 0 ? wrong.count : 0) + 1;
+      wrongCodes.set(ip, count >= PLATFORM.online.entryFails ? { count: 0, until: now + T.entryLockMs } : { count, until: 0 });
+      throw new LedgerError('entry');
+    }
+    wrongCodes.delete(ip);
+    if (signingUp) limit(signupTimes, PLATFORM.online.signupsPerMin); // only signups that had the code count
+  }
 
   function scheduleAdmin(): void {
     if (closing || adminTimer || adminStreams.size === 0) return;
@@ -258,10 +330,16 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
   const me = (id: string) => playerView(store.state, id);
 
   type Body = Record<string, unknown>;
-  type Handler = (req: IncomingMessage, body: Body, res: ServerResponse) => unknown;
+  type Handler = (req: IncomingMessage, body: Body, res: ServerResponse, pub: boolean) => unknown;
 
   const playerRoutes: Record<string, Handler> = {
-    'POST /api/signup': (_req, b) => {
+    'GET /api/hello': (_req, _b, _res, pub): Hello => ({
+      online: pub,
+      pingMs: pub ? PLATFORM.online.pingMs : PLATFORM.pingMs,
+      entryDigits: pub ? PLATFORM.online.entryDigits : 0,
+    }),
+    'POST /api/signup': (req, b, _res, pub) => {
+      if (pub) gate(req, b, true);
       const e = store.run((s) => signup(s, { name: b.name, pin: b.pin, key: keyOf(b) }));
       if (e.type !== 'signup') throw new LedgerError('bad_request');
       const p = store.state.players.get(e.player.id);
@@ -269,7 +347,8 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       touch(p.id);
       return { token: tokenOf(p), me: me(p.id) };
     },
-    'POST /api/login': (_req, b) => {
+    'POST /api/login': (req, b, _res, pub) => {
+      if (pub) gate(req, b, false);
       const k = nameKey(cleanName(b.name));
       const now = clock();
       const f = fails.get(k);
@@ -319,10 +398,10 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       store.run((s) => cancelSettlement(s, { id: b.id, by: 'player', playerId: p.id }));
       return { me: me(p.id) };
     },
-    'POST /api/game/open': (req, b) => {
+    'POST /api/game/open': (req, b, _res, pub) => {
       const p = authPlayer(bearer(req));
       touch(p.id);
-      const e = store.run((s) => openGame(s, { playerId: p.id, game: b.game, stake: b.stake, key: keyOf(b) }));
+      const e = store.run((s) => openGame(s, { playerId: p.id, game: b.game, stake: b.stake, key: keyOf(b), online: pub }));
       if (e.type !== 'gameOpen') throw new LedgerError('bad_request');
       const { id, game, stake, secret } = e.session;
       return { session: { id, game, stake, secret, openedAt: e.at }, me: me(p.id) };
@@ -330,7 +409,8 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
     // Needs no login: the session secret is enough, so a game can report after a logout, a kick or a restart.
     'POST /api/game/close': (_req, b) => {
       const e = store.run((s) => closeGame(s, { id: b.id, payout: b.payout, secret: b.secret, by: 'player' }));
-      return { me: e.type === 'gameClose' ? me(e.playerId) : null };
+      const done = e.type === 'gameClose' || e.type === 'gameReview';
+      return { me: done ? me(e.playerId) : null, review: e.type === 'gameReview' };
     },
   };
 
@@ -363,6 +443,16 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
     'POST /api/admin/game/close': (_req, b) => {
       store.run((s) => closeGame(s, { id: b.id, payout: b.payout, by: 'admin' }));
       return { ok: true };
+    },
+    'POST /api/admin/review': (_req, b) => {
+      store.run((s) => decideReview(s, { id: b.id, approve: b.approve }));
+      return { ok: true };
+    },
+    'POST /api/admin/online/code': () => {
+      if (!online) throw new LedgerError('bad_request');
+      entryCode = newCode();
+      scheduleAdmin();
+      return { code: entryCode };
     },
   };
 
@@ -425,15 +515,33 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
     res.end(`\uFEFF${csv}`); // BOM: Excel reads it as UTF-8
   }
 
-  async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
-    const url = new URL(req.url ?? '/', 'http://x');
+  async function handle(req: IncomingMessage, res: ServerResponse, pub: boolean): Promise<void> {
+    let url: URL;
+    try {
+      url = new URL(req.url ?? '/', 'http://x');
+    } catch {
+      // A request line no URL can be made of must not take the server down.
+      reply(res, 400, { error: 'bad_request', message: ERROR_TEXT.bad_request }, false);
+      return;
+    }
     const path = url.pathname;
     const route = `${req.method} ${path}`;
     const isApi = path.startsWith('/api/');
     const isAdmin = path.startsWith('/api/admin/') || path === '/admin' || path === '/admin.html';
+    if (pub) {
+      // The player app and the games come from this same address: no other site needs to read these answers,
+      // frame these pages or sniff their types.
+      res.setHeader('X-Content-Type-Options', 'nosniff');
+      res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+      res.setHeader('Referrer-Policy', 'no-referrer');
+    }
+    const cors = !isAdmin && !pub; // the Wi-Fi player app may be opened from a file; through the tunnel it never is
     try {
+      // Through the tunnel: no admin anything (not even its page) and no live updates. Checked first: the tunnel
+      // connects from 127.0.0.1, which fromThisPc() would take for the admin PC.
+      if (pub && (isAdmin || route === 'GET /api/events')) throw new HttpError(404, 'not found');
       if (isAdmin && !fromThisPc(req)) throw new LedgerError('forbidden');
-      if (isApi && !isAdmin && req.method === 'OPTIONS') {
+      if (isApi && cors && req.method === 'OPTIONS') {
         res.writeHead(204, {
           'Access-Control-Allow-Origin': '*',
           'Access-Control-Allow-Methods': 'GET, POST',
@@ -449,7 +557,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       const handler = playerRoutes[route] ?? adminRoutes[route];
       if (handler) {
         const body = req.method === 'POST' ? await readBody(req) : {};
-        reply(res, 200, handler(req, body, res), !isAdmin);
+        reply(res, 200, handler(req, body, res, pub), cors);
         return;
       }
       if (isApi) throw new HttpError(404, 'not found');
@@ -462,57 +570,95 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       throw new HttpError(404, 'not found');
     } catch (err) {
       if (err instanceof LedgerError) {
-        reply(res, STATUS[err.code] ?? 400, { error: err.code, message: ERROR_TEXT[err.code] }, !isAdmin);
+        reply(res, STATUS[err.code] ?? 400, { error: err.code, message: ERROR_TEXT[err.code] }, cors);
       } else if (err instanceof HttpError) {
-        reply(res, err.status, { error: 'bad_request', message: err.message }, !isAdmin);
+        reply(res, err.status, { error: 'bad_request', message: err.message }, cors);
       } else {
         console.error(err);
-        reply(res, 500, { error: 'bad_request', message: '서버 오류' }, !isAdmin);
+        reply(res, 500, { error: 'bad_request', message: '서버 오류' }, cors);
       }
     }
   }
 
-  const server = createServer((req, res) => void handle(req, res));
+  const server = createServer((req, res) => void handle(req, res, false));
+  const publicServer = online ? createServer((req, res) => void handle(req, res, true)) : null;
   try {
-    await new Promise<void>((done, fail) => {
-      server.once('error', fail);
-      server.listen(o.port ?? PLATFORM.port, o.host ?? '0.0.0.0', () => done());
-    });
+    await listen(server, o.port ?? PLATFORM.port, o.host ?? '0.0.0.0');
+    if (publicServer) await listen(publicServer, o.publicPort ?? PLATFORM.online.publicPort, '127.0.0.1');
   } catch (e) {
     clearInterval(sweep);
     clearInterval(keepAlive);
+    if (server.listening) server.close();
     store.close();
-    if ((e as NodeJS.ErrnoException).code === 'EADDRINUSE') {
-      throw new Error(`포트 ${o.port ?? PLATFORM.port}을 이미 쓰고 있습니다. 장부 서버가 벌써 켜져 있는지 확인하세요.`, { cause: e });
-    }
     throw e;
   }
   const port = (server.address() as AddressInfo).port;
+  const publicPort = publicServer ? (publicServer.address() as AddressInfo).port : null;
+  if (publicPort !== null && o.tunnel) {
+    tunnel = startTunnel({ exe: o.tunnel.exe, port: publicPort, restartMs: PLATFORM.online.tunnelRestartMs, onChange: () => scheduleAdmin() });
+  }
   urls = lanUrls(port);
   const discovery = o.discoveryPort === null ? null : answerDiscovery(o.discoveryPort ?? PLATFORM.discoveryPort, port);
 
   return {
     port,
+    publicPort,
+    tunnel: () => tunnel?.state() ?? null,
     url: `http://127.0.0.1:${port}/`, // not "localhost": that may mean IPv6, and the server listens on IPv4
     urls,
     store,
     async close() {
       for (const id of [...presence.keys()]) goOffline(id); // saves everyone's online time
       closing = true;
+      tunnel?.stop();
       discovery?.close();
       clearInterval(sweep);
       clearInterval(keepAlive);
       if (adminTimer) clearTimeout(adminTimer);
       for (const set of playerStreams.values()) for (const st of set) st.res.end();
       for (const a of adminStreams) a.res.end();
-      await new Promise<void>((done) => {
-        server.close(() => done());
-        server.closeAllConnections();
-      });
+      for (const s of [server, publicServer]) {
+        if (!s) continue;
+        await new Promise<void>((done) => {
+          s.close(() => done());
+          s.closeAllConnections();
+        });
+      }
       store.close();
     },
   };
 }
+
+function listen(s: Server, port: number, host: string): Promise<void> {
+  return new Promise<void>((done, fail) => {
+    s.once('error', (e: NodeJS.ErrnoException) =>
+      fail(
+        e.code === 'EADDRINUSE'
+          ? new Error(`포트 ${port}을 이미 쓰고 있습니다. 장부 서버가 벌써 켜져 있는지 확인하세요.`, { cause: e })
+          : e,
+      ),
+    );
+    s.listen(port, host, () => done());
+  });
+}
+
+/** The place a request comes from, for the tunnel's limits: an IPv4 address, or the /64 an IPv6 address is in. */
+export function ipKey(ip: string): string {
+  const v4 = /^(?:::ffff:)?(\d{1,3}(?:\.\d{1,3}){3})$/i.exec(ip);
+  if (v4) return v4[1];
+  if (!ip.includes(':')) return ip || 'unknown';
+  const [head, tail] = ip.toLowerCase().split('::');
+  const h = head ? head.split(':') : [];
+  const t = tail === undefined ? [] : tail ? tail.split(':') : [];
+  const groups = [...h, ...Array<string>(Math.max(0, 8 - h.length - t.length)).fill('0'), ...t];
+  return `${groups
+    .slice(0, 4)
+    .map((g) => g.replace(/^0+(?=.)/, ''))
+    .join(':')}::/64`;
+}
+
+/** A new 입장 코드: random digits, leading zeros kept. */
+const newCode = (): string => String(randomInt(0, 10 ** PLATFORM.online.entryDigits)).padStart(PLATFORM.online.entryDigits, '0');
 
 export const DISCOVERY_QUESTION = 'CASINO?';
 

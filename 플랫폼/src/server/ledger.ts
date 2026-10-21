@@ -1,4 +1,4 @@
-// The chip ledger (DESIGN.md section 2). Pure: a command checks the current state and returns one event, and
+// The chip ledger. Pure: a command checks the current state and returns one event, and
 // apply() folds an event into the state. The server writes every event to the journal before applying it and
 // replays the journal on start, so the state is always exactly the events so far. One command is one event:
 // a crash can never leave half a command behind.
@@ -11,6 +11,11 @@
 //
 // Requests that may be sent twice (a lost answer on a shaky Wi-Fi) carry a key: the same key gets the first
 // event back instead of doing the thing again.
+//
+// 온라인판: a session opened through the tunnel is marked online. Its report of a big win
+// (PLATFORM.online.reviewNet or more) does not pay out: the session stays open with the reported payout attached,
+// and the admin approves it (paid as reported) or turns it down (the stake comes back). The chips never leave
+// the ledger's three places meanwhile: they are still staked.
 import { randomBytes } from 'node:crypto';
 import { PLATFORM, gameDef, type GameId } from '../shared/config.ts';
 import type { ErrorCode, LogKind, LogRecord } from '../shared/protocol.ts';
@@ -36,6 +41,8 @@ export interface GameSession {
   stake: number;
   openedAt: number;
   secret: string; // closes the session; the game keeps it, so it can report even after a logout
+  online?: true; // opened through the tunnel
+  review?: { payout: number; at: number; seq: number }; // a big online win waiting for the admin
 }
 
 export interface Settlement {
@@ -65,8 +72,17 @@ export type EventBody =
   | { type: 'activity'; id: string; lastActiveAt: number; activeMs: number }
   | { type: 'edit'; id: string; before: Editable; after: Editable; bankruptcy: string | null }
   | { type: 'delete'; id: string; player: Player; games: GameSession[]; settlement: Settlement | null; bankruptcy: string | null }
-  | { type: 'gameOpen'; key: string; session: Omit<GameSession, 'openedAt'> }
-  | { type: 'gameClose'; id: string; playerId: string; payout: number; by: 'player' | 'admin'; bankruptcy: string | null }
+  | { type: 'gameOpen'; key: string; session: Omit<GameSession, 'openedAt' | 'review'> }
+  | { type: 'gameReview'; id: string; playerId: string; payout: number }
+  | {
+      type: 'gameClose';
+      id: string;
+      playerId: string;
+      payout: number;
+      by: 'player' | 'admin';
+      bankruptcy: string | null;
+      review?: 'approved' | 'rejected';
+    }
   | { type: 'settleRequest'; key: string; settlement: Omit<Settlement, 'requestedAt'> }
   | { type: 'settleCancel'; id: string; playerId: string; by: 'player' | 'admin' }
   | { type: 'settleDone'; id: string; playerId: string }
@@ -233,7 +249,10 @@ export function remove(s: State, id: unknown): EventBody {
 }
 
 /** A game takes its stake out of the free chips; the game then plays without the network until it reports. */
-export function openGame(s: State, input: { playerId: string; game: unknown; stake: unknown; key: string }): Outcome {
+export function openGame(
+  s: State,
+  input: { playerId: string; game: unknown; stake: unknown; key: string; online?: boolean },
+): Outcome {
   const done = replay(s, input.key, 'gameOpen', (e) => e.type === 'gameOpen' && e.session.playerId === input.playerId);
   if (done) return done;
   const p = player(s, input.playerId);
@@ -241,7 +260,8 @@ export function openGame(s: State, input: { playerId: string; game: unknown; sta
   if (!def) throw new LedgerError('game');
   const stake = checkChips(input.stake, 1);
   if (stake > p.chips) throw new LedgerError('funds');
-  return { type: 'gameOpen', key: input.key, session: { id: newId(), playerId: p.id, game: def.id, stake, secret: newSecret() } };
+  const session = { id: newId(), playerId: p.id, game: def.id, stake, secret: newSecret() };
+  return { type: 'gameOpen', key: input.key, session: input.online ? { ...session, online: true } : session };
 }
 
 /**
@@ -260,13 +280,33 @@ export function closeGame(s: State, input: { id: unknown; payout: unknown; secre
   const g = s.games.get(id);
   if (!g) throw new LedgerError('gone');
   if (input.by === 'player' && input.secret !== g.secret) throw new LedgerError('session');
+  if (g.review && input.by === 'player') {
+    // Sent again while the admin looks at it: the same report gets the same answer, anything else waits.
+    if (input.payout === g.review.payout) return { type: 'gameReview', id, playerId: g.playerId, ...g.review };
+    throw new LedgerError('review');
+  }
   const payout = checkChips(input.payout, 0);
   const def = gameDef(g.game);
   if (input.by === 'player' && def && payout > Math.max(g.stake, def.maxPayout)) throw new LedgerError('payout');
+  if (input.by === 'player' && g.online && payout - g.stake >= PLATFORM.online.reviewNet) {
+    return { type: 'gameReview', id, playerId: g.playerId, payout };
+  }
+  return closing(s, g, payout, input.by);
+}
+
+/** The admin's answer to a big online win: paid as reported, or the stake back. */
+export function decideReview(s: State, input: { id: unknown; approve: unknown }): EventBody {
+  const g = typeof input.id === 'string' ? s.games.get(input.id) : undefined;
+  if (!g?.review) throw new LedgerError('gone');
+  const approve = input.approve === true;
+  return closing(s, g, approve ? g.review.payout : g.stake, approve ? 'player' : 'admin', approve ? 'approved' : 'rejected');
+}
+
+function closing(s: State, g: GameSession, payout: number, by: 'player' | 'admin', review?: 'approved' | 'rejected'): EventBody {
   const p = player(s, g.playerId);
   const broke =
     p.chips + payout <= 0 && gamesOf(s, p.id).length === 1 && !settlementOf(s, p.id) && !bankruptcyOf(s, p.id);
-  return { type: 'gameClose', id, playerId: p.id, payout, by: input.by, bankruptcy: broke ? newId() : null };
+  return { type: 'gameClose', id: g.id, playerId: p.id, payout, by, bankruptcy: broke ? newId() : null, ...(review ? { review } : {}) };
 }
 
 /** 정산 요청: the chips are held at once, so they cannot be played away while the admin gets the physical chips. */
@@ -372,6 +412,15 @@ export function apply(s: State, e: LedgerEvent): void {
       log(s, e, 'gameOpen', p, 0, `${gameName(e.session.game)} 입장 · ${e.session.stake}칩을 걸고 시작`);
       break;
     }
+    case 'gameReview': {
+      const g = s.games.get(e.id);
+      if (!g) throw new Error(`장부에 없는 게임 ${e.id}`);
+      const p = must(s, g.playerId);
+      g.review = { payout: e.payout, at: e.at, seq: e.seq };
+      p.version++;
+      log(s, e, 'gameReview', p, 0, `${gameName(g.game)} ${g.stake}칩 → ${e.payout}칩 · 큰 지급이라 관리자 확인을 기다림`);
+      break;
+    }
     case 'gameClose': {
       const g = s.games.get(e.id);
       if (!g) throw new Error(`장부에 없는 게임 ${e.id}`);
@@ -383,7 +432,18 @@ export function apply(s: State, e: LedgerEvent): void {
       s.games.delete(g.id);
       s.closed.set(g.id, { secret: g.secret, event: e });
       s.totals.games += e.payout - g.stake;
-      const how = e.by === 'admin' ? (e.payout === g.stake ? ' (환불)' : e.payout === 0 ? ' (몰수)' : '') : '';
+      const how =
+        e.review === 'approved'
+          ? ' (관리자 승인)'
+          : e.review === 'rejected'
+            ? ' (관리자 거절 · 판돈 반환)'
+            : e.by === 'admin'
+              ? e.payout === g.stake
+                ? ' (환불)'
+                : e.payout === 0
+                  ? ' (몰수)'
+                  : ''
+              : '';
       log(s, e, e.by === 'admin' ? 'gameForce' : 'gameClose', p, e.payout - g.stake, `${gameName(g.game)} ${e.by === 'admin' ? '강제 종료' : '정산'} · ${g.stake}칩 → ${e.payout}칩${how}`);
       if (e.bankruptcy) {
         s.bankruptcies.set(e.bankruptcy, { id: e.bankruptcy, playerId: p.id, filedAt: e.at });

@@ -1,0 +1,11 @@
+{
+  "appId": "com.casion.casinoledger.online",
+  "productName": "CasinoLedgerOnline",
+  "directories": { "output": "release" },
+  "electronLanguages": ["ko", "en-US"],
+  "extraMetadata": { "name": "casino-ledger-online", "casinoMode": "online" },
+  "files": ["dist/**", "dist-server/server.mjs", "electron/main.cjs", "package.json"],
+  "extraResources": [{ "from": "vendor/cloudflared.exe", "to": "cloudflared.exe" }],
+  "win": { "target": [{ "target": "portable", "arch": ["x64"] }] },
+  "portable": { "artifactName": "CasinoLedgerOnline-${version}-portable.exe" }
+}

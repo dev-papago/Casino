@@ -1,4 +1,4 @@
-// Admin screen on the admin PC (DESIGN.md section 6): every player live with 수정 · 정산 · 삭제, the things waiting
+// Admin screen on the admin PC: every player live with 수정 · 정산 · 삭제, the things waiting
 // for the admin (정산 요청, 파산 신청, games that stopped reporting), and the DB 기록 window with every edit, delete
 // and settlement. Everything comes from the server's event stream; every action is a request the server checks
 // again, so a double click or a stale screen cannot do a thing twice or undo a change it did not see.
@@ -43,11 +43,13 @@ window.addEventListener('pointerdown', unlockAudio, { capture: true });
 const statusEl = h('span', { class: 'status', 'data-testid': 'status' });
 const summaryEl = h('div', { class: 'summary', 'data-testid': 'summary' });
 const urlsEl = h('div', { class: 'urls', 'data-testid': 'urls' });
+const onlineEl = h('div', { class: 'online-box', hidden: true, 'data-testid': 'online' }); // 온라인판
 const tabPlayers = h('button', { class: 'tab', type: 'button', 'data-testid': 'tab-players' });
 const tabLog = h('button', { class: 'tab', type: 'button', 'data-testid': 'tab-log' });
 const searchInput = h('input', { class: 'search', type: 'search', placeholder: '이름 검색', 'data-testid': 'search' });
 const tbody = h('tbody', { 'data-testid': 'players' });
 const emptyEl = h('div', { class: 'empty' }, '아직 가입한 플레이어가 없습니다');
+const reqReview = h('div', { class: 'req-list', 'data-testid': 'reviews' });
 const reqSettle = h('div', { class: 'req-list', 'data-testid': 'requests' });
 const reqBankrupt = h('div', { class: 'req-list', 'data-testid': 'bankruptcies' });
 const reqGames = h('div', { class: 'req-list', 'data-testid': 'open-games' });
@@ -92,6 +94,7 @@ const playersView = h(
     { class: 'panel side-panel' },
     h('h2', {}, '처리할 일'),
     noReqEl,
+    h('div', { class: 'req-group' }, reqReview),
     h('div', { class: 'req-group' }, reqSettle),
     h('div', { class: 'req-group' }, reqBankrupt),
     h('div', { class: 'req-group' }, reqGames),
@@ -125,6 +128,7 @@ root.append(
     statusEl,
     summaryEl,
     urlsEl,
+    onlineEl,
   ),
   h('nav', { class: 'tabs' }, tabPlayers, tabLog),
   playersView,
@@ -180,7 +184,8 @@ function receive(s: AdminState): void {
   for (const id of handled) if (!live.has(id)) handled.delete(id);
   setConnected(true);
   // A new request is something the admin has to do: sound and highlight (not for the ones already there).
-  const fresh = [...s.settlements, ...s.bankruptcies].filter((r) => !seenRequests.has(r.id));
+  const reviews = s.games.filter((g) => g.review !== null).map((g) => ({ id: `review:${g.id}` }));
+  const fresh = [...s.settlements, ...s.bankruptcies, ...reviews].filter((r) => !seenRequests.has(r.id));
   for (const r of fresh) seenRequests.add(r.id);
   if (fresh.length && !firstSnapshot) play('alert');
   firstSnapshot = false;
@@ -200,7 +205,7 @@ function render(): void {
   if (!state) return;
   const s = state;
   const online = s.players.filter((p) => p.online).length;
-  const waiting = s.settlements.length + s.bankruptcies.length;
+  const waiting = s.settlements.length + s.bankruptcies.length + s.games.filter((g) => g.review !== null).length;
   summaryEl.replaceChildren(
     stat('플레이어', `${s.players.length}명`),
     stat('접속 중', `${online}명`),
@@ -214,6 +219,7 @@ function render(): void {
       ? s.server.urls.map((u, i) => h('code', { class: i ? 'dim' : '', title: u.name }, `${u.url} `, h('small', {}, u.name)))
       : [h('code', {}, '네트워크 없음')]),
   );
+  renderOnline(s);
   setText(tabPlayers, `플레이어 (${s.players.length})`);
   setText(tabLog, `DB 기록 (${log.filter((r) => !GAME_KINDS.has(r.kind)).length})`);
   tabPlayers.classList.toggle('active', tab === 'players');
@@ -223,6 +229,43 @@ function render(): void {
     renderRequests();
   } else renderLog();
 }
+
+/** 온라인판: the tunnel's internet address (it changes whenever cloudflared starts again) and the 입장 코드. */
+let onlineKey = '';
+function renderOnline(s: AdminState): void {
+  const o = s.server.online;
+  onlineEl.hidden = !o;
+  if (!o) return;
+  const key = JSON.stringify(o);
+  if (key === onlineKey) return; // kept as is, so the copy button is not redrawn under the mouse
+  onlineKey = key;
+  const copy = h('button', { class: 'btn small', type: 'button', disabled: !o.url, 'data-testid': 'online-copy' }, '복사');
+  copy.addEventListener('click', () => {
+    if (!o.url) return;
+    void navigator.clipboard?.writeText(o.url).then(
+      () => toast('인터넷 주소를 복사했습니다', 'good'),
+      () => toast('복사하지 못했습니다. 주소를 직접 고르세요', 'bad'),
+    );
+  });
+  const newCode = h('button', { class: 'btn small', type: 'button', 'data-testid': 'online-new-code' }, '새 코드');
+  newCode.addEventListener('click', () =>
+    confirmDialog('입장 코드를 바꿀까요?', '이미 로그인한 플레이어는 그대로이고, 새로 가입하거나 로그인할 때 새 코드가 필요합니다.', '바꾸기', 'gold', () =>
+      post('online/code', {}, '입장 코드를 바꿨습니다'),
+    ),
+  );
+  onlineEl.replaceChildren(
+    h('span', { class: 'urls-label' }, '인터넷 주소'),
+    h('code', { class: `online-url ${o.status}`, 'data-testid': 'online-url', title: o.message }, o.url ?? o.message),
+    copy,
+    h('span', { class: `online-status ${o.status}` }, o.status === 'up' ? '● 열림' : o.status === 'stopped' ? '○ 꺼짐' : '◌ 연결 중'),
+    h('span', { class: 'urls-label' }, '입장 코드'),
+    h('code', { class: 'online-code', 'data-testid': 'online-code' }, o.code),
+    newCode,
+  );
+  if (o.status === 'up' && o.url && lastOnlineUrl && lastOnlineUrl !== o.url) toast('인터넷 주소가 바뀌었습니다. 플레이어에게 새 주소를 알려 주세요', 'bad');
+  if (o.url) lastOnlineUrl = o.url;
+}
+let lastOnlineUrl = '';
 
 function stat(label: string, value: string, hot = false): HTMLElement {
   return h('div', { class: `stat${hot ? ' hot' : ''}` }, h('span', {}, label), h('b', {}, value));
@@ -328,6 +371,12 @@ function renderRequests(): void {
   };
   const open = <T extends { id: string }>(list: T[]): T[] => list.filter((r) => !handled.has(r.id));
   place(
+    reqReview,
+    open(state.games.filter((g) => g.review !== null)).map((g) =>
+      card(`r:${g.id}`, keep, () => reviewCard(g), (el) => setText(el.querySelector('.ago')!, `${duration(now - g.openedAt)}째`)),
+    ),
+  );
+  place(
     reqSettle,
     open(state.settlements)
       .sort((a, b) => a.requestedAt - b.requestedAt)
@@ -339,7 +388,7 @@ function renderRequests(): void {
   );
   place(
     reqGames,
-    open(state.games).map((g) =>
+    open(state.games.filter((g) => g.review === null)).map((g) =>
       card(`g:${g.id}`, keep, () => gameCard(g), (el) => {
         const owner = state?.players.find((p) => p.id === g.playerId);
         setText(el.querySelector('.ago')!, `${duration(now - g.openedAt)}째 · ${owner?.online ? '접속 중' : '연결 끊김'}`);
@@ -401,6 +450,27 @@ function bankruptcyCard(b: AdminBankruptcy): HTMLElement {
       'div',
       { class: 'req-actions' },
       h('button', { class: 'btn small', type: 'button', 'data-testid': 'bankruptcy-done', onclick: () => confirmDialog(`${b.name}의 파산을 처리했나요?`, '칩을 다시 주려면 플레이어 [수정]에서 잔고를 바꾸세요. 잔고가 생기면 파산은 자동으로 풀립니다.', '처리 완료', 'gold', () => post('bankrupt/done', { id: b.id }, '파산 처리 완료', b.id)) }, '처리 완료'),
+    ),
+  );
+}
+
+/** 온라인판: a big win through the tunnel. Approve pays what the game reported; reject gives the stake back. */
+function reviewCard(g: AdminGame): HTMLElement {
+  const name = PLATFORM.games.find((d) => d.id === g.game)?.name ?? g.game;
+  const p = state?.players.find((x) => x.id === g.playerId);
+  const payout = g.review ?? 0;
+  const history = p ? `${ago(p.createdAt)} 가입 · 게임 ${p.played}판${p.played ? ` (${signed(p.net)})` : ''}` : '';
+  return h(
+    'div',
+    { class: 'req review', 'data-testid': 'review' },
+    h('div', { class: 'req-title' }, h('b', {}, g.name), ` ${name} ${chips(g.stake)} → ${chips(payout)} 지급 확인 (온라인)`),
+    h('div', { class: 'req-sub' }, h('span', { class: 'ago' }), ` · 순이익 ${signed(payout - g.stake)}칩`),
+    h('div', { class: 'req-sub' }, history),
+    h(
+      'div',
+      { class: 'req-actions' },
+      h('button', { class: 'btn small gold', type: 'button', 'data-testid': 'review-approve', onclick: () => confirmDialog(`${g.name}에게 ${chips(payout)} 지급`, `${name} 결과를 그대로 인정합니다. 잔고에 ${chips(payout)}이 들어갑니다.`, '승인', 'gold', () => post('review', { id: g.id, approve: true }, `승인했습니다 · ${chips(payout)} 지급`, g.id)) }, '승인'),
+      h('button', { class: 'btn small', type: 'button', 'data-testid': 'review-reject', onclick: () => confirmDialog(`${g.name}의 결과를 거절할까요?`, `판돈 ${chips(g.stake)}만 돌려줍니다. 조작이 의심될 때 쓰세요.`, '거절', 'danger', () => post('review', { id: g.id, approve: false }, `거절했습니다 · 판돈 ${chips(g.stake)} 반환`, g.id)) }, '거절'),
     ),
   );
 }

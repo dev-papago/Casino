@@ -15,7 +15,7 @@ export function playerView(s: State, id: string): PlayerView | null {
     inGame: inGameOf(s, id),
     settlement: r ? { id: r.id, amount: r.amount, requestedAt: r.requestedAt } : null,
     bankrupt: !!bankruptcyOf(s, id),
-    games: gamesOf(s, id).map(({ id: gid, game, stake, openedAt }) => ({ id: gid, game, stake, openedAt })),
+    games: gamesOf(s, id).map(({ id: gid, game, stake, openedAt, review }) => ({ id: gid, game, stake, openedAt, review: review?.payout ?? null })),
   };
 }
 
@@ -53,7 +53,16 @@ export function adminState(s: State, live: (id: string) => Live | null, at: numb
     players,
     settlements: [...s.settlements.values()].map((r) => ({ ...r, name: name(r.playerId) })),
     bankruptcies: [...s.bankruptcies.values()].map((b) => ({ ...b, name: name(b.playerId) })),
-    games: [...s.games.values()].map(({ secret: _secret, ...g }) => ({ ...g, name: name(g.playerId) })),
+    games: [...s.games.values()].map(({ id, playerId, game, stake, openedAt, online, review }) => ({
+      id,
+      playerId,
+      game,
+      stake,
+      openedAt,
+      online: !!online,
+      review: review?.payout ?? null,
+      name: name(playerId),
+    })),
     totals: { ...s.totals, outstanding: players.reduce((t, p) => t + p.total, 0) },
     server,
   };

@@ -483,6 +483,11 @@ button.game-tile:disabled {
   font-size: 0.9rem;
 }
 
+.open-row.review {
+  color: var(--gold);
+  font-weight: 700;
+}
+
 /* ---------------------------------------------------------------- feedback */
 
 .net-banner {

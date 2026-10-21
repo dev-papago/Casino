@@ -1,4 +1,4 @@
-// The ledger on disk (DESIGN.md section 3): data/journal.jsonl, one JSON event per line, only ever appended.
+// The ledger on disk: data/journal.jsonl, one JSON event per line, only ever appended.
 // Every event is flushed to the disk (fsync) before the server answers, so an answered request is never lost.
 // On start the file is read back in full. A last line cut off by a power failure is dropped: that request was
 // never answered, and the player app sends it again. A damaged line anywhere else stops the server, because a
@@ -45,7 +45,9 @@ export function openJournal<T>(dir: string): Journal<T> {
       try {
         events.push(JSON.parse(line) as T);
       } catch {
-        throw new Error(`장부 파일 ${path}의 ${i + 1}번째 줄이 손상되었습니다. data/backups의 사본으로 바꾸세요.`);
+        throw new Error(
+          `장부 파일 ${path}의 ${i + 1}번째 줄이 손상되었습니다. 같은 폴더의 backups에서 가장 최근 journal-<시각>.jsonl 사본을 journal.jsonl로 이름을 바꿔 넣고 다시 켜세요.`,
+        );
       }
     });
     if (tail.trim()) {

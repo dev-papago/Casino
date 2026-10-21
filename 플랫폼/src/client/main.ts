@@ -1,12 +1,14 @@
-// Player app (DESIGN.md section 5): 로그인 / 가입하기, then the lobby with the chip balance always on screen, the
+// Player app: 로그인 / 가입하기, then the lobby with the chip balance always on screen, the
 // games, and the settlement request. Everything comes from the ledger server; the app keeps only its login token.
 // When the server cannot be reached the app says so, keeps trying, and blocks anything that moves chips.
 // A game opens on top of the lobby in a frame from the same server, under a bar that keeps the balance in view;
 // it takes and gives back chips itself (sdk/casino.ts). Whatever way a game stops, its chips come back: the app
 // settles leftovers whenever no game is open, and sends results still waiting in the outbox on every report.
+// Through the tunnel (온라인판) the server says so at /api/hello: then login asks the 입장 코드, and the
+// app asks for news every PLATFORM.online.pingMs instead of live updates (a Quick Tunnel does not pass them).
 import './style.css';
 import { PLATFORM, type GameDef } from '../shared/config.ts';
-import type { AuthReply, MeReply, PlayerView } from '../shared/protocol.ts';
+import type { AuthReply, Hello, MeReply, PlayerView } from '../shared/protocol.ts';
 import { chips, clockTime, h, requestKey, setText } from '../ui/dom.ts';
 import { ApiError, api } from '../ui/net.ts';
 import { play, unlockAudio } from '../ui/sound.ts';
@@ -14,6 +16,7 @@ import { flush, settleLeftovers } from '../../sdk/casino.ts';
 
 const TOKEN_KEY = 'casino:v1:token';
 const SERVER_KEY = 'casino:v1:server';
+const ENTRY_KEY = 'casino:v1:entry'; // the 입장 코드 last used, so a returning player need not type it again
 const SEND_RETRY_MS = 30_000; // a chip request keeps trying this long through a Wi-Fi drop
 
 const root = document.getElementById('app')!;
@@ -28,6 +31,7 @@ let pingTimer: number | null = null;
 let busy = false; // a chip request is on its way
 let cancelling = false;
 let playing: GameDef | null = null; // the game open on top of the lobby
+let hello: Hello = { online: false, pingMs: PLATFORM.pingMs, entryDigits: 0 }; // how this server address works
 
 // ------------------------------------------------------------------ skeleton
 
@@ -47,6 +51,19 @@ function showLogin(notice = ''): void {
   const pin = pinInput('pin', 'PIN 4자리');
   const pin2 = pinInput('pin2', 'PIN 한 번 더');
   const server = h('input', { class: 'field', 'data-testid': 'server', placeholder: '서버 주소 (예: 192.168.0.12:7777)', value: base });
+  const entry = h('input', {
+    class: 'field pin',
+    inputmode: 'numeric',
+    maxlength: hello.entryDigits,
+    autocomplete: 'off',
+    placeholder: `입장 코드 ${hello.entryDigits}자리`,
+    value: load(ENTRY_KEY),
+    'data-testid': 'entry',
+  });
+  entry.addEventListener('input', () => {
+    const clean = entry.value.replace(/\D/g, '').slice(0, hello.entryDigits);
+    if (clean !== entry.value) entry.value = clean;
+  });
   const msg = h('div', { class: 'form-msg', 'data-testid': 'login-msg' }, notice);
   const submit = h('button', { class: 'btn primary wide', type: 'submit', 'data-testid': 'submit' }, '로그인');
   const tabLogin = h('button', { class: 'tab active', type: 'button', 'data-testid': 'tab-login' }, '로그인');
@@ -72,6 +89,7 @@ function showLogin(notice = ''): void {
     h('label', { class: 'row' }, h('span', {}, '이름'), name),
     h('label', { class: 'row' }, h('span', {}, 'PIN'), pin),
     pin2Row,
+    hello.entryDigits ? h('label', { class: 'row' }, h('span', {}, '입장 코드'), entry) : null,
     location.protocol.startsWith('http') ? null : h('label', { class: 'row' }, h('span', {}, '서버'), server),
     msg,
     submit,
@@ -85,13 +103,23 @@ function showLogin(notice = ''): void {
       submit.disabled = true;
       setText(submit, '연결 중…');
       try {
-        const body = { name: name.value, pin: pin.value, key: requestKey() };
+        const body = { name: name.value, pin: pin.value, key: requestKey(), ...(hello.entryDigits ? { code: entry.value } : {}) };
         const r = await api<AuthReply>(base, mode, body, { retryMs: 15_000 });
+        if (hello.entryDigits) save(ENTRY_KEY, entry.value);
         token = r.token;
         save(TOKEN_KEY, token);
         play('coin');
         showLobby(r.me, mode === 'signup' ? `가입 완료! 보너스 ${PLATFORM.signupBonus}칩` : '');
       } catch (err) {
+        if (err instanceof ApiError && err.code === 'entry') {
+          // The code changed (a server restart or [새 코드]): never send the old one again by accident.
+          if (!hello.entryDigits) {
+            await greet(); // /api/hello was missed at boot: now the form needs the code field
+            return showLogin(err.message);
+          }
+          entry.value = '';
+          remove(ENTRY_KEY);
+        }
         fail(err instanceof ApiError ? err.message : '오류가 났습니다');
         submit.disabled = false;
         setText(submit, mode === 'login' ? '로그인' : '가입하고 시작');
@@ -290,7 +318,14 @@ function render(): void {
   openGamesEl.hidden = me.games.length === 0;
   openGamesEl.replaceChildren(
     h('div', { class: 'open-title' }, '진행 중인 게임 (끝나면 칩이 돌아옵니다)'),
-    ...me.games.map((g) => h('div', { class: 'open-row' }, `${PLATFORM.games.find((d) => d.id === g.game)?.name ?? g.game} · ${chips(g.stake)} · ${clockTime(g.openedAt)} 시작`)),
+    ...me.games.map((g) =>
+      h(
+        'div',
+        { class: `open-row${g.review === null ? '' : ' review'}`, 'data-testid': g.review === null ? null : 'review' },
+        `${PLATFORM.games.find((d) => d.id === g.game)?.name ?? g.game} · ${chips(g.stake)} · ${clockTime(g.openedAt)} 시작`,
+        g.review === null ? '' : ` · ${chips(g.review)} 지급을 관리자가 확인하는 중`,
+      ),
+    ),
   );
 
   const r = me.settlement;
@@ -398,9 +433,14 @@ function handleError(err: unknown, show: (t: string) => void): void {
 
 // ------------------------------------------------------------------ connection
 
-/** Live updates by server-sent events, plus a report every PLATFORM.pingMs that keeps the player online. */
+/**
+ * Live updates by server-sent events, plus a report every PLATFORM.pingMs that keeps the player online. Through the
+ * tunnel the reports alone carry the news, more often (hello.pingMs); a replaced login shows up as 'session' there.
+ */
 function connect(): void {
   stopSession(false);
+  pingTimer = window.setInterval(() => void ping(), hello.pingMs);
+  if (hello.online) return;
   events = new EventSource(`${base}api/events?token=${encodeURIComponent(token)}`);
   events.addEventListener('me', (ev) => {
     setOnline(true);
@@ -409,7 +449,6 @@ function connect(): void {
   events.addEventListener('kicked', (ev) => endSession((JSON.parse((ev as MessageEvent).data) as { reason: string }).reason));
   events.onopen = () => setOnline(true);
   events.onerror = () => setOnline(false); // EventSource reconnects by itself
-  pingTimer = window.setInterval(() => void ping(), PLATFORM.pingMs);
 }
 
 async function ping(): Promise<void> {
@@ -516,8 +555,18 @@ function remove(key: string): void {
 
 // ------------------------------------------------------------------ boot
 
+/** Through the tunnel or on the Wi-Fi? An old server without /api/hello is the Wi-Fi kind. */
+async function greet(): Promise<void> {
+  try {
+    hello = await api<Hello>(base, 'hello', undefined, { retryMs: 10_000 });
+  } catch {
+    // keeps the Wi-Fi default
+  }
+}
+
 /** With a saved login, waits for the server (it may be restarting) instead of asking to log in again. */
 async function boot(): Promise<void> {
+  if (base) await greet();
   if (!token) return showLogin();
   screen.replaceChildren(h('div', { class: 'center' }, h('div', { class: 'card connecting', 'data-testid': 'connecting' }, '서버에 연결하는 중…')));
   for (;;) {

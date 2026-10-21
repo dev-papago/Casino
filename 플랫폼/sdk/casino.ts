@@ -1,10 +1,11 @@
-// Chip bridge for a game inside the casino platform (플랫폼/docs/DESIGN.md section 9). One self-contained file that
+// Chip bridge for a game inside the casino platform. One self-contained file that
 // 야바위 and 영끌문S both import. The player app opens a game from the ledger server with ?casino in its URL, so the
 // game shares the app's origin and its login. A game session:
 //
 //   open(game, stake)        takes the stake out of the player's free chips (it waits in the ledger as "게임 중")
 //   live(session, payout)    the game notes, after every change, what the player would get back if it ended now
-//   close(session, payout)   gives the result back in chips
+//   close(session, payout)   gives the result back in chips ('review': a big win through the tunnel waits for the
+//                            admin before it reaches the balance)
 //
 // Nothing here can be lost to a dropped Wi-Fi, a reload or a closed window. open() writes its request key down
 // first, so a cut-off request is found again. close() puts the result in an outbox first and sends it until the
@@ -122,8 +123,14 @@ async function sendOpen(o: Opening): Promise<CasinoSession> {
   return { ...r.session, playerId: o.playerId };
 }
 
-/** Gives the result back. 'sent': the ledger has it; 'queued': it waits in the outbox until the server is back. */
-export async function close(s: CasinoSession, payout: number): Promise<'sent' | 'queued'> {
+/** Sessions whose result the ledger took but holds for the admin (a big win through the tunnel). */
+const inReview = new Set<string>();
+
+/**
+ * Gives the result back. 'sent': the ledger has it; 'queued': it waits in the outbox until the server is back;
+ * 'review': the ledger has it and pays it out once the admin approves.
+ */
+export async function close(s: CasinoSession, payout: number): Promise<'sent' | 'queued' | 'review'> {
   const box = outbox().filter((c) => c.id !== s.id);
   box.push({ id: s.id, secret: s.secret, payout, game: s.game });
   write(OUTBOX_KEY, box);
@@ -132,11 +139,11 @@ export async function close(s: CasinoSession, payout: number): Promise<'sent' | 
   write(LIVE_KEY, rest);
   if (!outbox().some((c) => c.id === s.id)) {
     // Storage is blocked: no outbox, so this one try is all there is.
-    await call('game/close', { id: s.id, secret: s.secret, payout }, { auth: false, retryMs: 20_000 });
-    return 'sent';
+    const r = await call<{ review?: boolean }>('game/close', { id: s.id, secret: s.secret, payout }, { auth: false, retryMs: 20_000 });
+    return r.review ? 'review' : 'sent';
   }
   await flush();
-  return outbox().some((c) => c.id === s.id) ? 'queued' : 'sent';
+  return outbox().some((c) => c.id === s.id) ? 'queued' : inReview.has(s.id) ? 'review' : 'sent';
 }
 
 let flushing: Promise<number> | null = null;
@@ -153,7 +160,8 @@ export function flush(): Promise<number> {
 async function sendOutbox(): Promise<number> {
   for (const c of outbox()) {
     try {
-      await call('game/close', { id: c.id, secret: c.secret, payout: c.payout }, { auth: false, retryMs: 0 });
+      const r = await call<{ review?: boolean }>('game/close', { id: c.id, secret: c.secret, payout: c.payout }, { auth: false, retryMs: 0 });
+      if (r?.review) inReview.add(c.id);
     } catch (e) {
       if (e instanceof CasinoError && e.code === 'network') continue; // try again later
       // Any other answer is final (already closed, closed by the admin, over the limit): the admin sees the rest.

@@ -1,4 +1,4 @@
-// What the ledger server, the player app and the admin screen send each other (DESIGN.md section 4).
+// What the ledger server, the player app and the admin screen send each other.
 // Requests and answers are JSON over HTTP; live updates come as server-sent events.
 import type { GameId } from './config.ts';
 
@@ -20,6 +20,10 @@ export type ErrorCode =
   | 'game'
   | 'payout'
   | 'closed'
+  | 'review'
+  | 'entry'
+  | 'entry_locked'
+  | 'busy'
   | 'forbidden'
   | 'not_found';
 
@@ -41,6 +45,10 @@ export const ERROR_TEXT: Record<ErrorCode, string> = {
   game: '알 수 없는 게임입니다',
   payout: '게임 결과가 한도를 넘습니다. 관리자에게 문의하세요',
   closed: '이미 정산된 게임입니다',
+  review: '관리자가 확인하고 있는 게임입니다',
+  entry: '입장 코드가 맞지 않습니다. 행사장에서 안내한 코드를 넣으세요',
+  entry_locked: '입장 코드를 여러 번 틀렸습니다. 2분 뒤에 다시 하세요',
+  busy: '요청이 너무 많습니다. 잠시 뒤에 다시 하세요',
   forbidden: '관리자 PC에서만 할 수 있습니다',
   not_found: '없는 플레이어입니다',
 };
@@ -57,6 +65,7 @@ export interface GameSessionView {
   game: GameId;
   stake: number;
   openedAt: number;
+  review: number | null; // 온라인판: the payout the game reported, waiting for the admin
 }
 
 /** Everything the player app shows about the logged-in player. */
@@ -86,6 +95,19 @@ export interface GameOpenReply extends MeReply {
   session: GameSessionView & { secret: string };
 }
 
+/** GET /api/hello: how this address works. Through the tunnel there are no live updates and an 입장 코드 is asked. */
+export interface Hello {
+  online: boolean;
+  pingMs: number;
+  entryDigits: number; // 0: no 입장 코드
+}
+
+/** POST /api/game/close: `review` when a big online win waits for the admin instead of paying out at once. */
+export interface GameCloseReply {
+  me: PlayerView | null;
+  review: boolean;
+}
+
 /** Server-sent events on /api/events. */
 export interface PlayerEvents {
   me: PlayerView;
@@ -107,6 +129,7 @@ export type LogKind =
   | 'bankruptDone'
   | 'gameOpen'
   | 'gameClose'
+  | 'gameReview'
   | 'gameForce';
 
 export const LOG_LABEL: Record<LogKind, string> = {
@@ -122,6 +145,7 @@ export const LOG_LABEL: Record<LogKind, string> = {
   bankruptDone: '파산 처리',
   gameOpen: '게임 입장',
   gameClose: '게임 정산',
+  gameReview: '지급 확인 요청',
   gameForce: '게임 강제 종료',
 };
 
@@ -176,6 +200,15 @@ export interface AdminBankruptcy {
 export interface AdminGame extends GameSessionView {
   playerId: string;
   name: string;
+  online: boolean; // opened through the tunnel
+}
+
+/** The tunnel as the admin screen shows it (null: this server runs without one). */
+export interface AdminOnline {
+  status: 'starting' | 'up' | 'restarting' | 'stopped';
+  url: string | null; // https://….trycloudflare.com, changes whenever cloudflared starts again
+  message: string; // what is going on, in Korean
+  code: string; // 입장 코드
 }
 
 /** An address of the admin PC that player PCs can open, with the network it is on (Wi-Fi, 이더넷, …). */
@@ -193,7 +226,7 @@ export interface AdminState {
   // Chips given at signup, net admin edits, net game results, paid out at the counter, lost with deleted accounts,
   // and still owed to players. outstanding = bonus + edits + games − settled − deleted, always.
   totals: { bonus: number; edits: number; games: number; settled: number; deleted: number; outstanding: number };
-  server: { urls: LanUrl[]; dataDir: string; startedAt: number };
+  server: { urls: LanUrl[]; dataDir: string; startedAt: number; online: AdminOnline | null };
 }
 
 /** Server-sent events on /api/admin/events: a full snapshot first, then only what changed and the new log lines. */
