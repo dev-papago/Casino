@@ -4,13 +4,14 @@
 //
 // Online means the player app reported in within PLATFORM.offlineAfterMs (it does every PLATFORM.pingMs). A
 // connection alone proves nothing: a laptop that walks out of the Wi-Fi leaves its connection open for minutes.
+import { createSocket } from 'node:dgram';
 import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { networkInterfaces } from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { PLATFORM } from '../shared/config.ts';
+import { PLATFORM, gameDef } from '../shared/config.ts';
 import { ERROR_TEXT, LOG_LABEL, type AdminState, type ErrorCode, type LanUrl } from '../shared/protocol.ts';
 import {
   LedgerError,
@@ -39,7 +40,8 @@ export interface ServerOptions {
   dataDir: string;
   port?: number; // 0: any free port (tests)
   host?: string;
-  staticDir?: string; // the built pages; without it only the API answers
+  staticDir?: string; // the built pages and games; without it only the API answers
+  discoveryPort?: number | null; // UDP port answering player PCs that look for the server (null: none)
   clock?: () => number;
   timing?: Partial<Timing>;
 }
@@ -453,6 +455,8 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       if (isApi) throw new HttpError(404, 'not found');
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'method not allowed');
       if (path === '/' || path === '/index.html') return await serveFile(res, 'index.html');
+      const game = /^\/games\/([a-z]+)\/(?:index\.html)?$/.exec(path)?.[1];
+      if (game && gameDef(game)) return await serveFile(res, `games/${game}/index.html`);
       if (isAdmin) return await serveFile(res, 'admin.html');
       if (path.startsWith('/assets/')) return await serveFile(res, path.slice(1));
       throw new HttpError(404, 'not found');
@@ -485,6 +489,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
   }
   const port = (server.address() as AddressInfo).port;
   urls = lanUrls(port);
+  const discovery = o.discoveryPort === null ? null : answerDiscovery(o.discoveryPort ?? PLATFORM.discoveryPort, port);
 
   return {
     port,
@@ -494,6 +499,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
     async close() {
       for (const id of [...presence.keys()]) goOffline(id); // saves everyone's online time
       closing = true;
+      discovery?.close();
       clearInterval(sweep);
       clearInterval(keepAlive);
       if (adminTimer) clearTimeout(adminTimer);
@@ -506,6 +512,26 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       store.close();
     },
   };
+}
+
+export const DISCOVERY_QUESTION = 'CASINO?';
+
+/**
+ * Answers player PCs looking for the server: they broadcast "CASINO?" on the Wi-Fi and get back the HTTP port,
+ * and the answer's sender address is the server. A taken port only costs the automatic search.
+ */
+function answerDiscovery(udpPort: number, httpPort: number): { close(): void } | null {
+  const sock = createSocket({ type: 'udp4', reuseAddr: true });
+  sock.on('error', (e) => {
+    console.warn(`자동 찾기(UDP ${udpPort})를 켜지 못했습니다: ${e.message}`);
+    sock.close();
+  });
+  sock.on('message', (msg, from) => {
+    if (msg.toString() !== DISCOVERY_QUESTION) return;
+    sock.send(JSON.stringify({ casino: true, port: httpPort }), from.port, from.address);
+  });
+  sock.bind(udpPort);
+  return { close: () => sock.close() };
 }
 
 /** The player whose app should hear about this event. */

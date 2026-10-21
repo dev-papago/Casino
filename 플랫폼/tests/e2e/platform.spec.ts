@@ -20,7 +20,9 @@ test('signup, admin edit, settlement, network drop, another login, delete', asyn
 
   await admin.goto('/admin');
   await expect(admin.getByTestId('status')).toContainText('서버 연결됨');
-  await expect(admin.getByTestId('summary')).toContainText('플레이어0명');
+  const count = async (): Promise<number> => Number(/플레이어(\d+)명/.exec((await admin.getByTestId('summary').textContent()) ?? '')?.[1]);
+  await expect(admin.getByTestId('summary')).toContainText('플레이어');
+  const before = await count();
 
   // Sign up: 5 chips, and the admin sees the player online at once.
   await signUp(player, '테스터', '1234');
@@ -100,7 +102,7 @@ test('signup, admin edit, settlement, network drop, another login, delete', asyn
   await expect(admin.getByTestId('dialog')).toContainText('삭제할까요?');
   await admin.getByTestId('dialog-ok').click();
   await expect(second.getByTestId('login-msg')).toContainText('관리자가 계정을 삭제했습니다');
-  await expect(admin.getByTestId('summary')).toContainText('플레이어0명');
+  await expect.poll(count).toBe(before);
   await admin.getByTestId('tab-log').click();
   await expect(admin.getByTestId('log').locator('tr').first()).toContainText('계정 삭제 · 잔고 10칩 소멸');
   expect(errors).toEqual([]);

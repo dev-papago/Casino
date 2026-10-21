@@ -396,15 +396,73 @@ h2 {
   font-size: 0.85rem;
 }
 
-.game-soon {
+button.game-tile {
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    transform 0.12s,
+    box-shadow 0.12s;
+}
+
+button.game-tile:hover:not(:disabled) {
+  transform: translateY(-3px);
+  box-shadow: 0 0.8rem 2rem rgba(180, 107, 255, 0.35);
+}
+
+button.game-tile:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.game-play {
   justify-self: start;
   margin-top: 0.3rem;
-  padding: 0.15rem 0.6rem;
+  padding: 0.25rem 0.9rem;
   border-radius: 99rem;
-  background: rgba(255, 255, 255, 0.08);
-  color: var(--dim);
-  font-size: 0.75rem;
-  font-weight: 800;
+  background: linear-gradient(180deg, var(--gold), var(--gold-deep));
+  color: #241400;
+  font-size: 0.85rem;
+  font-weight: 900;
+}
+
+/* ---------------------------------------------------------------- a game on top of the lobby */
+
+.game-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 15;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  background: #000;
+}
+
+.game-bar {
+  display: flex;
+  align-items: center;
+  gap: 1.2rem;
+  padding: 0.35rem 1rem;
+  background: rgba(20, 12, 36, 0.98);
+  border-bottom: 1px solid var(--line);
+}
+
+.gb-name {
+  font-weight: 900;
+}
+
+.gb-balance {
+  margin-left: auto;
+  color: var(--gold);
+  font-weight: 900;
+  font-size: 1.1rem;
+}
+
+.game-frame {
+  width: 100%;
+  height: 100%;
+  border: 0;
+  display: block;
 }
 
 .open-games {

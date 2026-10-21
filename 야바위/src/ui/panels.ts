@@ -27,8 +27,43 @@ export function confirmCard(e: EconomyConfig, onStart: () => void, onCancel: () 
   );
 }
 
+/**
+ * 카지노 플랫폼: how many chips to take from the ledger into this game. `max` is what the player has (and stays
+ * under the payout line, or the first win would already end the session).
+ */
+export function stakeCard(free: number, max: number, onStart: (stake: number) => void, onCancel: () => void): HTMLElement {
+  let stake = Math.min(CONFIG.economy.buyIn, max);
+  const n = h('b', { class: 'stake-n', 'data-testid': 'stake-n' }, stake);
+  const step = (d: number): void => {
+    stake = Math.max(1, Math.min(max, stake + d));
+    n.textContent = String(stake);
+  };
+  const msg = h('p', { class: 'note', 'data-testid': 'stake-msg' }, `내 잔고에서 사용 가능한 칩 ${free}개 · 한 번에 최대 ${max}개`);
+  const start = button('시작', () => {
+    start.disabled = true;
+    msg.textContent = '장부에서 칩을 가져오는 중…';
+    onStart(stake);
+  }, { kind: 'primary', testid: 'stake-start' });
+  return h(
+    'div',
+    { class: 'card confirm', 'data-testid': 'stake' },
+    h('h2', {}, '칩 걸고 시작'),
+    h('p', { class: 'lead' }, '몇 칩을 가지고 시작할까요?'),
+    h(
+      'div',
+      { class: 'bet stake-pick' },
+      button('−', () => step(-1), { testid: 'stake-minus' }),
+      n,
+      button('+', () => step(1), { testid: 'stake-plus' }),
+      button('전부', () => step(Infinity), { testid: 'stake-max' }),
+    ),
+    msg,
+    h('div', { class: 'row' }, start, button('취소', onCancel, { kind: 'ghost', key: 'Esc', testid: 'stake-cancel' })),
+  );
+}
+
 /** "돌려드릴 칩 N개" in big type; the chips pop in one by one (CSS delay by --i) to match the tick sounds. */
-export function settlementCard(s: Session & { ended: EndReason }, onPaid: () => void, maxPile: number): HTMLElement {
+export function settlementCard(s: Session & { ended: EndReason }, onPaid: () => void, maxPile: number, casino = false): HTMLElement {
   const wins = s.rounds.filter((r) => r.win).length;
   const pile = Array.from({ length: Math.min(s.stack, maxPile) }, (_, i) => {
     const c = chipIcon() as SVGElement;
@@ -39,11 +74,11 @@ export function settlementCard(s: Session & { ended: EndReason }, onPaid: () => 
     'div',
     { class: `card settle reason-${s.ended}`, 'data-testid': 'settlement' },
     h('div', { class: 'reason', 'data-testid': 'end-reason' }, END_TEXT[s.ended]),
-    h('div', { class: 'pay-label' }, '돌려드릴 칩'),
+    h('div', { class: 'pay-label' }, casino ? '내 잔고로 돌아가는 칩' : '돌려드릴 칩'),
     h('div', { class: 'pay' }, h('span', { class: 'pay-n', 'data-testid': 'payout' }, s.stack), h('span', { class: 'pay-unit' }, '개')),
     h('div', { class: 'pay-chips' }, ...pile),
-    h('p', { class: 'note' }, `시작 칩 ${s.econ.buyIn}개 · ${s.rounds.length}판 중 ${wins}판 맞힘 · 손님 결과 ${signed(sessionNet(s))}칩`),
-    h('div', { class: 'row' }, button('지급 완료', onPaid, { kind: 'primary', testid: 'paid-out' })),
+    h('p', { class: 'note' }, `시작 칩 ${s.econ.buyIn}개 · ${s.rounds.length}판 중 ${wins}판 맞힘 · ${casino ? '결과' : '손님 결과'} ${signed(sessionNet(s))}칩`),
+    h('div', { class: 'row' }, button(casino ? '칩 받기' : '지급 완료', onPaid, { kind: 'primary', testid: 'paid-out' })),
   );
 }
 

@@ -1139,3 +1139,40 @@ dd.inverse {
     transform: translate(-0.15rem, 0);
   }
 }
+
+/* Casino: chips brought in on the title card, and where they went at the end. */
+.stake-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.6rem;
+  margin: 0.4rem 0 0.2rem;
+  font-weight: 800;
+}
+
+.stake-n {
+  min-width: 4.5rem;
+  text-align: center;
+  font-size: 1.6rem;
+  color: var(--gold);
+}
+
+.stake-usd {
+  color: var(--dim);
+}
+
+.cashout {
+  margin: 0.4rem 0;
+  padding: 0.6rem 0.9rem;
+  border-radius: 0.6rem;
+  font-weight: 900;
+  color: var(--gold);
+  background: rgba(245, 197, 66, 0.12);
+  border: 1px solid rgba(245, 197, 66, 0.5);
+}
+
+.cashout.queued {
+  color: #ffc2cd;
+  border-color: rgba(255, 69, 96, 0.6);
+  background: rgba(255, 69, 96, 0.12);
+}

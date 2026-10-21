@@ -5,4 +5,4 @@ import { startServer, staticDirDefault } from '../../src/server/server.ts';
 
 const dataDir = 'test-results/e2e-data';
 rmSync(dataDir, { recursive: true, force: true });
-await startServer({ dataDir, port: Number(process.argv[2]), host: '127.0.0.1', staticDir: staticDirDefault(), timing: { offlineAfterMs: 6000 } });
+await startServer({ dataDir, port: Number(process.argv[2]), host: '127.0.0.1', staticDir: staticDirDefault(), timing: { offlineAfterMs: 6000 }, discoveryPort: null });

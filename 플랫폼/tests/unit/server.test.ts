@@ -18,7 +18,7 @@ afterEach(async () => {
 
 async function boot(dir = mkdtempSync(join(tmpdir(), 'srv-'))): Promise<{ srv: RunningServer; dir: string; call: Call }> {
   if (!dirs.includes(dir)) dirs.push(dir);
-  const srv = await startServer({ dataDir: dir, port: 0, host: '127.0.0.1', timing: TIMING });
+  const srv = await startServer({ dataDir: dir, port: 0, host: '127.0.0.1', timing: TIMING, discoveryPort: null });
   running.push(srv);
   const call: Call = async (path, body, token) => {
     const res = await fetch(`${srv.url}api/${path}`, {
@@ -180,6 +180,40 @@ describe('server', () => {
     const text = new TextDecoder().decode(bytes);
     expect(text).toContain('"번호","시각","종류","플레이어"');
     expect(text).toContain('"가입","기록","5","5"');
+  });
+});
+
+describe('discovery', () => {
+  it('answers a player PC that asks where the casino is', async () => {
+    const { createSocket } = await import('node:dgram');
+    const dir = mkdtempSync(join(tmpdir(), 'srv-'));
+    dirs.push(dir);
+    const srv = await startServer({ dataDir: dir, port: 0, host: '127.0.0.1', timing: TIMING, discoveryPort: 47_778 });
+    running.push(srv);
+    const sock = createSocket('udp4');
+    const answer = new Promise<{ port: number; from: string }>((done) =>
+      sock.on('message', (m, from) => done({ ...(JSON.parse(m.toString()) as { port: number }), from: from.address })),
+    );
+    sock.send('CASINO?', 47_778, '127.0.0.1');
+    expect(await answer).toEqual({ casino: true, port: srv.port, from: '127.0.0.1' });
+    sock.close();
+  });
+});
+
+describe('player exe discovery', () => {
+  it('finds the server by broadcast and skips networks that refuse', async () => {
+    const { createRequire } = await import('node:module');
+    const { discover, broadcastAddresses } = createRequire(import.meta.url)('../../electron/discover.cjs') as {
+      discover: (ms: number, port: number, targets: string[]) => Promise<string>;
+      broadcastAddresses: () => string[];
+    };
+    const dir = mkdtempSync(join(tmpdir(), 'srv-'));
+    dirs.push(dir);
+    const srv = await startServer({ dataDir: dir, port: 0, host: '127.0.0.1', timing: TIMING, discoveryPort: 47_779 });
+    running.push(srv);
+    expect(broadcastAddresses()).toContain('255.255.255.255');
+    expect(await discover(1500, 47_779, ['0.0.0.1', '127.0.0.1'])).toBe(`http://127.0.0.1:${srv.port}/`);
+    expect(await discover(300, 47_780, ['127.0.0.1'])).toBe(''); // nobody there
   });
 });
 
