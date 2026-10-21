@@ -1,0 +1,10 @@
+{
+  "appId": "com.casion.casinoplayer",
+  "productName": "CasinoPlayer",
+  "directories": { "output": "release" },
+  "electronLanguages": ["ko", "en-US"],
+  "extraMetadata": { "main": "electron/player.cjs" },
+  "files": ["electron/player.cjs", "electron/discover.cjs", "package.json"],
+  "win": { "target": [{ "target": "portable", "arch": ["x64"] }] },
+  "portable": { "artifactName": "CasinoPlayer-${version}-portable.exe" }
+}

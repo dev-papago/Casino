@@ -1,12 +1,16 @@
 // Player app (DESIGN.md section 5): 로그인 / 가입하기, then the lobby with the chip balance always on screen, the
 // games, and the settlement request. Everything comes from the ledger server; the app keeps only its login token.
 // When the server cannot be reached the app says so, keeps trying, and blocks anything that moves chips.
+// A game opens on top of the lobby in a frame from the same server, under a bar that keeps the balance in view;
+// it takes and gives back chips itself (sdk/casino.ts). Whatever way a game stops, its chips come back: the app
+// settles leftovers whenever no game is open, and sends results still waiting in the outbox on every report.
 import './style.css';
 import { PLATFORM, type GameDef } from '../shared/config.ts';
 import type { AuthReply, MeReply, PlayerView } from '../shared/protocol.ts';
 import { chips, clockTime, h, requestKey, setText } from '../ui/dom.ts';
 import { ApiError, api } from '../ui/net.ts';
 import { play, unlockAudio } from '../ui/sound.ts';
+import { flush, settleLeftovers } from '../../sdk/casino.ts';
 
 const TOKEN_KEY = 'casino:v1:token';
 const SERVER_KEY = 'casino:v1:server';
@@ -23,6 +27,7 @@ let events: EventSource | null = null;
 let pingTimer: number | null = null;
 let busy = false; // a chip request is on its way
 let cancelling = false;
+let playing: GameDef | null = null; // the game open on top of the lobby
 
 // ------------------------------------------------------------------ skeleton
 
@@ -181,20 +186,87 @@ function showLobby(first: PlayerView, hello = ''): void {
   );
   render();
   connect();
+  void sweepGames();
   if (hello) toast(hello, 'good');
 }
 
 function gameTile(g: GameDef): HTMLElement {
   return h(
-    'div',
-    { class: `game-tile game-${g.id}`, 'data-testid': `game-${g.id}` },
+    'button',
+    { class: `game-tile game-${g.id}`, type: 'button', 'data-testid': `game-${g.id}`, onclick: () => openGame(g) },
     h('div', { class: 'game-icon' }, g.id === 'yabawi' ? '🥤' : '📈'),
     h('div', { class: 'game-name' }, g.name),
     h('div', { class: 'game-desc' }, g.description),
     h('div', { class: 'game-rate' }, g.perChip === 1 ? '1칩 = 1칩' : `1칩 = ${g.unit}${g.perChip.toLocaleString('en-US')}`),
-    h('div', { class: 'game-soon' }, '연결 준비 중'),
+    h('div', { class: 'game-play' }, '▶ 시작'),
   );
 }
+
+// ------------------------------------------------------------------ games
+
+const gameName = h('span', { class: 'gb-name' });
+const gameBalance = h('span', { class: 'gb-balance', 'data-testid': 'game-balance' });
+const gameConn = h('span', { class: 'conn' });
+const gameLayer = h(
+  'div',
+  { class: 'game-layer', hidden: true, 'data-testid': 'game-layer' },
+  h(
+    'div',
+    { class: 'game-bar' },
+    h('div', { class: 'logo small' }, h('span', { class: 'logo-mark' }, '♠'), '카지노'),
+    gameName,
+    gameConn,
+    gameBalance,
+    h('button', { class: 'btn ghost small', type: 'button', 'data-testid': 'game-leave', onclick: () => leaveGame() }, '로비로'),
+  ),
+);
+root.append(gameLayer);
+
+function openGame(g: GameDef): void {
+  if (!me || playing) return;
+  if (!online) return toast('서버와 연결된 뒤에 시작하세요', 'bad');
+  playing = g;
+  setText(gameName, g.name);
+  gameLayer.querySelector('iframe')?.remove();
+  const speed = new URLSearchParams(location.search).get('speed'); // e2e only: faster 야바위 animations
+  const src = `${base}games/${g.id}/?casino=1${speed ? `&speed=${encodeURIComponent(speed)}` : ''}`;
+  gameLayer.append(h('iframe', { class: 'game-frame', src, title: g.name, 'data-testid': 'game-frame' }));
+  gameLayer.hidden = false;
+  play('click');
+  render();
+}
+
+/** The lobby's own way out (the games have theirs): a game left in the middle is settled at its current value. */
+function leaveGame(): void {
+  if (!playing) return;
+  if (!window.confirm(`${playing.name}을(를) 닫을까요? 진행 중인 게임은 지금 상태로 정산됩니다.`)) return;
+  closeGame();
+}
+
+function closeGame(): void {
+  gameLayer.querySelector('iframe')?.remove();
+  gameLayer.hidden = true;
+  playing = null;
+  void sweepGames();
+}
+
+/** Settles games that stopped without reporting, and sends results waiting in the outbox. */
+async function sweepGames(): Promise<void> {
+  if (!playing) await settleLeftovers();
+  await flush();
+  if (token && me) {
+    try {
+      update((await api<MeReply>(base, 'me', undefined, { token })).me);
+    } catch {
+      // the next report brings it
+    }
+  }
+}
+
+window.addEventListener('message', (e) => {
+  if (e.origin !== location.origin || (e.data as { type?: string } | null)?.type !== 'casino:exit') return;
+  closeGame();
+});
 
 function render(): void {
   if (!me) return;
@@ -206,6 +278,10 @@ function render(): void {
   setText(breakdownEl, parts.join(' · '));
   setText(connEl, online ? '● 서버 연결됨' : '○ 연결 끊김');
   connEl.classList.toggle('off', !online);
+  setText(gameConn, online ? '● 연결됨' : '○ 연결 끊김');
+  gameConn.classList.toggle('off', !online);
+  setText(gameBalance, `내 잔고 ${chips(me.total)}${me.inGame ? ` · 게임 중 ${me.inGame}` : ''}`);
+  for (const b of gamesEl.querySelectorAll('button')) b.disabled = !online;
   banner.hidden = online;
 
   noticeEl.hidden = !me.bankrupt;
@@ -341,6 +417,7 @@ async function ping(): Promise<void> {
     const r = await api<MeReply>(base, 'ping', {}, { token });
     setOnline(true);
     update(r.me);
+    void flush(); // results that waited for the server
   } catch (err) {
     if (err instanceof ApiError && err.code === 'session') endSession('다시 로그인하세요');
     else setOnline(false);
@@ -364,14 +441,16 @@ function stopSession(clearToken = true): void {
   }
 }
 
-/** The server ended this login (another PC logged in, the account was deleted, ...). */
+/** The server ended this login (another PC logged in, the account was deleted, ...). A game left open is settled. */
 function endSession(reason: string): void {
   token = '';
   remove(TOKEN_KEY);
+  if (playing) closeGame();
   showLogin(reason);
 }
 
 async function doLogout(): Promise<void> {
+  if (playing) closeGame();
   const t = token;
   token = '';
   remove(TOKEN_KEY);

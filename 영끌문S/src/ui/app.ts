@@ -1,3 +1,8 @@
+// 카지노 플랫폼 (DESIGN.md section 7): opened by the player app with ?casino, the game takes chips from the
+// player's ledger balance instead of starting from the fixed deposit: N chips become N × $1,000 (leverage opens at
+// twice that), and 정산 gives back the final equity in chips by the same rule as the result card. Every tick the
+// game tells the ledger bridge what it would pay out now, so a reload or a closed window settles at that value.
+//
 // Screen layout and game flow (DESIGN.md sections 1 and 5): stock tabs on the left (easiest first), the chart
 // in the middle, account and orders (매수 · 인버스 · 매도) on the right. The market never closes and never pauses
 // while a game runs (not even behind the 정산 dialog); every tick moves all stocks, then liquidates positions
@@ -27,6 +32,7 @@ import { between, cryptoRng } from '../rng.ts';
 import { CandleChart, type ChartLine } from './chart.ts';
 import { button, h } from './dom.ts';
 import { clock, num, pct, qty, signedUsd, tone, usd } from './format.ts';
+import * as casino from '../../../플랫폼/sdk/casino.ts';
 
 export type Screen = 'title' | 'trade' | 'confirm' | 'result';
 type Side = 'buy' | 'inverse' | 'sell';
@@ -55,7 +61,12 @@ const FLOAT_MIN_X = 180; // px: room for a floating "+$123.45" left of the newes
 const stars = (n: number): string => `${'★'.repeat(n)}${'☆'.repeat(5 - n)}`;
 
 export function mountApp(root: HTMLElement): void {
-  const econ = CONFIG.economy;
+  const CASINO = casino.inCasino();
+  let econ = CONFIG.economy; // the casino sets the deposit (and the leverage line) from the chips brought in
+  let ticket: casino.CasinoSession | null = null; // the ledger's game session for this game
+  let wallet: casino.CasinoPlayer | null = null; // the player's balance, read on the title screen
+  let stake = 1; // chips to bring
+  let cashout: 'sent' | 'queued' | 'sending' | null = null;
   const T = CONFIG.timing;
   const rng = cryptoRng();
   const sfx = new Sfx(loadMuted());
@@ -376,7 +387,7 @@ export function mountApp(root: HTMLElement): void {
   function applyTrade(r: TradeResult, st: Stock): void {
     if (!r.ok) {
       sfx.play('error');
-      toast(TRADE_ERROR_TEXT[r.error], 'warn');
+      toast(errorText(r.error), 'warn');
       return;
     }
     account = r.account;
@@ -447,23 +458,84 @@ export function mountApp(root: HTMLElement): void {
     setScreen('confirm');
   }
 
+  const errorText = (e: keyof typeof TRADE_ERROR_TEXT): string =>
+    e === 'locked' ? `레버리지는 평가 자산 ${usd(econ.leverageFrom, 0)}부터 쓸 수 있습니다` : TRADE_ERROR_TEXT[e];
+
+  /** The account with everything held sold at the current prices: what 정산 would leave. */
+  function soldOut(): Account {
+    let a = account;
+    for (const id of Object.keys(a.positions)) {
+      const r = sell(a, id, market.get(id).price, 1, econ);
+      if (r.ok) a = r.account;
+    }
+    return a;
+  }
+
   /** Sells everything at the current prices and shows the result. */
   function finish(reason: EndReason): void {
     if (screen !== 'trade' && screen !== 'confirm') return;
     pending = []; // orders still waiting are dropped; everything held is sold below
-    for (const id of Object.keys(account.positions)) {
-      const r = sell(account, id, market.get(id).price, 1, econ);
-      if (r.ok) account = r.account;
-    }
+    account = soldOut();
     ending = { reason, account };
+    if (CASINO && ticket) {
+      const t = ticket;
+      ticket = null;
+      cashout = 'sending';
+      void casino.close(t, chips(account.cash)).then((how) => {
+        cashout = how;
+        if (screen === 'result') renderOverlay();
+      });
+    }
     sfx.play(reason === 'broke' ? 'liquidate' : 'end');
     setScreen('result');
     renderClock(); // stops at the time the game ended
   }
 
+  /** 게임 시작 in the casino: brings `stake` chips in from the ledger first. */
+  async function startCasino(): Promise<void> {
+    if (screen !== 'title' || !wallet || cashout === 'sending') return;
+    const n = stake;
+    cashout = 'sending'; // blocks a second click while the chips come in
+    renderOverlay();
+    try {
+      ticket = await casino.open('yeongkkeul', n, wallet.id);
+    } catch (e) {
+      cashout = null;
+      wallet = null;
+      void loadWallet(e instanceof casino.CasinoError ? e.message : '칩을 가져오지 못했습니다');
+      return;
+    }
+    cashout = null;
+    const deposit = n * CONFIG.economy.chipValue;
+    econ = { ...CONFIG.economy, deposit, leverageFrom: 2 * deposit };
+    startGame();
+  }
+
+  let walletNote = '';
+  /** Reads the player's balance for the title screen. */
+  async function loadWallet(note = ''): Promise<void> {
+    walletNote = note || '잔고를 확인하는 중…';
+    renderOverlay();
+    try {
+      wallet = await casino.player();
+      walletNote = note;
+    } catch (e) {
+      wallet = null;
+      walletNote = e instanceof casino.CasinoError && e.code === 'session' ? '로그인이 끝났습니다. 로비에서 다시 로그인하세요' : '서버에 연결할 수 없습니다';
+    }
+    stake = Math.max(1, Math.min(stake, maxStake()));
+    if (screen === 'title') renderOverlay();
+  }
+  const maxStake = (): number => Math.min(wallet?.free ?? 0, CONFIG.economy.maxChips - 1);
+
   /** Back to the title with a fresh, still market (the next game starts from it). */
   function backToTitle(): void {
     sfx.play('click');
+    if (CASINO) {
+      econ = CONFIG.economy;
+      cashout = null;
+      void loadWallet();
+    }
     market = new Market(rng);
     extremes = freshExtremes(market);
     prevPrices = market.prices();
@@ -479,6 +551,37 @@ export function mountApp(root: HTMLElement): void {
     render();
   }
 
+  /** Title screen in the casino: how many chips to bring, then start. */
+  function casinoStart(): HTMLElement[] {
+    const max = maxStake();
+    const n = h('b', { class: 'stake-n', 'data-testid': 'stake-n' }, `${stake}칩`);
+    const dollars = h('span', { class: 'stake-usd' }, `= ${usd(stake * CONFIG.economy.chipValue, 0)}`);
+    const step = (d: number): void => {
+      stake = Math.max(1, Math.min(max, stake + d));
+      renderOverlay();
+    };
+    const start = button('게임 시작', () => void startCasino(), { kind: 'primary', key: 'Enter', testid: 'start' });
+    start.disabled = !wallet || max < 1 || cashout === 'sending';
+    return [
+      h(
+        'div',
+        { class: 'stake-row' },
+        h('span', {}, '가져갈 칩'),
+        button('−', () => step(-1), { kind: 'ghost', testid: 'stake-minus' }),
+        n,
+        button('+', () => step(1), { kind: 'ghost', testid: 'stake-plus' }),
+        button('전부', () => step(Infinity), { kind: 'ghost', testid: 'stake-max' }),
+        dollars,
+      ),
+      h(
+        'p',
+        { class: 'note', 'data-testid': 'wallet' },
+        walletNote || (wallet ? (max < 1 ? '사용할 수 있는 칩이 없습니다' : `내 잔고에서 사용 가능한 칩 ${wallet.free}개 · 한 번에 최대 ${max}개`) : ''),
+      ),
+      h('div', { class: 'btn-row' }, start, button('로비로', () => casino.exit(), { kind: 'ghost', testid: 'to-lobby' })),
+    ];
+  }
+
   function renderOverlay(): void {
     overlay.hidden = screen === 'trade';
     if (screen === 'title') {
@@ -491,14 +594,16 @@ export function mountApp(root: HTMLElement): void {
           h(
             'ul',
             { class: 'rules' },
-            h('li', {}, `기본예탁금 `, h('b', {}, usd(econ.deposit, 0)), '으로 시작합니다'),
+            CASINO
+              ? h('li', {}, '가져온 칩을 ', h('b', {}, `1칩 = ${usd(econ.chipValue, 0)}`), '로 바꿔 시작합니다')
+              : h('li', {}, `기본예탁금 `, h('b', {}, usd(econ.deposit, 0)), '으로 시작합니다'),
             h('li', {}, '좌측 종목을 골라 차트를 보고 우측에서 매수 / 매도'),
             h('li', {}, h('b', {}, '인버스'), '는 가격이 내리면 이익, 오르면 손실'),
             h(
               'li',
               {},
               `평가 자산 `,
-              h('b', {}, usd(econ.leverageFrom, 0)),
+              h('b', {}, CASINO ? '시작 예탁금의 2배' : usd(econ.leverageFrom, 0)),
               `부터 레버리지 최대 `,
               h('b', {}, `${Math.max(...econ.leverages)}배`),
               ' — 청산가에 닿으면 증거금 전액 손실',
@@ -507,7 +612,7 @@ export function mountApp(root: HTMLElement): void {
             h('li', {}, h('b', {}, '장 마감 없음'), ' — 원할 때 정산하기를 눌러 끝냅니다'),
             h('li', {}, '평가 자산이 ', h('b', {}, usd(econ.autoSettleAt, 0)), `(${chips(econ.autoSettleAt)}칩)을 넘으면 자동 정산 · ${usd(econ.chipValue, 0)} = 1칩, 최대 ${econ.maxChips}칩`),
           ),
-          button('게임 시작', () => startGame(), { kind: 'primary', key: 'Enter', testid: 'start' }),
+          ...(CASINO ? casinoStart() : [button('게임 시작', () => startGame(), { kind: 'primary', key: 'Enter', testid: 'start' })]),
         ),
       );
     } else if (screen === 'confirm') {
@@ -555,9 +660,27 @@ export function mountApp(root: HTMLElement): void {
             h('dt', {}, '낸 수수료'),
             h('dd', {}, usd(a.fees)),
           ),
-          button('처음으로', () => {
-            backToTitle();
-          }, { kind: 'primary', key: 'Enter', testid: 'restart' }),
+          ...(CASINO
+            ? [
+                h(
+                  'div',
+                  { class: `cashout ${cashout ?? ''}`, 'data-testid': 'cashout' },
+                  cashout === 'sent'
+                    ? `${chips(total)}칩이 내 잔고로 들어갔습니다`
+                    : cashout === 'queued'
+                      ? `${chips(total)}칩 · 서버와 다시 연결되면 잔고에 들어갑니다`
+                      : `${chips(total)}칩을 잔고로 보내는 중…`,
+                ),
+              ]
+            : []),
+          h(
+            'div',
+            { class: 'btn-row' },
+            button('처음으로', () => {
+              backToTitle();
+            }, { kind: 'primary', key: 'Enter', testid: 'restart' }),
+            CASINO ? button('로비로', () => casino.exit(), { kind: 'ghost', testid: 'to-lobby' }) : null,
+          ),
         ),
       );
     } else {
@@ -639,6 +762,7 @@ export function mountApp(root: HTMLElement): void {
     });
     levNote.hidden = !pos;
     levLockNote.hidden = !locked;
+    setText(levLockNote, `평가 자산 ${usd(econ.leverageFrom, 0)}부터 레버리지 사용 가능`);
     if (document.activeElement !== amountInput && amountInput.value !== (amount ? String(amount) : '')) {
       amountInput.value = amount ? String(amount) : '';
     }
@@ -654,7 +778,7 @@ export function mountApp(root: HTMLElement): void {
       pos && pos.inverse !== inverse
         ? TRADE_ERROR_TEXT.side
         : L > 1 && locked
-        ? TRADE_ERROR_TEXT.locked
+        ? errorText('locked')
         : amount < econ.minOrder
           ? `최소 주문 ${usd(econ.minOrder, 0)}`
           : amount + fee > account.cash + 1e-9
@@ -795,7 +919,10 @@ export function mountApp(root: HTMLElement): void {
     if (e.target instanceof HTMLInputElement) return;
     if (e.key === 'Enter' && (screen === 'title' || screen === 'result')) {
       e.preventDefault();
-      if (screen === 'title') startGame();
+      if (screen === 'title') {
+        if (CASINO) void startCasino();
+        else startGame();
+      }
       else backToTitle();
     } else if (e.key === 'Escape' && screen === 'confirm') {
       setScreen('trade');
@@ -822,6 +949,7 @@ export function mountApp(root: HTMLElement): void {
       if (st.price < e.lo) e.lo = st.price;
     }
     if (screen === 'trade' || screen === 'confirm') {
+      if (ticket) casino.live(ticket, chips(soldOut().cash)); // a reload or a closed window settles at this
       const r = liquidate(account, prices, econ);
       if (r.fills.length) {
         account = r.account;
@@ -872,6 +1000,10 @@ export function mountApp(root: HTMLElement): void {
   setAmount(DEFAULT_AMOUNT);
   setScreen('title');
   requestAnimationFrame(frame);
+  if (CASINO) {
+    // A 영끌문S that stopped without 정산 is settled at its last value before a new one starts.
+    void casino.settleLeftovers('yeongkkeul').then(() => loadWallet());
+  }
 }
 
 // ------------------------------------------------------------ helpers

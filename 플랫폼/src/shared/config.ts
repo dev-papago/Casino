@@ -18,6 +18,7 @@ export interface GameDef {
 
 export const PLATFORM = {
   port: 7777,
+  discoveryPort: 7778, // UDP: player PCs ask "where is the casino?" on the Wi-Fi and the server answers
   signupBonus: 5, // chips a new account starts with
   pinDigits: 4,
   nameMax: 12,

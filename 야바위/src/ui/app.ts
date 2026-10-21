@@ -1,5 +1,11 @@
 // Screens and the round flow (DESIGN.md sections 1, 3, 7, 8). UI phases live in memory;
 // the session and stats are saved at start, at pick (before the reveal), at 정산 and at 지급 완료.
+//
+// 카지노 플랫폼 (DESIGN.md section 11): opened by the player app with ?casino, the chips come from the ledger
+// instead of the staff. 칩 걸고 시작 takes the stake from the player's balance, 칩 받기 gives the stack back, and
+// nothing is saved here: after every change the game tells the ledger bridge what the player would get back if it
+// stopped now. During a round that is the stack minus the bet, so a reload or a closed window mid-round loses the
+// bet instead of undoing the round; the player app settles whatever is left at that value.
 import { Sfx } from '../audio';
 import { CONFIG, LEVEL_IDS, PAID_LEVELS, saveSettings, sessionEconomy, type LevelId, type Settings } from '../config';
 import { cappedByPayout, maxBetFor, quit, resumePhase, sessionNet, settleRound, startSession, winAmount, type Session } from '../game/session';
@@ -10,9 +16,10 @@ import { adminPanel, pinPanel } from './admin';
 import { DEFS_SVG, SOUND_OFF_SVG, SOUND_ON_SVG } from './art';
 import { CupsView } from './cups';
 import { button, fromHtml, h, signed, sleep } from './dom';
-import { END_TEXT, chipDelayMs, chipIcon, confirmCard, settlementCard } from './panels';
+import { END_TEXT, chipDelayMs, chipIcon, confirmCard, settlementCard, stakeCard } from './panels';
+import * as casino from '../../../플랫폼/sdk/casino';
 
-export type Screen = 'idle' | 'confirm' | 'pin' | 'admin' | 'game' | 'settlement';
+export type Screen = 'idle' | 'confirm' | 'stake' | 'pin' | 'admin' | 'game' | 'settlement';
 export type Phase = 'ready' | 'showBall' | 'shuffling' | 'picking' | 'reveal' | 'result';
 type Mode = 'paid' | 'practice';
 
@@ -37,8 +44,11 @@ export function parseSpeed(search: string): number {
 }
 
 export function mountApp(root: HTMLElement, boot: Boot): void {
+  const CASINO = casino.inCasino();
   let settings = boot.settings;
-  let state = boot.state;
+  // In the casino the ledger keeps the chips: the booth's saved session and stats are not used.
+  let state = CASINO ? { session: null, stats: emptyStats() } : boot.state;
+  let ticket: casino.CasinoSession | null = null; // the ledger's game session for the chips on the table
   const speed = boot.speed;
   const T = CONFIG.timing;
   const rng = cryptoRng();
@@ -94,7 +104,7 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
   title.addEventListener('click', () => {
     const now = performance.now();
     titleClicks = now - titleClicks.at < TITLE_GAP_MS ? { n: titleClicks.n + 1, at: now } : { n: 1, at: now };
-    if (titleClicks.n < TITLE_CLICKS) return;
+    if (titleClicks.n < TITLE_CLICKS || CASINO) return; // no booth admin screen in the casino
     titleClicks = { n: 0, at: 0 };
     if (screen === 'idle') showPin();
   });
@@ -106,7 +116,7 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     if (space || e.key === 'Enter') e.preventDefault();
     if (e.repeat) return;
     if (e.code === 'KeyM') return toggleMute();
-    if (e.key === 'Escape' && (screen === 'confirm' || screen === 'pin' || screen === 'admin')) return showIdle();
+    if (e.key === 'Escape' && (screen === 'confirm' || screen === 'stake' || screen === 'pin' || screen === 'admin')) return showIdle();
     if (screen !== 'game') return;
     const digit = '123'.indexOf(e.key);
     if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') return void (e.preventDefault(), stepLevel(e.key === 'ArrowLeft' ? -1 : 1));
@@ -136,7 +146,8 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
 
   function persist(next: SavedState): void {
     state = next;
-    saveState(state);
+    if (!CASINO) saveState(state);
+    else if (ticket && state.session && !state.session.ended) casino.live(ticket, state.session.stack);
   }
 
   function renderMute(): void {
@@ -173,10 +184,60 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
       h('div', { class: 'msg-sub' }, `${OVERLAP_NOTE} · 정산할 때까지 계속 · 연습은 무료`),
     );
     controls.replaceChildren(
-      button('새 손님', showConfirm, { kind: 'primary', testid: 'new-guest' }),
+      CASINO
+        ? button('칩 걸고 시작', () => void showStake(), { kind: 'primary', testid: 'new-guest' })
+        : button('새 손님', showConfirm, { kind: 'primary', testid: 'new-guest' }),
       button('연습하기 (무료)', () => enterGame('practice'), { testid: 'practice' }),
+      ...(CASINO ? [button('로비로', () => casino.exit(), { kind: 'ghost', testid: 'to-lobby' })] : []),
     );
+    if (CASINO) status.firstElementChild?.replaceChildren(chipIcon(), '내 잔고의 칩으로 시작');
     void demo(++demoToken);
+  }
+
+  /** 칩 걸고 시작 (casino): how many chips to bring from the player's balance. */
+  async function showStake(): Promise<void> {
+    if (screen !== 'idle') return;
+    setScreen('stake');
+    overlay.replaceChildren(h('div', { class: 'card confirm' }, h('p', { class: 'lead' }, '잔고를 확인하는 중…')));
+    let me: casino.CasinoPlayer;
+    try {
+      me = await casino.player();
+    } catch (e) {
+      overlay.replaceChildren(casinoError(e instanceof casino.CasinoError && e.code === 'session' ? '로그인이 끝났습니다. 로비에서 다시 로그인하세요' : '서버에 연결할 수 없습니다'));
+      return;
+    }
+    if ((screen as Screen) !== 'stake') return; // closed while waiting
+    const max = Math.min(me.free, CONFIG.economy.autoSettleAt - 1);
+    if (max < 1) return void overlay.replaceChildren(casinoError('사용할 수 있는 칩이 없습니다'));
+    overlay.replaceChildren(
+      stakeCard(me.free, max, (stake) => void startCasino(me.id, stake), showIdle),
+    );
+  }
+
+  async function startCasino(playerId: string, stake: number): Promise<void> {
+    try {
+      ticket = await casino.open('yabawi', stake, playerId);
+    } catch (e) {
+      overlay.replaceChildren(casinoError(e instanceof casino.CasinoError ? e.message : '칩을 가져오지 못했습니다'));
+      return;
+    }
+    if (screen !== 'stake') {
+      // Left the card while the chips were on their way: give them straight back.
+      void casino.close(ticket, stake);
+      ticket = null;
+      return;
+    }
+    persist({ ...state, session: startSession({ ...sessionEconomy(settings), buyIn: stake }, Date.now()) });
+    enterGame('paid');
+  }
+
+  function casinoError(text: string): HTMLElement {
+    return h(
+      'div',
+      { class: 'card confirm', 'data-testid': 'casino-error' },
+      h('p', { class: 'lead' }, text),
+      h('div', { class: 'row' }, button('확인', showIdle, { kind: 'primary' })),
+    );
   }
 
   async function demo(token: number): Promise<void> {
@@ -258,6 +319,8 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     const token = ++roundToken;
     const p = generatePlan(mode === 'paid' ? paidLevel : level, CONFIG, rng);
     plan = p;
+    // From here the bet is on the table: stopping before the pick loses it.
+    if (CASINO && mode === 'paid' && ticket && s) casino.live(ticket, s.stack - bet);
     // Show the ball under cup `start`, then lower the cup; the ball leaves the DOM before the shuffle.
     cups.reset();
     cups.show(p, 0);
@@ -561,19 +624,40 @@ export function mountApp(root: HTMLElement, boot: Boot): void {
     root.dataset.phase = '';
     cups.setPickable(false);
     controls.replaceChildren();
-    overlay.replaceChildren(settlementCard({ ...s, ended: s.ended }, payout, MAX_PILE));
+    overlay.replaceChildren(settlementCard({ ...s, ended: s.ended }, payout, MAX_PILE, CASINO));
+    if (CASINO && ticket) casino.live(ticket, s.stack);
     for (let i = 0; i < Math.min(s.stack, MAX_PILE); i++) sfx.play('tick', ms(chipDelayMs(i)));
   }
 
   function payout(): void {
     const s = session();
     if (screen !== 'settlement' || !s?.ended) return;
+    if (CASINO && ticket) {
+      const t = ticket;
+      ticket = null;
+      const back = overlay.querySelector<HTMLButtonElement>('[data-testid="paid-out"]');
+      if (back) back.disabled = true;
+      void casino.close(t, s.stack).then((how) => {
+        persist({ session: null, stats: recordPayout(state.stats, s) });
+        showIdle();
+        message.replaceChildren(
+          h('div', { class: 'msg-main win', 'data-testid': 'casino-done' }, how === 'sent' ? `${s.stack}칩이 내 잔고로 들어갔어요` : `${s.stack}칩 정산을 보내는 중이에요`),
+          h('div', { class: 'msg-sub' }, how === 'sent' ? '다시 하려면 [칩 걸고 시작]' : '서버와 다시 연결되면 자동으로 잔고에 들어갑니다'),
+        );
+      });
+      return;
+    }
     persist({ session: null, stats: recordPayout(state.stats, s) });
     showIdle();
   }
 
   // ------------------------------------------------------------ boot (refresh rule, section 3)
   renderMute();
+  if (CASINO) {
+    showIdle();
+    void casino.settleLeftovers('yabawi'); // a 야바위 that stopped without 칩 받기 (reload, window closed)
+    return;
+  }
   const resume = resumePhase(state.session);
   if (resume === 'settlement') showSettlement();
   else if (resume === 'ready') enterGame('paid');
