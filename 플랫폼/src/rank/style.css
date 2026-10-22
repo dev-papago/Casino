@@ -1,0 +1,213 @@
+:root {
+  --bg: #08060f;
+  --ink: #f6f0ff;
+  --dim: #a89bc4;
+  --gold: #ffcf4a;
+  --panel: rgba(28, 18, 48, 0.85);
+  --line: rgba(255, 200, 120, 0.18);
+  color-scheme: dark;
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: radial-gradient(circle at 50% -10%, #3a1f63, var(--bg) 60%) fixed;
+  color: var(--ink);
+  font-family: 'Pretendard', 'Malgun Gothic', 'Apple SD Gothic Neo', system-ui, sans-serif;
+}
+#app {
+  max-width: 1400px;
+  margin: 0 auto;
+  padding: 2vh 3vw 4vh;
+  display: flex;
+  flex-direction: column;
+  gap: 2.4vh;
+}
+.rk-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+}
+.rk-head h1 {
+  margin: 0;
+  font-size: clamp(28px, 4vw, 60px);
+  font-weight: 900;
+  color: var(--gold);
+  text-shadow: 0 0 30px rgba(255, 207, 74, 0.35);
+}
+.rk-spade {
+  color: #b46bff;
+}
+.rk-clock {
+  font-size: clamp(18px, 2vw, 32px);
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.rk-stats {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1.2vw;
+}
+.rk-tile {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 1.4vh 1.2vw;
+}
+.rk-tile-label {
+  color: var(--dim);
+  font-size: clamp(13px, 1.1vw, 18px);
+}
+.rk-tile-value {
+  font-size: clamp(22px, 2.4vw, 40px);
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+.rk-podium {
+  display: grid;
+  grid-template-columns: 1fr 1.15fr 1fr;
+  align-items: end;
+  gap: 1.5vw;
+  min-height: 34vh;
+}
+.rk-step {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6vh;
+  text-align: center;
+  border-radius: 16px;
+}
+.rk-medal {
+  font-size: clamp(36px, 4.5vw, 72px);
+  filter: drop-shadow(0 6px 12px rgba(0, 0, 0, 0.5));
+}
+.rk-step .rk-name {
+  font-size: clamp(20px, 2.4vw, 42px);
+  font-weight: 900;
+}
+.rk-step .rk-total {
+  font-size: clamp(22px, 2.8vw, 48px);
+  font-weight: 900;
+  color: var(--gold);
+  font-variant-numeric: tabular-nums;
+}
+.rk-sub {
+  color: var(--dim);
+  font-size: clamp(12px, 1vw, 16px);
+}
+.rk-block {
+  width: 100%;
+  border-radius: 16px 16px 4px 4px;
+  font-size: clamp(30px, 4vw, 64px);
+  font-weight: 900;
+  color: rgba(0, 0, 0, 0.35);
+  display: grid;
+  place-items: center;
+}
+.p1 .rk-block {
+  height: 18vh;
+  background: linear-gradient(180deg, #ffe08a, #d79b14);
+  box-shadow: 0 0 50px rgba(255, 207, 74, 0.45);
+}
+.p2 .rk-block {
+  height: 13vh;
+  background: linear-gradient(180deg, #f4f7fb, #9aa7b8);
+}
+.p3 .rk-block {
+  height: 9vh;
+  background: linear-gradient(180deg, #f2b98a, #a8622e);
+}
+.p1 .rk-name {
+  text-shadow: 0 0 24px rgba(255, 207, 74, 0.6);
+}
+.rk-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0.8vh 1.5vw;
+}
+.rk-row {
+  display: grid;
+  grid-template-columns: 3em 1fr auto auto;
+  gap: 1vw;
+  align-items: center;
+  padding: 1vh 1.2vw;
+  border-radius: 14px;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  font-size: clamp(16px, 1.5vw, 26px);
+}
+.rk-pos {
+  color: var(--dim);
+  font-weight: 900;
+}
+.rk-row .rk-name {
+  font-weight: 800;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rk-played {
+  color: var(--dim);
+  font-size: 0.75em;
+}
+.rk-row .rk-total {
+  font-weight: 900;
+  color: var(--gold);
+  font-variant-numeric: tabular-nums;
+}
+.rk-dot {
+  display: inline-block;
+  width: 0.45em;
+  height: 0.45em;
+  border-radius: 50%;
+  background: #3dff8f;
+  box-shadow: 0 0 8px #3dff8f;
+  margin-left: 0.4em;
+  vertical-align: middle;
+}
+.up {
+  animation: rk-up 1.4s ease-out;
+}
+.new {
+  animation: rk-new 1.4s ease-out;
+}
+@keyframes rk-up {
+  0% {
+    background-color: rgba(61, 255, 143, 0.35);
+    transform: translateY(8px);
+  }
+}
+@keyframes rk-new {
+  0% {
+    background-color: rgba(255, 207, 74, 0.35);
+    transform: scale(0.96);
+  }
+}
+.rk-empty {
+  grid-column: 1 / -1;
+  text-align: center;
+  color: var(--dim);
+  font-size: 28px;
+  align-self: center;
+}
+.rk-status {
+  text-align: center;
+  color: var(--dim);
+}
+.rk-status.off {
+  color: #ff6b6b;
+}
+@media (max-width: 800px) {
+  .rk-stats {
+    grid-template-columns: 1fr 1fr;
+  }
+  .rk-list {
+    grid-template-columns: 1fr;
+  }
+}

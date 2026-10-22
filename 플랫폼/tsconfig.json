@@ -9,6 +9,7 @@
     "module": "ESNext",
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
     "erasableSyntaxOnly": true,
     "isolatedModules": true,
     "verbatimModuleSyntax": true,
@@ -26,6 +27,10 @@
   "include": [
     "src",
     "sdk",
+    "games/arcade",
+    "games/plinko",
+    "games/slot",
+    "games/yacht",
     "tests",
     "scripts",
     "vite.config.ts",

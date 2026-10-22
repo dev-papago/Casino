@@ -1,6 +1,7 @@
 // The games inside the platform: chips go from the ledger into 야바위 and 영끌문S and back, and no way of
 // stopping a game (a reload mid-round, the lobby closing it, a dropped Wi-Fi at the end) loses or makes chips.
 import { expect, test, type APIRequestContext, type Frame, type Page } from '@playwright/test';
+import { earnChips, signUp as register } from './helpers.ts';
 
 interface Ledger {
   players: { name: string; total: number; free: number; inGame: number }[];
@@ -12,13 +13,8 @@ const ledger = async (request: APIRequestContext, name: string) => {
 };
 
 async function signUp(page: Page, name: string): Promise<void> {
-  await page.goto('/?speed=20');
-  await page.getByTestId('tab-signup').click();
-  await page.getByTestId('name').fill(name);
-  await page.getByTestId('pin').fill('1234');
-  await page.getByTestId('pin2').fill('1234');
-  await page.getByTestId('submit').click();
-  await expect(page.getByTestId('balance')).toHaveText('5칩');
+  await register(page, name, '1234', '/?speed=20');
+  await earnChips(page);
 }
 
 async function gameFrame(page: Page, id: string): Promise<Frame> {
@@ -87,27 +83,33 @@ test('영끌문S turns chips into dollars and back; closing it from the lobby se
   await f.getByTestId('stake-plus').click(); // 1 → 2
   await expect(f.getByTestId('stake-n')).toHaveText('2칩');
   await f.getByTestId('start').click();
-  await expect(f.getByTestId('equity')).toHaveText('$2,000.00');
+  await expect(f.getByTestId('equity')).toHaveText('$2,000.00'); // 1 chip = $1,000, no entry fee
   await expect(page.getByTestId('game-balance')).toContainText('게임 중 2');
   // Leverage opens at twice the deposit brought in.
   await expect(f.getByTestId('lev-lock')).toContainText('$4,000');
 
-  // 정산 with nothing bought: $2,000 → 2 chips back.
+  // 정산 with nothing bought: the same 2 chips back (no bonus without a position).
+  await page.waitForTimeout(1500);
+  await expect(f.getByTestId('equity')).toHaveText('$2,000.00');
   await f.getByTestId('settle').click();
   await f.getByTestId('confirm-settle').click();
   await expect(f.getByTestId('cashout')).toHaveText('2칩이 내 잔고로 들어갔습니다');
-  await expect.poll(async () => (await ledger(request, '트레이더')).p).toMatchObject({ total: 5, inGame: 0 });
+  const back = 2;
+  await expect.poll(async () => (await ledger(request, '트레이더')).p).toMatchObject({ total: 3 + back, inGame: 0 });
   await f.getByTestId('to-lobby').click();
   await expect(page.getByTestId('game-layer')).toBeHidden();
 
   // Left in the middle from the lobby: settled at what the game was worth.
   f = await gameFrame(page, 'yeongkkeul');
-  await expect(f.getByTestId('wallet')).toContainText('사용 가능한 칩 5개');
+  await expect(f.getByTestId('wallet')).toContainText(`사용 가능한 칩 ${3 + back}개`);
   await f.getByTestId('start').click();
   await expect(f.getByTestId('equity')).toHaveText('$1,000.00');
   page.once('dialog', (d) => void d.accept());
   await page.getByTestId('game-leave').click();
-  await expect.poll(async () => await ledger(request, '트레이더')).toMatchObject({ open: 0, p: { total: 5, inGame: 0 } });
+  await expect.poll(async () => (await ledger(request, '트레이더')).open).toBe(0);
+  const left = (await ledger(request, '트레이더')).p; // $1,000: the chip back
+  expect(left.inGame).toBe(0);
+  expect(left.total).toBe(3 + back);
 });
 
 test('a result sent while the Wi-Fi is down arrives when it is back', async ({ page, request, context }) => {

@@ -7,7 +7,15 @@ import { afterEach, describe, expect, it } from 'vitest';
 import type { AdminState, AuthReply, GameOpenReply, LogRecord, MeReply, PlayerView } from '../../src/shared/protocol.ts';
 import { startServer, type RunningServer } from '../../src/server/server.ts';
 
-const TIMING = { offlineAfterMs: 400, sweepMs: 40, activitySaveMs: 60_000, adminThrottleMs: 10, keepAliveMs: 60_000, loginLockMs: 300 };
+const TIMING = {
+  offlineAfterMs: 400,
+  sweepMs: 40,
+  activitySaveMs: 60_000,
+  adminThrottleMs: 10,
+  keepAliveMs: 60_000,
+  loginLockMs: 300,
+  deathStageMinMs: [0, 0, 0, 0, 0], // the 데스 게임 can be "played" at once
+};
 const running: RunningServer[] = [];
 const dirs: string[] = [];
 
@@ -16,9 +24,9 @@ afterEach(async () => {
   for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true });
 });
 
-async function boot(dir = mkdtempSync(join(tmpdir(), 'srv-'))): Promise<{ srv: RunningServer; dir: string; call: Call }> {
+async function boot(dir = mkdtempSync(join(tmpdir(), 'srv-')), timing: Partial<typeof TIMING> = {}): Promise<{ srv: RunningServer; dir: string; call: Call }> {
   if (!dirs.includes(dir)) dirs.push(dir);
-  const srv = await startServer({ dataDir: dir, port: 0, host: '127.0.0.1', timing: TIMING, discoveryPort: null });
+  const srv = await startServer({ dataDir: dir, port: 0, host: '127.0.0.1', timing: { ...TIMING, ...timing } });
   running.push(srv);
   const call: Call = async (path, body, token) => {
     const res = await fetch(`${srv.url}api/${path}`, {
@@ -31,6 +39,20 @@ async function boot(dir = mkdtempSync(join(tmpdir(), 'srv-'))): Promise<{ srv: R
   return { srv, dir, call };
 }
 type Call = (path: string, body?: unknown, token?: string) => Promise<{ status: number; data: any }>;
+
+/** Plays the 데스 게임 through to its reward (every stage at once: TIMING allows it). */
+async function clearDeath(call: Call, token: string): Promise<{ status: number; data: any }> {
+  const { run } = (await call('death/start', {}, token)).data as { run: string };
+  for (let stage = 1; stage <= 5; stage++) await call('death/stage', { run, stage }, token);
+  return call('death/clear', { run, key: `death-${run}` }, token);
+}
+
+/** A new player with the 데스 게임's chips to play with. */
+async function newPlayer(call: Call, body: { name: string; pin: string; key?: string }): Promise<AuthReply> {
+  const auth = (await call('signup', body)).data as AuthReply;
+  const done = await clearDeath(call, auth.token);
+  return { token: auth.token, me: (done.data as MeReply).me };
+}
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
 async function until<T>(f: () => T | undefined | false, ms = 3000): Promise<T> {
@@ -79,8 +101,8 @@ describe('server', () => {
     const s = await call('signup', { name: '철수', pin: '1234', key: 'signup-key-1' });
     expect(s.status).toBe(200);
     const auth = s.data as AuthReply;
-    expect(auth.me).toMatchObject({ name: '철수', total: 5, free: 5, held: 0, inGame: 0, bankrupt: false });
-    expect((await call('me', undefined, auth.token)).data.me.total).toBe(5);
+    expect(auth.me).toMatchObject({ name: '철수', total: 0, free: 0, held: 0, inGame: 0, deathGame: true, messages: [] });
+    expect((await call('me', undefined, auth.token)).data.me.total).toBe(0);
     expect((await call('signup', { name: '철수', pin: '1111' })).data.error).toBe('name_taken');
     for (let i = 0; i < 5; i++) expect((await call('login', { name: '철수', pin: '0000' })).data.error).toBe('login');
     const locked = await call('login', { name: '철수', pin: '1234' });
@@ -102,7 +124,7 @@ describe('server', () => {
 
   it('holds a settlement request until the admin pays it; a resent request counts once', async () => {
     const { call } = await boot();
-    const { token } = (await call('signup', { name: '영희', pin: '1234' })).data as AuthReply;
+    const { token } = await newPlayer(call, { name: '영희', pin: '1234' });
     const body = { amount: 3, key: 'settle-key-1' };
     await call('settle', body, token);
     const again = (await call('settle', body, token)).data as MeReply;
@@ -117,20 +139,21 @@ describe('server', () => {
 
   it('a game reports its result with the session secret, even after the player logged out', async () => {
     const { call } = await boot();
-    const { token } = (await call('signup', { name: '게임', pin: '1234' })).data as AuthReply;
+    const { token } = await newPlayer(call, { name: '게임', pin: '1234' });
     const open = (await call('game/open', { game: 'yabawi', stake: 5, key: 'open-key-1' }, token)).data as GameOpenReply;
     expect(open.me).toMatchObject({ total: 5, free: 0, inGame: 5 });
     await call('logout', {}, token);
     const close = await call('game/close', { id: open.session.id, secret: open.session.secret, payout: 0 });
     expect(close.status).toBe(200);
     const state = (await call('admin/state')).data as AdminState & { log: LogRecord[] };
-    expect(state.bankruptcies).toHaveLength(1); // lost everything: filed for bankruptcy
-    expect(state.log.map((r) => r.kind)).toEqual(['signup', 'gameOpen', 'gameClose', 'bankrupt']);
+    // Lost everything: recorded as a bankruptcy, and the 데스 게임 is open again.
+    expect(state.log.map((r) => r.kind)).toEqual(['signup', 'deathClear', 'gameOpen', 'gameClose', 'bankrupt']);
+    expect(state.players[0]).toMatchObject({ total: 0, deathClears: 1 });
   });
 
   it('pushes changes to the player app and tells an old login it was replaced', async () => {
     const { srv, call } = await boot();
-    const { token, me } = (await call('signup', { name: '실시간', pin: '1234' })).data as AuthReply;
+    const { token, me } = await newPlayer(call, { name: '실시간', pin: '1234' });
     const stream = listen(`${srv.url}api/events?token=${token}`);
     await until(() => stream.got.find((g) => g.event === 'me'));
     const p = ((await call('admin/state')).data as AdminState).players[0];
@@ -163,7 +186,7 @@ describe('server', () => {
 
   it('comes back after a restart with the same ledger and the same logins', async () => {
     const { srv, dir, call } = await boot();
-    const { token } = (await call('signup', { name: '재시작', pin: '1234' })).data as AuthReply;
+    const { token } = await newPlayer(call, { name: '재시작', pin: '1234' });
     await call('settle', { amount: 2 }, token);
     await srv.close();
     running.splice(running.indexOf(srv), 1);
@@ -173,47 +196,56 @@ describe('server', () => {
 
   it('exports the DB 기록 as a CSV Excel can read', async () => {
     const { srv, call } = await boot();
-    await call('signup', { name: '기록', pin: '1234' });
+    await newPlayer(call, { name: '기록', pin: '1234' });
     const res = await fetch(`${srv.url}api/admin/log.csv`);
     const bytes = new Uint8Array(await res.arrayBuffer());
     expect([...bytes.slice(0, 3)]).toEqual([0xef, 0xbb, 0xbf]); // BOM
     const text = new TextDecoder().decode(bytes);
     expect(text).toContain('"번호","시각","종류","플레이어"');
-    expect(text).toContain('"가입","기록","5","5"');
+    expect(text).toContain('"가입","기록","0","0"');
+    expect(text).toContain('"데스 게임 통과","기록","5","5"');
   });
-});
 
-describe('discovery', () => {
-  it('answers a player PC that asks where the casino is', async () => {
-    const { createSocket } = await import('node:dgram');
-    const dir = mkdtempSync(join(tmpdir(), 'srv-'));
-    dirs.push(dir);
-    const srv = await startServer({ dataDir: dir, port: 0, host: '127.0.0.1', timing: TIMING, discoveryPort: 47_778 });
-    running.push(srv);
-    const sock = createSocket('udp4');
-    const answer = new Promise<{ port: number; from: string }>((done) =>
-      sock.on('message', (m, from) => done({ ...(JSON.parse(m.toString()) as { port: number }), from: from.address })),
-    );
-    sock.send('CASINO?', 47_778, '127.0.0.1');
-    expect(await answer).toEqual({ casino: true, port: srv.port, from: '127.0.0.1' });
-    sock.close();
+  it('pays the 데스 게임 for a whole run only: in order, no faster than a person, to a player with no chips', async () => {
+    const { call } = await boot();
+    const { token } = (await call('signup', { name: '도전자', pin: '1234' })).data as AuthReply;
+    expect((await call('death/clear', { run: 'x', key: 'death-x' }, token)).data.error).toBe('death_run');
+    // Out of order: the run is void.
+    let { run } = (await call('death/start', {}, token)).data;
+    expect((await call('death/stage', { run, stage: 2 }, token)).data.error).toBe('death_run');
+    expect((await call('death/stage', { run, stage: 1 }, token)).data.error).toBe('death_run');
+    // Stopped early: no reward.
+    ({ run } = (await call('death/start', {}, token)).data);
+    for (let stage = 1; stage <= 4; stage++) expect((await call('death/stage', { run, stage }, token)).status).toBe(200);
+    expect((await call('death/stage', { run, stage: 4 }, token)).status).toBe(200); // sent again: harmless
+    expect((await call('death/clear', { run, key: 'death-early' }, token)).data.error).toBe('death_run');
+    expect((await call('death/stage', { run, stage: 5 }, token)).status).toBe(200);
+    const done = await call('death/clear', { run, key: 'death-key-1' }, token);
+    expect(done.data.me).toMatchObject({ total: 5, deathGame: false });
+    // The answer was lost: the same key gets the same result, not a second reward.
+    expect((await call('death/clear', { run, key: 'death-key-1' }, token)).data.me.total).toBe(5);
+    expect((await call('death/start', {}, token)).data.error).toBe('death_rich');
+
+    // A stage reported sooner than anyone can play it: refused.
+    const slow = await boot(undefined, { deathStageMinMs: [60_000, 0, 0, 0, 0] });
+    const other = (await slow.call('signup', { name: '번개', pin: '1234' })).data as AuthReply;
+    const r = (await slow.call('death/start', {}, other.token)).data.run;
+    expect((await slow.call('death/stage', { run: r, stage: 1 }, other.token)).data.error).toBe('death_run');
   });
-});
 
-describe('player exe discovery', () => {
-  it('finds the server by broadcast and skips networks that refuse', async () => {
-    const { createRequire } = await import('node:module');
-    const { discover, broadcastAddresses } = createRequire(import.meta.url)('../../electron/discover.cjs') as {
-      discover: (ms: number, port: number, targets: string[]) => Promise<string>;
-      broadcastAddresses: () => string[];
-    };
-    const dir = mkdtempSync(join(tmpdir(), 'srv-'));
-    dirs.push(dir);
-    const srv = await startServer({ dataDir: dir, port: 0, host: '127.0.0.1', timing: TIMING, discoveryPort: 47_779 });
-    running.push(srv);
-    expect(broadcastAddresses()).toContain('255.255.255.255');
-    expect(await discover(1500, 47_779, ['0.0.0.1', '127.0.0.1'])).toBe(`http://127.0.0.1:${srv.port}/`);
-    expect(await discover(300, 47_780, ['127.0.0.1'])).toBe(''); // nobody there
+  it('carries a player\'s message to the admin, and back that it was read; at most a few a minute', async () => {
+    const { call } = await boot();
+    const { token } = (await call('signup', { name: '문의', pin: '1234' })).data as AuthReply;
+    const sent = await call('message', { text: '칩이 안 들어왔어요', key: 'msg-key-1' }, token);
+    expect(sent.data.me.messages).toMatchObject([{ text: '칩이 안 들어왔어요', read: false }]);
+    expect((await call('message', { text: '칩이 안 들어왔어요', key: 'msg-key-1' }, token)).data.me.messages).toHaveLength(1);
+    const state = (await call('admin/state')).data as AdminState;
+    expect(state.messages).toMatchObject([{ name: '문의', text: '칩이 안 들어왔어요', read: false }]);
+    await call('admin/message/read', { id: state.messages[0].id });
+    expect((await call('me', undefined, token)).data.me.messages[0].read).toBe(true);
+    expect((await call('message', { text: '' }, token)).data.error).toBe('message');
+    for (let i = 0; i < 3; i++) await call('message', { text: `${i}` }, token);
+    expect((await call('message', { text: '또' }, token)).data.error).toBe('busy');
   });
 });
 

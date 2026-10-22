@@ -5,9 +5,11 @@
 //
 // A player's chips are in one of three places: free (`chips`), held for a settlement request (until the admin
 // hands over the physical chips or turns the request down), or staked in an open game session (until the game
-// reports its result). Their sum is the player's 잔고. Nothing ever goes below zero. Chips come in by the signup
-// bonus, admin edits and game wins, and go out by settlements (physical chips), admin edits, game losses and
-// deleting an account; `totals` counts each, so the ledger can always be checked against itself.
+// reports its result). Their sum is the player's 잔고. Nothing ever goes below zero. Chips come in by the 데스 게임
+// (and the signup bonus of older ledgers), admin edits and game wins, and go out by settlements (physical chips),
+// admin edits, game losses and deleting an account; `totals` counts each, so the ledger can always be checked
+// against itself. A player who loses the last chip in a game goes broke: that is recorded, and the 데스 게임 opens
+// again. Players' messages to the admin are kept here too.
 //
 // Requests that may be sent twice (a lost answer on a shaky Wi-Fi) carry a key: the same key gets the first
 // event back instead of doing the thing again.
@@ -30,6 +32,8 @@ export interface Player {
   activeMs: number; // time online, as last saved
   played: number; // game sessions finished
   net: number; // chips won (+) or lost (−) in them
+  paidOut: number; // physical chips handed over (at most PLATFORM.settleMax over the whole festival)
+  deathClears: number; // 데스 게임 cleared
   version: number; // bumps whenever the player's chips, name or PIN change; an admin edit names the version it saw
   login: string; // secret of the current login ('' = logged out); a new login ends the old one
 }
@@ -52,10 +56,12 @@ export interface Settlement {
   requestedAt: number;
 }
 
-export interface Bankruptcy {
+export interface Message {
   id: string;
   playerId: string;
-  filedAt: number;
+  text: string;
+  at: number;
+  read: boolean;
 }
 
 /** What an admin edit changes: name, PIN and 잔고 (all of the player's chips). */
@@ -87,7 +93,10 @@ export type EventBody =
   | { type: 'settleCancel'; id: string; playerId: string; by: 'player' | 'admin' }
   | { type: 'settleDone'; id: string; playerId: string }
   | { type: 'settleDirect'; key: string; id: string; playerId: string; amount: number }
-  | { type: 'bankruptDone'; id: string; playerId: string };
+  | { type: 'bankruptDone'; id: string; playerId: string } // older ledgers: the admin handled a bankruptcy
+  | { type: 'deathClear'; key: string; playerId: string; reward: number }
+  | { type: 'message'; key: string; message: { id: string; playerId: string; text: string } }
+  | { type: 'messageRead'; id: string };
 
 export type LedgerEvent = EventBody & { seq: number; at: number };
 
@@ -101,7 +110,7 @@ export interface State {
   games: Map<string, GameSession>; // open sessions
   closed: Map<string, { secret: string; event: LedgerEvent }>; // finished sessions, for a repeated report
   settlements: Map<string, Settlement>; // pending requests
-  bankruptcies: Map<string, Bankruptcy>; // waiting for the admin
+  messages: Map<string, Message>; // to the admin, oldest first
   keys: Map<string, LedgerEvent>; // request key → the event it made
   log: LogRecord[]; // the DB 기록 window
   totals: { bonus: number; edits: number; games: number; settled: number; deleted: number };
@@ -123,7 +132,7 @@ export function emptyState(): State {
     games: new Map(),
     closed: new Map(),
     settlements: new Map(),
-    bankruptcies: new Map(),
+    messages: new Map(),
     keys: new Map(),
     log: [],
     totals: { bonus: 0, edits: 0, games: 0, settled: 0, deleted: 0 },
@@ -180,14 +189,16 @@ function replay(s: State, key: string, type: EventBody['type'], same: (e: Ledger
 
 export const settlementOf = (s: State, playerId: string): Settlement | undefined =>
   [...s.settlements.values()].find((r) => r.playerId === playerId);
-export const bankruptcyOf = (s: State, playerId: string): Bankruptcy | undefined =>
-  [...s.bankruptcies.values()].find((b) => b.playerId === playerId);
 export const gamesOf = (s: State, playerId: string): GameSession[] =>
   [...s.games.values()].filter((g) => g.playerId === playerId);
 export const heldOf = (s: State, playerId: string): number => settlementOf(s, playerId)?.amount ?? 0;
 export const inGameOf = (s: State, playerId: string): number => gamesOf(s, playerId).reduce((t, g) => t + g.stake, 0);
+/** Physical chips the player can still be given: settleMax less what was handed over and what is requested. */
+export const settleLeftOf = (s: State, p: Player): number => Math.max(0, PLATFORM.settleMax - (p.paidOut ?? 0) - heldOf(s, p.id));
 /** 잔고: free + held + staked. */
 export const totalOf = (s: State, p: Player): number => p.chips + heldOf(s, p.id) + inGameOf(s, p.id);
+/** The 데스 게임 pays out to a player with no chips at all. */
+export const deathOpenFor = (s: State, p: Player): boolean => totalOf(s, p) <= 0;
 
 // ------------------------------------------------------------------ commands
 
@@ -231,8 +242,7 @@ export function edit(s: State, input: { id: unknown; version: unknown; name: unk
   // Held and staked chips are not the admin's to take here: 잔고 cannot go below them.
   if (total < before.total - p.chips) throw new LedgerError('held');
   if (name === before.name && pin === before.pin && total === before.total) throw new LedgerError('unchanged');
-  const b = bankruptcyOf(s, p.id);
-  return { type: 'edit', id: p.id, before, after: { name, pin, total }, bankruptcy: b && total > 0 ? b.id : null };
+  return { type: 'edit', id: p.id, before, after: { name, pin, total }, bankruptcy: null };
 }
 
 /** Deletes the account and everything in it: free, held and staked chips. */
@@ -244,7 +254,7 @@ export function remove(s: State, id: unknown): EventBody {
     player: { ...p },
     games: gamesOf(s, p.id),
     settlement: settlementOf(s, p.id) ?? null,
-    bankruptcy: bankruptcyOf(s, p.id)?.id ?? null,
+    bankruptcy: null,
   };
 }
 
@@ -267,7 +277,7 @@ export function openGame(
 /**
  * The game's result. A player's report needs the session secret and stays within the game's limit; the admin can
  * close a session that will never report (a PC that died mid-game) with any payout: the stake back, nothing, or
- * what the player shows on screen. A session that ends with the player out of chips files for bankruptcy.
+ * what the player shows on screen. A session that ends with the player out of chips records a bankruptcy.
  */
 export function closeGame(s: State, input: { id: unknown; payout: unknown; secret?: unknown; by: 'player' | 'admin' }): Outcome {
   const id = typeof input.id === 'string' ? input.id : '';
@@ -287,7 +297,7 @@ export function closeGame(s: State, input: { id: unknown; payout: unknown; secre
   }
   const payout = checkChips(input.payout, 0);
   const def = gameDef(g.game);
-  if (input.by === 'player' && def && payout > Math.max(g.stake, def.maxPayout)) throw new LedgerError('payout');
+  if (input.by === 'player' && def?.maxMult !== undefined && payout > g.stake * def.maxMult) throw new LedgerError('payout');
   if (input.by === 'player' && g.online && payout - g.stake >= PLATFORM.online.reviewNet) {
     return { type: 'gameReview', id, playerId: g.playerId, payout };
   }
@@ -304,8 +314,7 @@ export function decideReview(s: State, input: { id: unknown; approve: unknown })
 
 function closing(s: State, g: GameSession, payout: number, by: 'player' | 'admin', review?: 'approved' | 'rejected'): EventBody {
   const p = player(s, g.playerId);
-  const broke =
-    p.chips + payout <= 0 && gamesOf(s, p.id).length === 1 && !settlementOf(s, p.id) && !bankruptcyOf(s, p.id);
+  const broke = p.chips + payout <= 0 && gamesOf(s, p.id).length === 1 && !settlementOf(s, p.id);
   return { type: 'gameClose', id: g.id, playerId: p.id, payout, by, bankruptcy: broke ? newId() : null, ...(review ? { review } : {}) };
 }
 
@@ -317,6 +326,7 @@ export function requestSettlement(s: State, input: { playerId: string; amount: u
   if (settlementOf(s, p.id)) throw new LedgerError('pending');
   const amount = checkChips(input.amount, 1);
   if (amount > p.chips) throw new LedgerError('funds');
+  if (amount > settleLeftOf(s, p)) throw new LedgerError('settle_cap');
   return { type: 'settleRequest', key: input.key, settlement: { id: newId(), playerId: p.id, amount } };
 }
 
@@ -341,13 +351,34 @@ export function directSettlement(s: State, input: { playerId: unknown; amount: u
   const p = player(s, input.playerId);
   const amount = checkChips(input.amount, 1);
   if (amount > p.chips) throw new LedgerError('funds');
+  if (amount > settleLeftOf(s, p)) throw new LedgerError('settle_cap');
   return { type: 'settleDirect', key: input.key, id: newId(), playerId: p.id, amount };
 }
 
-export function resolveBankruptcy(s: State, id: unknown): EventBody {
-  const b = typeof id === 'string' ? s.bankruptcies.get(id) : undefined;
-  if (!b) throw new LedgerError('gone');
-  return { type: 'bankruptDone', id: b.id, playerId: b.playerId };
+/** The 데스 게임 cleared (the server followed the run): the reward, if the player is still poor enough for it. */
+export function clearDeathGame(s: State, input: { playerId: string; key: string }): Outcome {
+  const done = replay(s, input.key, 'deathClear', (e) => e.type === 'deathClear' && e.playerId === input.playerId);
+  if (done) return done;
+  const p = player(s, input.playerId);
+  if (!deathOpenFor(s, p)) throw new LedgerError('death_rich');
+  return { type: 'deathClear', key: input.key, playerId: p.id, reward: PLATFORM.deathGame.reward };
+}
+
+/** A message to the admin: one line of plain text, PLATFORM.message.maxLength characters at most. */
+export function sendMessage(s: State, input: { playerId: string; text: unknown; key: string }): Outcome {
+  const done = replay(s, input.key, 'message', (e) => e.type === 'message' && e.message.playerId === input.playerId);
+  if (done) return done;
+  const p = player(s, input.playerId);
+  const text = typeof input.text === 'string' ? input.text.normalize('NFC').replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim() : '';
+  if (!text || [...text].length > PLATFORM.message.maxLength) throw new LedgerError('message');
+  return { type: 'message', key: input.key, message: { id: newId(), playerId: p.id, text } };
+}
+
+/** The admin read a message. */
+export function readMessage(s: State, id: unknown): EventBody {
+  const m = typeof id === 'string' ? s.messages.get(id) : undefined;
+  if (!m || m.read) throw new LedgerError('gone');
+  return { type: 'messageRead', id: m.id };
 }
 
 // ------------------------------------------------------------------ apply
@@ -358,11 +389,11 @@ export function apply(s: State, e: LedgerEvent): void {
   if ('key' in e && e.key) s.keys.set(e.key, e);
   switch (e.type) {
     case 'signup': {
-      const p: Player = { ...e.player, chips: e.bonus, createdAt: e.at, lastActiveAt: e.at, activeMs: 0, played: 0, net: 0, version: 1 };
+      const p: Player = { ...e.player, chips: e.bonus, createdAt: e.at, lastActiveAt: e.at, activeMs: 0, played: 0, net: 0, paidOut: 0, deathClears: 0, version: 1 };
       s.players.set(p.id, p);
       s.names.set(nameKey(p.name), p.id);
       s.totals.bonus += e.bonus;
-      log(s, e, 'signup', p, e.bonus, `가입 · 보너스 ${e.bonus}칩`);
+      log(s, e, 'signup', p, e.bonus, e.bonus ? `가입 · 보너스 ${e.bonus}칩` : '가입');
       break;
     }
     case 'login':
@@ -387,7 +418,6 @@ export function apply(s: State, e: LedgerEvent): void {
       p.version++;
       s.names.set(nameKey(p.name), p.id);
       s.totals.edits += delta;
-      if (e.bankruptcy) s.bankruptcies.delete(e.bankruptcy);
       log(s, e, 'edit', p, delta, editText(e.before, e.after) + (e.bankruptcy ? ' · 파산 해제' : ''));
       break;
     }
@@ -398,7 +428,6 @@ export function apply(s: State, e: LedgerEvent): void {
       log(s, e, 'delete', p, -total, `계정 삭제 · 잔고 ${total}칩${parts.length ? ` (${parts.join(', ')} 포함)` : ''} 소멸`, 0);
       for (const g of e.games) s.games.delete(g.id);
       if (e.settlement) s.settlements.delete(e.settlement.id);
-      if (e.bankruptcy) s.bankruptcies.delete(e.bankruptcy);
       s.names.delete(nameKey(p.name));
       s.players.delete(p.id);
       s.totals.deleted += total;
@@ -445,10 +474,7 @@ export function apply(s: State, e: LedgerEvent): void {
                   : ''
               : '';
       log(s, e, e.by === 'admin' ? 'gameForce' : 'gameClose', p, e.payout - g.stake, `${gameName(g.game)} ${e.by === 'admin' ? '강제 종료' : '정산'} · ${g.stake}칩 → ${e.payout}칩${how}`);
-      if (e.bankruptcy) {
-        s.bankruptcies.set(e.bankruptcy, { id: e.bankruptcy, playerId: p.id, filedAt: e.at });
-        log(s, e, 'bankrupt', p, 0, '잔고 0칩 · 자동 파산 신청');
-      }
+      if (e.bankruptcy) log(s, e, 'bankrupt', p, 0, '잔고 0칩 · 파산 (데스 게임에 다시 도전할 수 있음)');
       break;
     }
     case 'settleRequest': {
@@ -475,6 +501,7 @@ export function apply(s: State, e: LedgerEvent): void {
       p.version++;
       s.settlements.delete(r.id);
       s.totals.settled += r.amount;
+      p.paidOut += r.amount;
       log(s, e, 'settleDone', p, -r.amount, `실물 ${r.amount}칩 지급 완료`);
       break;
     }
@@ -483,13 +510,30 @@ export function apply(s: State, e: LedgerEvent): void {
       p.chips -= e.amount;
       p.version++;
       s.totals.settled += e.amount;
+      p.paidOut += e.amount;
       log(s, e, 'settleDirect', p, -e.amount, `실물 ${e.amount}칩 지급 (관리자가 바로 정산)`);
       break;
     }
     case 'bankruptDone': {
+      const p = s.players.get(e.playerId);
+      if (p) log(s, e, 'bankruptDone', p, 0, '파산 처리 완료');
+      break;
+    }
+    case 'deathClear': {
       const p = must(s, e.playerId);
-      s.bankruptcies.delete(e.id);
-      log(s, e, 'bankruptDone', p, 0, '파산 처리 완료');
+      p.chips += e.reward;
+      p.deathClears = (p.deathClears ?? 0) + 1;
+      p.version++;
+      s.totals.bonus += e.reward;
+      log(s, e, 'deathClear', p, e.reward, `데스 게임 통과 · ${e.reward}칩 지급`);
+      break;
+    }
+    case 'message':
+      s.messages.set(e.message.id, { ...e.message, at: e.at, read: false });
+      break;
+    case 'messageRead': {
+      const m = s.messages.get(e.id);
+      if (m) m.read = true;
       break;
     }
   }

@@ -1,5 +1,6 @@
 // Player app: 로그인 / 가입하기, then the lobby with the chip balance always on screen, the
-// games, and the settlement request. Everything comes from the ledger server; the app keeps only its login token.
+// games, the settlement request and messages to the admin. A player with no chips at all (a new account starts
+// with none) gets the 데스 게임, which pays its reward once cleared. Everything comes from the ledger server; the app keeps only its login token.
 // When the server cannot be reached the app says so, keeps trying, and blocks anything that moves chips.
 // A game opens on top of the lobby in a frame from the same server, under a bar that keeps the balance in view;
 // it takes and gives back chips itself (sdk/casino.ts). Whatever way a game stops, its chips come back: the app
@@ -8,21 +9,29 @@
 // app asks for news every PLATFORM.online.pingMs instead of live updates (a Quick Tunnel does not pass them).
 import './style.css';
 import { PLATFORM, type GameDef } from '../shared/config.ts';
-import type { AuthReply, Hello, MeReply, PlayerView } from '../shared/protocol.ts';
+import type { AuthReply, Hello, MeReply, PlayerRankReply, PlayerView } from '../shared/protocol.ts';
 import { chips, clockTime, h, requestKey, setText } from '../ui/dom.ts';
 import { ApiError, api } from '../ui/net.ts';
 import { play, unlockAudio } from '../ui/sound.ts';
 import { flush, settleLeftovers } from '../../sdk/casino.ts';
 
+const GAME_ICON: Record<GameDef['id'], string> = { yabawi: '🥤', yeongkkeul: '📈', plinko: '🔮', slot: '🎰', yacht: '🎲' };
+
+/** A page that opens over the lobby: a chip game, or the 데스 게임. */
+interface Page {
+  id: string;
+  name: string;
+}
+const DEATH_GAME: Page = { id: 'deathgame', name: '데스 게임' };
+
 const TOKEN_KEY = 'casino:v1:token';
-const SERVER_KEY = 'casino:v1:server';
 const ENTRY_KEY = 'casino:v1:entry'; // the 입장 코드 last used, so a returning player need not type it again
 const SEND_RETRY_MS = 30_000; // a chip request keeps trying this long through a Wi-Fi drop
 
 const root = document.getElementById('app')!;
 root.classList.add('app');
 
-let base = serverBase();
+const base = `${location.origin}/`; // the player app always comes from the server it talks to
 let token = load(TOKEN_KEY);
 let me: PlayerView | null = null;
 let online = false;
@@ -30,7 +39,7 @@ let events: EventSource | null = null;
 let pingTimer: number | null = null;
 let busy = false; // a chip request is on its way
 let cancelling = false;
-let playing: GameDef | null = null; // the game open on top of the lobby
+let playing: Page | null = null; // the game open on top of the lobby
 let hello: Hello = { online: false, pingMs: PLATFORM.pingMs, entryDigits: 0 }; // how this server address works
 
 // ------------------------------------------------------------------ skeleton
@@ -50,7 +59,6 @@ function showLogin(notice = ''): void {
   const name = h('input', { class: 'field', 'data-testid': 'name', maxlength: PLATFORM.nameMax, autocomplete: 'off', placeholder: '이름' });
   const pin = pinInput('pin', 'PIN 4자리');
   const pin2 = pinInput('pin2', 'PIN 한 번 더');
-  const server = h('input', { class: 'field', 'data-testid': 'server', placeholder: '서버 주소 (예: 192.168.0.12:7777)', value: base });
   const entry = h('input', {
     class: 'field pin',
     inputmode: 'numeric',
@@ -75,7 +83,7 @@ function showLogin(notice = ''): void {
     tabSignup.classList.toggle('active', m === 'signup');
     pin2Row.hidden = m === 'login';
     setText(submit, m === 'login' ? '로그인' : '가입하고 시작');
-    setText(msg, m === 'signup' ? `처음 가입하면 ${PLATFORM.signupBonus}칩을 드려요` : '');
+    setText(msg, m === 'signup' ? `가입하고 데스 게임을 통과하면 ${PLATFORM.deathGame.reward}칩을 드려요` : '');
     msg.className = 'form-msg';
   };
   tabLogin.addEventListener('click', () => setMode('login'));
@@ -89,8 +97,8 @@ function showLogin(notice = ''): void {
     h('label', { class: 'row' }, h('span', {}, '이름'), name),
     h('label', { class: 'row' }, h('span', {}, 'PIN'), pin),
     pin2Row,
-    hello.entryDigits ? h('label', { class: 'row' }, h('span', {}, '입장 코드'), entry) : null,
-    location.protocol.startsWith('http') ? null : h('label', { class: 'row' }, h('span', {}, '서버'), server),
+    // The player exe asks for the code once, with the internet address, and passes it on (#entry=…).
+    hello.entryDigits ? h('label', { class: 'row', hidden: !!entry.value }, h('span', {}, '입장 코드'), entry) : null,
     msg,
     submit,
   );
@@ -98,7 +106,6 @@ function showLogin(notice = ''): void {
     e.preventDefault();
     void (async () => {
       if (submit.disabled) return;
-      if (!location.protocol.startsWith('http')) setServer(server.value);
       if (mode === 'signup' && pin.value !== pin2.value) return fail('PIN 두 번이 서로 다릅니다');
       submit.disabled = true;
       setText(submit, '연결 중…');
@@ -109,7 +116,7 @@ function showLogin(notice = ''): void {
         token = r.token;
         save(TOKEN_KEY, token);
         play('coin');
-        showLobby(r.me, mode === 'signup' ? `가입 완료! 보너스 ${PLATFORM.signupBonus}칩` : '');
+        showLobby(r.me, mode === 'signup' ? `가입 완료! 데스 게임을 통과하면 ${PLATFORM.deathGame.reward}칩` : '');
       } catch (err) {
         if (err instanceof ApiError && err.code === 'entry') {
           // The code changed (a server restart or [새 코드]): never send the old one again by accident.
@@ -119,6 +126,7 @@ function showLogin(notice = ''): void {
           }
           entry.value = '';
           remove(ENTRY_KEY);
+          (entry.parentElement as HTMLElement).hidden = false;
         }
         fail(err instanceof ApiError ? err.message : '오류가 났습니다');
         submit.disabled = false;
@@ -155,12 +163,38 @@ function pinInput(testid: string, placeholder: string): HTMLInputElement {
 
 // ------------------------------------------------------------------ lobby
 
+const RANK_MS = 5000; // the ranking beside the lobby and the games is read this often
+let rankTimer: number | null = null;
+const rankLobby = h('aside', { class: 'rank-panel', 'data-testid': 'rank-panel' });
+const rankSide = h('aside', { class: 'rank-panel side' });
 const balanceEl = h('div', { class: 'balance-num', 'data-testid': 'balance' });
 const breakdownEl = h('div', { class: 'balance-sub', 'data-testid': 'breakdown' });
 const nameEl = h('div', { class: 'who-name', 'data-testid': 'who' });
 const connEl = h('span', { class: 'conn' });
 const noticeEl = h('div', { class: 'notice', hidden: true, 'data-testid': 'notice' });
 const gamesEl = h('div', { class: 'games' });
+const deathTile = h(
+  'button',
+  { class: 'death-tile', type: 'button', hidden: true, 'data-testid': 'game-deathgame', onclick: () => openGame(DEATH_GAME) },
+  h('div', { class: 'death-skull' }, '💀'),
+  h(
+    'div',
+    { class: 'death-body' },
+    h('div', { class: 'death-title' }, 'THE FINAL SEAT'),
+    h('div', { class: 'death-name' }, `데스 게임 · 다섯 관문을 통과하면 ${PLATFORM.deathGame.reward}칩`),
+    h('div', { class: 'death-desc' }, '잔고가 0칩일 때 도전할 수 있습니다. 실패해도 몇 번이든 다시 도전할 수 있습니다.'),
+  ),
+  h('div', { class: 'game-play' }, '▶ 도전'),
+);
+const messageInput = h('input', {
+  class: 'field message-input',
+  maxlength: PLATFORM.message.maxLength,
+  placeholder: '관리자에게 보낼 내용',
+  'data-testid': 'message-text',
+});
+const messageBtn = h('button', { class: 'btn', type: 'button', 'data-testid': 'message-send' }, '보내기');
+const messageMsg = h('div', { class: 'form-msg', 'data-testid': 'message-msg' });
+const myMessagesEl = h('ul', { class: 'my-messages', 'data-testid': 'my-messages' });
 const openGamesEl = h('div', { class: 'open-games', hidden: true, 'data-testid': 'open-games' });
 const settleInput = h('input', { class: 'field amount', type: 'number', min: 1, step: 1, 'data-testid': 'settle-amount', placeholder: '칩 개수' });
 const settleBtn = h('button', { class: 'btn gold', type: 'button', 'data-testid': 'settle' }, '정산 요청');
@@ -168,12 +202,17 @@ const settleMsg = h('div', { class: 'form-msg', 'data-testid': 'settle-msg' });
 const pendingEl = h('div', { class: 'pending', hidden: true, 'data-testid': 'pending' });
 const cancelBtn = h('button', { class: 'btn ghost small', type: 'button', 'data-testid': 'settle-cancel' }, '요청 취소');
 const settleForm = h('div', { class: 'settle-form' }, settleInput, settleBtn);
+const settleCapEl = h('p', { class: 'hint', 'data-testid': 'settle-cap' });
 
 settleBtn.addEventListener('click', () => void requestSettlement());
 settleInput.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') void requestSettlement();
 });
 cancelBtn.addEventListener('click', () => void cancelSettlement());
+messageBtn.addEventListener('click', () => void sendMessage());
+messageInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') void sendMessage();
+});
 
 function showLobby(first: PlayerView, hello = ''): void {
   me = first;
@@ -185,6 +224,7 @@ function showLobby(first: PlayerView, hello = ''): void {
     h(
       'div',
       { class: 'lobby' },
+      rankLobby,
       h(
         'header',
         { class: 'top' },
@@ -200,15 +240,25 @@ function showLobby(first: PlayerView, hello = ''): void {
         breakdownEl,
         noticeEl,
       ),
-      h('section', { class: 'card games-card' }, h('h2', {}, '게임'), gamesEl, openGamesEl),
+      h('section', { class: 'card games-card' }, h('h2', {}, '게임'), deathTile, gamesEl, openGamesEl),
       h(
         'section',
         { class: 'card settle-card' },
         h('h2', {}, '실물 칩으로 바꾸기'),
         h('p', { class: 'hint' }, '바꿀 칩 개수를 적고 요청하면, 관리자가 실물 칩을 건네고 장부에서 뺍니다.'),
+        settleCapEl,
         settleForm,
         pendingEl,
         settleMsg,
+      ),
+      h(
+        'section',
+        { class: 'card message-card' },
+        h('h2', {}, '관리자에게 메시지'),
+        h('p', { class: 'hint' }, '궁금한 점이나 문제가 생기면 적어 보내세요. 관리자 화면에 바로 뜹니다.'),
+        h('div', { class: 'settle-form' }, messageInput, messageBtn),
+        messageMsg,
+        myMessagesEl,
       ),
     ),
   );
@@ -222,7 +272,7 @@ function gameTile(g: GameDef): HTMLElement {
   return h(
     'button',
     { class: `game-tile game-${g.id}`, type: 'button', 'data-testid': `game-${g.id}`, onclick: () => openGame(g) },
-    h('div', { class: 'game-icon' }, g.id === 'yabawi' ? '🥤' : '📈'),
+    h('div', { class: 'game-icon' }, GAME_ICON[g.id]),
     h('div', { class: 'game-name' }, g.name),
     h('div', { class: 'game-desc' }, g.description),
     h('div', { class: 'game-rate' }, g.perChip === 1 ? '1칩 = 1칩' : `1칩 = ${g.unit}${g.perChip.toLocaleString('en-US')}`),
@@ -231,6 +281,7 @@ function gameTile(g: GameDef): HTMLElement {
 }
 
 // ------------------------------------------------------------------ games
+
 
 const gameName = h('span', { class: 'gb-name' });
 const gameBalance = h('span', { class: 'gb-balance', 'data-testid': 'game-balance' });
@@ -247,10 +298,11 @@ const gameLayer = h(
     gameBalance,
     h('button', { class: 'btn ghost small', type: 'button', 'data-testid': 'game-leave', onclick: () => leaveGame() }, '로비로'),
   ),
+  rankSide,
 );
 root.append(gameLayer);
 
-function openGame(g: GameDef): void {
+function openGame(g: Page): void {
   if (!me || playing) return;
   if (!online) return toast('서버와 연결된 뒤에 시작하세요', 'bad');
   playing = g;
@@ -310,10 +362,26 @@ function render(): void {
   gameConn.classList.toggle('off', !online);
   setText(gameBalance, `내 잔고 ${chips(me.total)}${me.inGame ? ` · 게임 중 ${me.inGame}` : ''}`);
   for (const b of gamesEl.querySelectorAll('button')) b.disabled = !online;
+  deathTile.hidden = !me.deathGame;
+  deathTile.disabled = !online;
   banner.hidden = online;
 
-  noticeEl.hidden = !me.bankrupt;
-  if (me.bankrupt) setText(noticeEl, '잔고가 0칩이 되어 파산 신청이 접수되었습니다. 관리자에게 가 주세요.');
+  noticeEl.hidden = !me.deathGame;
+  if (me.deathGame) {
+    setText(noticeEl, `잔고가 0칩입니다. 데스 게임을 통과하면 ${PLATFORM.deathGame.reward}칩을 받습니다.`);
+  }
+
+  myMessagesEl.replaceChildren(
+    ...me.messages.map((m) =>
+      h(
+        'li',
+        { class: `my-message${m.read ? ' read' : ''}` },
+        h('span', { class: 'my-message-text' }, m.text),
+        h('span', { class: 'my-message-meta' }, `${clockTime(m.at)} · ${m.read ? '관리자가 읽음' : '보냄'}`),
+      ),
+    ),
+  );
+  messageBtn.disabled = !online || sendingMessage;
 
   openGamesEl.hidden = me.games.length === 0;
   openGamesEl.replaceChildren(
@@ -338,8 +406,10 @@ function render(): void {
       cancelBtn,
     );
   }
-  settleInput.max = String(me.free);
-  settleBtn.disabled = !online || busy || me.free < 1;
+  const canTake = Math.min(me.free, me.settleLeft);
+  setText(settleCapEl, me.settleLeft > 0 ? `실물 칩은 한 사람당 ${PLATFORM.settleMax}개까지 · 앞으로 ${me.settleLeft}개 더 받을 수 있습니다` : `실물 칩 ${PLATFORM.settleMax}개를 모두 받았습니다 · 남은 칩은 게임에서 계속 쓸 수 있습니다`);
+  settleInput.max = String(canTake);
+  settleBtn.disabled = !online || busy || canTake < 1;
   cancelBtn.disabled = !online || busy;
 }
 
@@ -364,7 +434,10 @@ function update(next: PlayerView): void {
       toast(`잔고 ${chips(prev.total)} → ${chips(next.total)}`, 'bad');
       flash('down');
     }
-    if (!prev.bankrupt && next.bankrupt) play('error');
+    if (!prev.deathGame && next.deathGame) {
+      toast('잔고가 0칩이 되었습니다 · 데스 게임에 다시 도전할 수 있습니다', 'bad');
+      play('error');
+    }
   }
   render();
 }
@@ -380,6 +453,7 @@ async function requestSettlement(): Promise<void> {
   const amount = Number(settleInput.value);
   if (!Number.isInteger(amount) || amount < 1) return settleError('1칩 이상, 정수로 적어 주세요');
   if (amount > me.free) return settleError(`사용 가능한 칩은 ${chips(me.free)}입니다`);
+  if (amount > me.settleLeft) return settleError(`실물 칩은 앞으로 ${chips(me.settleLeft)}까지만 받을 수 있습니다`);
   busy = true;
   render();
   setText(settleBtn, '보내는 중…');
@@ -419,6 +493,35 @@ async function cancelSettlement(): Promise<void> {
   }
 }
 
+let sendingMessage = false;
+
+async function sendMessage(): Promise<void> {
+  if (!me || sendingMessage) return;
+  const text = messageInput.value.trim();
+  if (!text) return messageError('보낼 내용을 적어 주세요');
+  sendingMessage = true;
+  render();
+  try {
+    const r = await api<MeReply>(base, 'message', { text, key: requestKey() }, { token, retryMs: SEND_RETRY_MS });
+    messageInput.value = '';
+    setText(messageMsg, '관리자에게 보냈습니다');
+    messageMsg.className = 'form-msg';
+    play('click');
+    update(r.me);
+  } catch (err) {
+    handleError(err, messageError);
+  } finally {
+    sendingMessage = false;
+    render();
+  }
+}
+
+function messageError(text: string): void {
+  setText(messageMsg, text);
+  messageMsg.className = 'form-msg error';
+  play('error');
+}
+
 function settleError(text: string): void {
   setText(settleMsg, text);
   settleMsg.className = 'form-msg error';
@@ -440,6 +543,8 @@ function handleError(err: unknown, show: (t: string) => void): void {
 function connect(): void {
   stopSession(false);
   pingTimer = window.setInterval(() => void ping(), hello.pingMs);
+  rankTimer = window.setInterval(() => void loadRank(), RANK_MS);
+  void loadRank();
   if (hello.online) return;
   events = new EventSource(`${base}api/events?token=${encodeURIComponent(token)}`);
   events.addEventListener('me', (ev) => {
@@ -449,6 +554,38 @@ function connect(): void {
   events.addEventListener('kicked', (ev) => endSession((JSON.parse((ev as MessageEvent).data) as { reason: string }).reason));
   events.onopen = () => setOnline(true);
   events.onerror = () => setOnline(false); // EventSource reconnects by itself
+}
+
+// ------------------------------------------------------------------ ranking (beside the lobby and the games)
+
+async function loadRank(): Promise<void> {
+  if (!token) return;
+  try {
+    const d = await api<PlayerRankReply>(base, 'rank', undefined, { token });
+    for (const el of [rankLobby, rankSide]) renderRank(el, d);
+  } catch {
+    // the next try
+  }
+}
+
+function renderRank(el: HTMLElement, d: PlayerRankReply): void {
+  el.replaceChildren(
+    h('h2', {}, '🏆 잔고 순위'),
+    h(
+      'ol',
+      { class: 'rank-list' },
+      ...d.rows.map((r, i) =>
+        h(
+          'li',
+          { class: `rank-row${r.me ? ' me' : ''}${i < 3 ? ` top${i + 1}` : ''}` },
+          h('span', { class: 'rank-pos' }, i < 3 ? ['🥇', '🥈', '🥉'][i] : String(i + 1)),
+          h('span', { class: 'rank-name' }, r.name, r.online ? h('span', { class: 'rank-dot' }) : ''),
+          h('span', { class: 'rank-total' }, chips(r.total)),
+        ),
+      ),
+    ),
+    d.me ? h('div', { class: 'rank-me', 'data-testid': 'rank-me' }, `내 순위 ${d.me.rank}위 · ${d.players}명 중`) : '',
+  );
 }
 
 async function ping(): Promise<void> {
@@ -474,6 +611,8 @@ function stopSession(clearToken = true): void {
   events = null;
   if (pingTimer !== null) window.clearInterval(pingTimer);
   pingTimer = null;
+  if (rankTimer !== null) window.clearInterval(rankTimer);
+  rankTimer = null;
   if (clearToken) {
     me = null;
     banner.hidden = true;
@@ -511,25 +650,7 @@ function toast(text: string, kind: 'good' | 'bad' | 'info'): void {
   window.setTimeout(() => el.remove(), 3700);
 }
 
-// ------------------------------------------------------------------ storage and server address
-
-function serverBase(): string {
-  if (location.protocol.startsWith('http')) return `${location.origin}/`;
-  const q = new URLSearchParams(location.search).get('server');
-  return normalizeServer(q ?? load(SERVER_KEY));
-}
-
-function setServer(raw: string): void {
-  base = normalizeServer(raw);
-  save(SERVER_KEY, base);
-}
-
-function normalizeServer(raw: string): string {
-  const v = raw.trim();
-  if (!v) return '';
-  const withScheme = /^https?:\/\//.test(v) ? v : `http://${v}`;
-  return withScheme.endsWith('/') ? withScheme : `${withScheme}/`;
-}
+// ------------------------------------------------------------------ storage
 
 function load(key: string): string {
   try {
@@ -555,17 +676,26 @@ function remove(key: string): void {
 
 // ------------------------------------------------------------------ boot
 
-/** Through the tunnel or on the Wi-Fi? An old server without /api/hello is the Wi-Fi kind. */
+/** Through the tunnel, or on the admin PC itself (tests)? Without an answer the local defaults stay. */
 async function greet(): Promise<void> {
   try {
     hello = await api<Hello>(base, 'hello', undefined, { retryMs: 10_000 });
   } catch {
-    // keeps the Wi-Fi default
+    // keeps the local defaults
   }
+}
+
+/** The player exe opens the app with #entry=<입장 코드> (checked with the address): remember it, hide it. */
+function takeEntryCode(): void {
+  const code = /^#entry=(\d+)$/.exec(location.hash)?.[1];
+  if (!code) return;
+  save(ENTRY_KEY, code);
+  history.replaceState(null, '', location.pathname + location.search);
 }
 
 /** With a saved login, waits for the server (it may be restarting) instead of asking to log in again. */
 async function boot(): Promise<void> {
+  takeEntryCode();
   if (base) await greet();
   if (!token) return showLogin();
   screen.replaceChildren(h('div', { class: 'center' }, h('div', { class: 'card connecting', 'data-testid': 'connecting' }, '서버에 연결하는 중…')));

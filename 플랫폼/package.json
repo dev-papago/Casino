@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.2.0",
   "type": "module",
-  "description": "카지노 플랫폼: 관리자 PC의 칩 장부 서버, 관리자 화면, 플레이어 화면 (같은 와이파이)",
+  "description": "카지노 플랫폼: 관리자 PC의 칩 장부 서버와 관리자 화면, 인터넷 주소(Cloudflare Quick Tunnel)로 접속하는 플레이어 화면",
   "author": "casion",
   "engines": {
     "node": ">=22.18.0"
@@ -15,15 +15,15 @@
     "test": "vitest run",
     "e2e": "npm run build && playwright test",
     "typecheck": "tsc --noEmit",
-    "exe": "npm run build && vite build --config vite.server.config.ts && electron-builder --win portable --x64 && electron-builder --config electron-builder.player.json --win portable --x64",
-    "get-cloudflared": "node scripts/get-cloudflared.mjs",
-    "exe:online": "npm run build && vite build --config vite.server.config.ts && node scripts/get-cloudflared.mjs && electron-builder --config electron-builder.online.json --win portable --x64 && electron-builder --config electron-builder.player-online.json --win portable --x64"
+    "exe": "npm run build && vite build --config vite.server.config.ts && node scripts/get-cloudflared.mjs && electron-builder --win portable --x64 && electron-builder --config electron-builder.player.json --win portable --x64",
+    "get-cloudflared": "node scripts/get-cloudflared.mjs"
   },
   "devDependencies": {
     "@playwright/test": "1.56.1",
     "@types/node": "22.20.5",
     "electron": "44.5.1",
     "electron-builder": "26.15.3",
+    "tailwindcss": "3.4.17",
     "typescript": "5.9.3",
     "vite": "7.3.7",
     "vitest": "4.1.12"
@@ -44,6 +44,12 @@
       "dist-server/server.mjs",
       "electron/main.cjs",
       "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/cloudflared.exe",
+        "to": "cloudflared.exe"
+      }
     ],
     "win": {
       "target": [

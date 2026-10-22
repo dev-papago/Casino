@@ -1,7 +1,7 @@
 // Every tunable number of the platform. The ledger server, the admin screen and the player app read this one
 // object. Chips are whole numbers everywhere: in the ledger, inside the games and at the counter (실물 칩).
 
-export type GameId = 'yabawi' | 'yeongkkeul';
+export type GameId = 'yabawi' | 'yeongkkeul' | 'plinko' | 'slot' | 'yacht';
 
 /**
  * A game in the player app. A game session takes chips out of the player's balance when it starts (the stake)
@@ -13,22 +13,40 @@ export interface GameDef {
   description: string;
   perChip: number; // what one chip is worth inside the game: 야바위 1 chip, 영끌문S $1,000
   unit: string;
-  maxPayout: number; // a session pays out at most this (or its stake, if larger); a bigger result is a bug
+  // A one-round game pays out at most stake × maxMult (its top prize); a bigger report is a bug or a forgery.
+  // Games that run many rounds per session (야바위, 영끌문S) have no limit: chips won in games are unlimited.
+  maxMult?: number;
 }
 
 export const PLATFORM = {
   port: 7777,
-  discoveryPort: 7778, // UDP: player PCs ask "where is the casino?" on the Wi-Fi and the server answers
-  signupBonus: 5, // chips a new account starts with
+  signupBonus: 0, // chips a new account starts with: none, the 데스 게임 gives the first ones
+  // 데스 게임 (THE FINAL SEAT, games/deathgame): a player with no chips at all (free, held and in games together)
+  // can play it; clearing all five stages pays `reward` chips. The server follows the run stage by stage and refuses a stage reported
+  // sooner after the previous one than stageMinMs allows (faster than anyone can play it: a forged report).
+  deathGame: {
+    reward: 5,
+    stageMinMs: [8_000, 20_000, 10_000, 6_000, 4_000] as readonly number[],
+  },
+  // 메시지: a player writes to the admin (the admin screen's 메시지 panel).
+  message: {
+    maxLength: 200,
+    perMin: 5, // messages a minute from one player
+  },
   pinDigits: 4,
   nameMax: 12,
   maxChips: 1_000_000, // sanity limit for any chip amount
+  settleMax: 50, // physical chips one player can receive in all (game chips are unlimited; the rest stays in the ledger)
+  // The chip economy: a guest earns 5 chips in the 데스 게임, bets half to all of the balance every round, and the
+  // games' 승리 추세 (sdk/casino.ts) pulls the balance toward a center, so the chips left after 17 minutes spread
+  // like a skewed bell (10–12 on average, about 1 in 30 reaching 50). The skill games pay better than the luck
+  // games. The 확률 시뮬레이터 (/sim on the admin PC) shows each game's spread.
   pingMs: 5_000, // the player app reports in this often
   offlineAfterMs: 15_000, // no report for this long → offline
   activitySaveMs: 300_000, // online time is written to the ledger at least this often
   loginFails: 5, // wrong PINs in a row before that name is locked for a while
   loginLockMs: 30_000,
-  // 온라인판: the same server also answers through a cloudflared Quick Tunnel, on its own port.
+  // Players come in through a cloudflared Quick Tunnel to the server's public port.
   online: {
     publicPort: 7780, // the tunnel's way in, on 127.0.0.1 only: player routes, no admin routes
     pingMs: 2_000, // a Quick Tunnel does not pass server-sent events, so the player app asks this often instead
@@ -50,7 +68,6 @@ export const PLATFORM = {
       description: '컵 세 개 속 공을 찾아라. 맞히면 배당만큼 칩을 받는다.',
       perChip: 1,
       unit: '칩',
-      maxPayout: 50,
     },
     {
       id: 'yeongkkeul',
@@ -58,7 +75,30 @@ export const PLATFORM = {
       description: '모의 트레이딩. $1,000 = 1칩으로 바꿔 들어가고, 끝날 때 다시 칩으로 바꾼다.',
       perChip: 1000,
       unit: '$',
-      maxPayout: 50,
+    },
+    {
+      id: 'plinko',
+      name: '플링코',
+      description: '공을 떨어뜨려 바닥 칸의 배율만큼 받는다. 쉬움은 자주 조금, 어려움은 가끔 크게.',
+      perChip: 1,
+      unit: '칩',
+      maxMult: 50,
+    },
+    {
+      id: 'slot',
+      name: '슬롯머신',
+      description: '릴 세 개를 돌려 같은 그림을 맞춘다. 777이면 50배.',
+      perChip: 1,
+      unit: '칩',
+      maxMult: 50,
+    },
+    {
+      id: 'yacht',
+      name: '요트 다이스',
+      description: '주사위 다섯 개를 세 번 굴려 족보를 만든다. 한 번 잡은 주사위는 풀 수 없다.',
+      perChip: 1,
+      unit: '칩',
+      maxMult: 20,
     },
   ] as readonly GameDef[],
 };

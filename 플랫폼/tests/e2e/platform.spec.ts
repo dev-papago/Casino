@@ -1,15 +1,8 @@
-// One festival day in miniature: a player signs up on a player PC, the admin edits and settles on the admin PC,
-// the Wi-Fi drops and comes back, the account logs in elsewhere and is finally deleted.
-import { expect, test, type Page } from '@playwright/test';
-
-async function signUp(page: Page, name: string, pin: string): Promise<void> {
-  await page.goto('/');
-  await page.getByTestId('tab-signup').click();
-  await page.getByTestId('name').fill(name);
-  await page.getByTestId('pin').fill(pin);
-  await page.getByTestId('pin2').fill(pin);
-  await page.getByTestId('submit').click();
-}
+// One festival day in miniature: a player signs up on a player PC and gets the 데스 게임's chips, writes to the
+// admin, the admin edits and settles on the admin PC, the Wi-Fi drops and comes back, the account logs in
+// elsewhere and is finally deleted.
+import { expect, test } from '@playwright/test';
+import { earnChips, signUp } from './helpers.ts';
 
 test('signup, admin edit, settlement, network drop, another login, delete', async ({ browser }) => {
   const errors: string[] = [];
@@ -24,14 +17,30 @@ test('signup, admin edit, settlement, network drop, another login, delete', asyn
   await expect(admin.getByTestId('summary')).toContainText('플레이어');
   const before = await count();
 
-  // Sign up: 5 chips, and the admin sees the player online at once.
+  // Sign up: no chips yet, the 데스 게임 is offered; its reward is 5 chips. The admin sees the player online at once.
   await signUp(player, '테스터', '1234');
-  await expect(player.getByTestId('balance')).toHaveText('5칩');
+  await expect(player.getByTestId('balance')).toHaveText('0칩');
+  await expect(player.getByTestId('game-deathgame')).toBeVisible();
+  await expect(player.getByTestId('notice')).toContainText('데스 게임');
+  await earnChips(player);
+  await expect(player.getByTestId('game-deathgame')).toBeHidden();
   await expect(player.getByTestId('who')).toHaveText('테스터');
   const row = admin.getByTestId('players').locator('tr', { hasText: '테스터' });
   await expect(row).toContainText('온라인');
   await expect(row).toContainText('1234');
   await expect(row).toContainText('5칩');
+  await expect(row).toContainText('데스 게임 1회');
+
+  // 메시지: the player writes, the admin reads it, the player sees that.
+  await player.getByTestId('message-text').fill('정산은 어디서 하나요?');
+  await player.getByTestId('message-send').click();
+  await expect(player.getByTestId('my-messages')).toContainText('정산은 어디서 하나요?');
+  const msg = admin.getByTestId('message').filter({ hasText: '정산은 어디서 하나요?' });
+  await expect(msg).toContainText('테스터');
+  await expect(admin.getByTestId('summary')).toContainText('새 메시지1건');
+  await msg.getByTestId('message-read').click();
+  await expect(admin.getByTestId('read-message')).toContainText('정산은 어디서 하나요?');
+  await expect(player.getByTestId('my-messages')).toContainText('관리자가 읽음', { timeout: 10_000 });
   // The same name again is refused.
   const other = await (await browser.newContext()).newPage();
   await signUp(other, '테스터', '9999');
@@ -71,7 +80,7 @@ test('signup, admin edit, settlement, network drop, another login, delete', asyn
   // DB 기록 has every edit and settlement.
   await admin.getByTestId('tab-log').click();
   const log = admin.getByTestId('log');
-  for (const kind of ['가입', '수정', '정산 요청', '정산 완료', '정산 거절', '관리자 정산']) await expect(log).toContainText(kind);
+  for (const kind of ['가입', '데스 게임 통과', '수정', '정산 요청', '정산 완료', '정산 거절', '관리자 정산']) await expect(log).toContainText(kind);
   await expect(log.locator('tr').first()).toContainText('관리자 정산');
   await admin.getByTestId('tab-players').click();
 

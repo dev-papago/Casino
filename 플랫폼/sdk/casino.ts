@@ -23,6 +23,43 @@ export interface CasinoPlayer {
   name: string;
   free: number; // chips the player can take into a game
   total: number;
+  held: number; // held for a settlement request
+  games: { game: string; stake: number }[]; // open game sessions
+}
+
+/**
+ * 승리 추세: the games pull every guest's chips (in all) toward a center, so over many rounds the balances settle
+ * into a skewed bell: a short left side (few go broke) and a long right tail toward 50. A result that would leave
+ * the guest further from the center than now is drawn again (or the round eased or tightened) unless it is kept,
+ * with chance e^(u(before) − u(after)); u grows with the distance in ln(chips / center), quadratically: `left`
+ * below the center, `right` above it. A result toward the center always stands. Going broke counts like losing
+ * all but 1/bust of the balance. Each game sets its own numbers (the skill games a higher center), tuned with the
+ * 확률 시뮬레이터 (/sim); 야바위 (an easier or harder shuffle) and 영끌문S (a 배당금) have their own forms.
+ * A guest who settles while ahead does better than one who plays on: the price of the bell (the user's choice).
+ */
+export interface Tilt {
+  center: number;
+  left: number;
+  right: number;
+  bust: number;
+}
+
+/** The chance that a result taking the guest from `before` to `after` chips (in all) stands. */
+export function keepChance(before: number, after: number, t: Tilt): number {
+  const u = (x: number): number => {
+    const d = Math.log(x / t.center);
+    return (d < 0 ? t.left : t.right) * d * d;
+  };
+  const b = Math.max(1, before);
+  return Math.min(1, Math.exp(u(b) - u(after > 0 ? after : b / t.bust)));
+}
+
+let lastSeen: CasinoPlayer | null = null;
+
+/** The player's chips outside `game` and outside its free balance (held, in other games), as last read. */
+export function chipsElsewhere(game: string): number {
+  if (!lastSeen) return 0;
+  return lastSeen.held + lastSeen.games.reduce((a, g) => a + (g.game === game ? 0 : g.stake), 0);
 }
 
 export interface CasinoSession {
@@ -69,6 +106,7 @@ const token = (): string => raw(TOKEN_KEY) ?? '';
 /** The logged-in player; throws CasinoError 'session' when nobody is logged in on this PC. */
 export async function player(): Promise<CasinoPlayer> {
   const r = await call<{ me: CasinoPlayer }>('me', undefined, { auth: true, retryMs: 10_000 });
+  lastSeen = r.me;
   return r.me;
 }
 
@@ -173,6 +211,25 @@ async function sendOutbox(): Promise<number> {
 
 /** Results still waiting for the server. */
 export const waiting = (): number => outbox().length;
+
+// ------------------------------------------------------------------ 데스 게임
+
+/** Starts a 데스 게임 run: the server follows it (only for a player with too few chips for the games). */
+export async function deathStart(): Promise<string> {
+  return (await call<{ run: string }>('death/start', {}, { auth: true, retryMs: 10_000 })).run;
+}
+
+/** Stage `stage` (1–5) of the run is cleared. Sending it again is harmless. */
+export async function deathStage(run: string, stage: number): Promise<void> {
+  await call('death/stage', { run, stage }, { auth: true, retryMs: 20_000 });
+}
+
+/** Every stage cleared: the reward goes to the balance. `key` makes a repeat (after a lost answer) count once. */
+export async function deathClear(run: string, key: string): Promise<CasinoPlayer> {
+  const r = await call<{ me: CasinoPlayer }>('death/clear', { run, key }, { auth: true, retryMs: 20_000 });
+  lastSeen = r.me;
+  return r.me;
+}
 
 /** Back to the player app: closes the game window opened by the app, or goes to the app's page. */
 export function exit(): void {

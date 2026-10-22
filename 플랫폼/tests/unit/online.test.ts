@@ -18,7 +18,7 @@ afterEach(async () => {
 type Reply = { status: number; data: any; headers?: Headers };
 async function boot(dir = mkdtempSync(join(tmpdir(), 'online-')), timing: { entryLockMs?: number } = {}) {
   if (!dirs.includes(dir)) dirs.push(dir);
-  const srv = await startServer({ dataDir: dir, port: 0, host: '127.0.0.1', publicPort: 0, discoveryPort: null, timing });
+  const srv = await startServer({ dataDir: dir, port: 0, host: '127.0.0.1', publicPort: 0, timing: { deathStageMinMs: [0, 0, 0, 0, 0], ...timing } });
   running.push(srv);
   const at = (port: number) => async (path: string, body?: unknown, o: { token?: string; ip?: string } = {}): Promise<Reply> => {
     const res = await fetch(`http://127.0.0.1:${port}/${path}`, {
@@ -45,6 +45,13 @@ async function boot(dir = mkdtempSync(join(tmpdir(), 'online-')), timing: { entr
   return { srv, dir, lan, pub, code };
 }
 
+/** Plays the 데스 게임 through to its reward, through the tunnel (the stage minimums are 0 here). */
+async function clearDeath(pub: (path: string, body?: unknown, o?: { token?: string }) => Promise<Reply>, token: string): Promise<Reply> {
+  const { run } = (await pub('api/death/start', {}, { token })).data as { run: string };
+  for (let stage = 1; stage <= 5; stage++) await pub('api/death/stage', { run, stage }, { token });
+  return pub('api/death/clear', { run, key: `death-${run}` }, { token });
+}
+
 describe('public listener', () => {
   it('never reaches the admin side, though cloudflared connects from 127.0.0.1', async () => {
     const { lan, pub } = await boot();
@@ -54,14 +61,34 @@ describe('public listener', () => {
     for (const path of ['api/admin/edit', 'api/admin/review', 'api/admin/online/code', 'api/admin/settle']) {
       expect((await pub(path, {})).status, path).toBe(404);
     }
-    // The same requests on the Wi-Fi listener from this PC are the admin's.
+    // The same requests on the local listener from this PC are the admin's.
     expect((await lan('api/admin/state')).status).toBe(200);
   });
 
-  it('says how it works: online through the tunnel, as before on the Wi-Fi', async () => {
+  it('says how it works: online through the tunnel, and without on the admin PC itself', async () => {
     const { lan, pub } = await boot();
     expect((await pub('api/hello')).data).toEqual({ online: true, pingMs: PLATFORM.online.pingMs, entryDigits: PLATFORM.online.entryDigits });
     expect((await lan('api/hello')).data).toEqual({ online: false, pingMs: PLATFORM.pingMs, entryDigits: 0 });
+  });
+
+  it('checks the 입장 코드 on its own for the player exe, and shows players the ranking (and the rank page only on the admin PC)', async () => {
+    const { lan, pub, code } = await boot();
+    const c = await code();
+    expect((await pub('api/entry', { code: '000000' === c ? '111111' : '000000' })).data.error).toBe('entry');
+    expect((await pub('api/entry', { code: c })).data).toEqual({ ok: true });
+    expect((await lan('api/entry', {})).data).toEqual({ ok: true }); // this PC: no code
+    const a = (await pub('api/signup', { name: '일등', pin: '1111', code: c })).data;
+    const b = (await pub('api/signup', { name: '이등', pin: '2222', code: c })).data;
+    expect((await clearDeath(pub, b.token)).data.me.total).toBe(5);
+    await lan('api/admin/edit', { id: a.me.id, version: 1, name: '일등', pin: '1111', total: 30 });
+    expect((await pub('api/rank')).status).toBe(401); // players only
+    const r = (await pub('api/rank', undefined, { token: b.token })).data;
+    expect(r.rows.map((x: { name: string; total: number; me: boolean }) => [x.name, x.total, x.me])).toEqual([
+      ['일등', 30, false],
+      ['이등', 5, true],
+    ]);
+    expect(r.me).toEqual({ rank: 2, total: 5 });
+    for (const path of ['rank', 'sim', 'api/admin/rank']) expect((await pub(path)).status, path).toBe(404);
   });
 
   it('asks the 입장 코드 for signup and login through the tunnel only; the admin can change it', async () => {
@@ -74,7 +101,7 @@ describe('public listener', () => {
     expect((await pub('api/signup', { name: '손님', pin: '1111', code: c })).status).toBe(200);
     expect((await pub('api/login', { name: '손님', pin: '1111' })).data.error).toBe('entry');
     expect((await pub('api/login', { name: '손님', pin: '1111', code: c })).status).toBe(200);
-    expect((await lan('api/signup', { name: '부스', pin: '2222' })).status).toBe(200); // Wi-Fi: no code, as before
+    expect((await lan('api/signup', { name: '부스', pin: '2222' })).status).toBe(200); // this PC: no code
     const next = (await lan('api/admin/online/code', {})).data.code as string;
     expect(next).toMatch(new RegExp(`^\\d{${PLATFORM.online.entryDigits}}$`));
     if (next !== c) expect((await pub('api/login', { name: '손님', pin: '1111', code: c })).data.error).toBe('entry');
@@ -152,14 +179,14 @@ describe('public listener', () => {
     expect((await pub('api/hello')).status).toBe(200);
   });
 
-  it('answers through the tunnel without CORS and with safety headers; the Wi-Fi side as before', async () => {
+  it('answers without CORS anywhere, and with safety headers through the tunnel', async () => {
     const { lan, pub } = await boot();
     const p = await pub('api/hello');
     expect(p.headers?.get('access-control-allow-origin')).toBeNull();
     expect(p.headers?.get('x-content-type-options')).toBe('nosniff');
     expect(p.headers?.get('x-frame-options')).toBe('SAMEORIGIN');
     expect((await pub('api/nothing')).headers?.get('access-control-allow-origin')).toBeNull();
-    expect((await lan('api/hello')).headers?.get('access-control-allow-origin')).toBe('*');
+    expect((await lan('api/hello')).headers?.get('access-control-allow-origin')).toBeNull();
   });
 
   it('limits signup and login tries per IP through the tunnel', async () => {
@@ -173,10 +200,11 @@ describe('public listener', () => {
     expect((await pub('api/login', { name: '다른 이름', pin: '0000', code: c }, { ip: '203.0.113.8' })).data.error).toBe('login');
   });
 
-  it('holds a big online win until the admin approves it; the same game on the Wi-Fi pays at once', async () => {
+  it('holds a big online win until the admin approves it; the same game opened on the admin PC pays at once', async () => {
     const { lan, pub, code } = await boot();
     const c = await code();
     const auth = (await pub('api/signup', { name: '행운', pin: '7777', code: c })).data;
+    await clearDeath(pub, auth.token);
     const big = 1 + PLATFORM.online.reviewNet;
     const play = async (call: typeof pub) => {
       const r = await call('api/game/open', { game: 'yabawi', stake: 1, key: `k-${Math.random()}` }, { token: auth.token });
@@ -192,9 +220,9 @@ describe('public listener', () => {
     expect(state.games.find((g) => g.id === online.id)).toMatchObject({ online: true, review: big });
     expect((await lan('api/admin/review', { id: online.id, approve: true })).status).toBe(200);
     expect((await pub('api/me', undefined, { token: auth.token })).data.me.total).toBe(5 + big - 1);
-    // Opened on the Wi-Fi: paid as before.
-    const wifi = await play(lan);
-    const paid = await lan('api/game/close', { id: wifi.id, secret: wifi.secret, payout: big });
+    // Opened on the admin PC itself: paid at once.
+    const local = await play(lan);
+    const paid = await lan('api/game/close', { id: local.id, secret: local.secret, payout: big });
     expect(paid.data.review).toBe(false);
     expect(paid.data.me.total).toBe(5 + 2 * (big - 1));
   });

@@ -1,0 +1,57 @@
+:root {
+  --bg: #050811;
+  --bg2: #0f1629;
+  --panel: #0c101d;
+  --line: #1c2842;
+  --accent: #00f0ff;
+  --accent2: #ff007f;
+}
+.pk-wrap {
+  /* the whole board fits the window height (bar, result line and controls take about 340px) */
+  width: min(100%, 720px, calc((100vh - 340px) * 720 / 660));
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.pk-canvas {
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: radial-gradient(circle at 50% 30%, #121b36 0%, #050811 100%);
+  box-shadow: inset 0 0 40px rgba(0, 240, 255, 0.06);
+}
+.pk-history {
+  display: flex;
+  gap: 5px;
+  justify-content: flex-end;
+  min-height: 26px;
+  overflow: hidden;
+}
+.pk-tag {
+  padding: 3px 8px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 900;
+  animation: pk-in 0.3s ease-out;
+}
+@keyframes pk-in {
+  from {
+    transform: scale(0.4);
+    opacity: 0;
+  }
+}
+.pk-cap {
+  min-height: 18px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--dim);
+}
+.pk-gap {
+  margin-left: 10px;
+}
+.ab-btn.ghost.on {
+  border-color: var(--accent2);
+  color: var(--accent2);
+  box-shadow: 0 0 14px color-mix(in srgb, var(--accent2) 50%, transparent);
+}

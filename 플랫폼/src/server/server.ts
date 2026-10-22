@@ -1,33 +1,38 @@
-// The ledger server on the admin PC. Plain node:http, no packages: JSON requests, and
-// server-sent events for live updates to the player apps and the admin screen. Player endpoints are open to the
-// Wi-Fi; the admin page and admin endpoints answer only to the admin PC itself.
+// The ledger server on the admin PC. Plain node:http, no packages: JSON requests, and server-sent events for live
+// updates to the admin screen (and to a player app opened on this PC). The main listener answers on 127.0.0.1 only:
+// the admin page, the admin API, and the player routes for testing on the admin PC itself. Players play through the
+// internet address only (no direct Wi-Fi connections).
 //
 // Online means the player app reported in within PLATFORM.offlineAfterMs (it does every PLATFORM.pingMs). A
-// connection alone proves nothing: a laptop that walks out of the Wi-Fi leaves its connection open for minutes.
+// connection alone proves nothing: a laptop that loses its network leaves its connection open for minutes.
 //
-// 온라인판: with `publicPort` a second listener on 127.0.0.1 is the way in for cloudflared. Everything
+// With `publicPort` a second listener on 127.0.0.1 is the way in for cloudflared. Everything
 // that arrives there came from the internet, whatever its address says (cloudflared connects from 127.0.0.1), so it
 // gets the player routes only: no admin page, no admin API, no live updates (a Quick Tunnel does not pass them).
 // Signup and login there need the 입장 코드 (a new one at every start: the internet address changes then too), are
 // rate-limited per IP, and an IP that gets the code wrong too often is shut out for a while. Big wins wait for the
 // admin. Answers there carry no CORS header (the player app is served from the same address) and a few safety
 // headers.
-import { createSocket } from 'node:dgram';
+//
+// 데스 게임: the page plays in the browser, so the server follows each run (in memory: a restart means starting
+// over). A run starts only for a player with no chips at all, its five stages must be reported in
+// order and no faster than stageMinMs, and only then does the ledger pay the reward.
 import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { networkInterfaces } from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
 import { PLATFORM, gameDef } from '../shared/config.ts';
-import { ERROR_TEXT, LOG_LABEL, type AdminOnline, type AdminState, type ErrorCode, type Hello, type LanUrl } from '../shared/protocol.ts';
+import { ERROR_TEXT, LOG_LABEL, type AdminOnline, type AdminState, type ErrorCode, type Hello } from '../shared/protocol.ts';
 import {
   LedgerError,
   activity,
   cancelSettlement,
   cleanName,
   closeGame,
+  clearDeathGame,
   completeSettlement,
+  deathOpenFor,
   decideReview,
   directSettlement,
   edit,
@@ -35,25 +40,25 @@ import {
   logout,
   nameKey,
   openGame,
+  readMessage,
   remove,
   requestSettlement,
-  resolveBankruptcy,
+  sendMessage,
   signup,
   type LedgerEvent,
   type Player,
 } from './ledger.ts';
 import { Store } from './store.ts';
 import { startTunnel, type Tunnel, type TunnelState } from './tunnel.ts';
-import { adminState, playerView, type Live } from './views.ts';
+import { adminState, playerRankView, playerView, rankView, type Live } from './views.ts';
 
 export interface ServerOptions {
   dataDir: string;
   port?: number; // 0: any free port (tests)
-  host?: string;
+  host?: string; // default 127.0.0.1: nothing on the network reaches the main listener
   staticDir?: string; // the built pages and games; without it only the API answers
-  discoveryPort?: number | null; // UDP port answering player PCs that look for the server (null: none)
-  publicPort?: number | null; // 온라인판: the player-only listener for cloudflared, on 127.0.0.1 (0: any free port)
-  tunnel?: { exe: string } | null; // 온라인판: run this cloudflared to the public port
+  publicPort?: number | null; // the player-only listener for cloudflared, on 127.0.0.1 (0: any free port; null: none)
+  tunnel?: { exe: string } | null; // run this cloudflared to the public port
   clock?: () => number;
   timing?: Partial<Timing>;
 }
@@ -66,14 +71,21 @@ interface Timing {
   adminThrottleMs: number; // admin screen updates at most this often
   loginLockMs: number;
   entryLockMs: number; // an IP that got the 입장 코드 wrong too often waits this long
+  deathStageMinMs: readonly number[]; // 데스 게임: the least time a stage can take (tests: 0)
+}
+
+/** A 데스 게임 run the server follows: the stages cleared so far and when the last one was. */
+interface DeathRun {
+  id: string;
+  stage: number;
+  at: number;
 }
 
 export interface RunningServer {
   port: number;
-  publicPort: number | null; // 온라인판
+  publicPort: number | null;
   tunnel(): TunnelState | null;
   url: string; // on this PC
-  urls: LanUrl[]; // for the player PCs on the Wi-Fi
   store: Store;
   close(): Promise<void>;
 }
@@ -136,6 +148,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
     adminThrottleMs: 150,
     loginLockMs: PLATFORM.loginLockMs,
     entryLockMs: PLATFORM.online.entryLockMs,
+    deathStageMinMs: PLATFORM.deathGame.stageMinMs,
     ...o.timing,
   };
   const store = new Store(o.dataDir, clock);
@@ -145,7 +158,6 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
   const fails = new Map<string, { count: number; until: number }>();
   const playerStreams = new Map<string, Set<Stream>>();
   const adminStreams = new Set<AdminStream>();
-  let urls: LanUrl[] = [];
   let adminTimer: NodeJS.Timeout | null = null;
   let closing = false;
 
@@ -157,6 +169,8 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
   const wrongCodes = new Map<string, { count: number; until: number }>(); // wrong 입장 코드 per IP
   const wrongTimes: number[] = []; // wrong 입장 코드 from everywhere, last minute
   const signupTimes: number[] = [];
+  const deathRuns = new Map<string, DeathRun>(); // player id → the 데스 게임 run in progress
+  const messageTimes = new Map<string, number[]>(); // player id → messages sent in the last minute
 
   // ------------------------------------------------------------ presence
 
@@ -206,12 +220,11 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
 
   // ------------------------------------------------------------ pushes
 
-  function sse(res: ServerResponse, cors: boolean): void {
+  function sse(res: ServerResponse): void {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache',
       Connection: 'keep-alive',
-      ...(cors ? { 'Access-Control-Allow-Origin': '*' } : {}),
     });
     res.write('retry: 2000\n\n');
   }
@@ -239,7 +252,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
           code: entryCode,
         }
       : null;
-  const adminInfo = (): AdminState => adminState(store.state, live, clock(), { urls, dataDir, startedAt, online: onlineInfo() });
+  const adminInfo = (): AdminState => adminState(store.state, live, clock(), { dataDir, startedAt, online: onlineInfo() });
 
   /** Drops what is older than a minute; returns how many are left. */
   function lastMinute(times: number[]): number {
@@ -254,8 +267,8 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
     times.push(clock());
   }
 
-  /** Signup and login through the tunnel: rate-limited per IP, and only with the 입장 코드. */
-  function gate(req: IncomingMessage, b: Body, signingUp: boolean): void {
+  /** The 입장 코드 through the tunnel: rate-limited per IP, wrong codes counted per IP and for everyone together. */
+  function checkEntry(req: IncomingMessage, b: Body): void {
     // cloudflared puts the visitor's address here; only the public listener ever reads it (it can be faked elsewhere).
     // An IPv6 visitor holds a whole /64, so that is what counts as one place.
     const ip = ipKey(String(req.headers['cf-connecting-ip'] ?? '').split(',')[0].trim());
@@ -274,6 +287,18 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       throw new LedgerError('entry');
     }
     wrongCodes.delete(ip);
+  }
+
+  /** The player's 데스 게임 run, if `run` names it. */
+  function deathRun(p: Player, run: unknown): DeathRun {
+    const r = deathRuns.get(p.id);
+    if (!r || r.id !== run) throw new LedgerError('death_run');
+    return r;
+  }
+
+  /** Signup and login through the tunnel: only with the 입장 코드. */
+  function gate(req: IncomingMessage, b: Body, signingUp: boolean): void {
+    checkEntry(req, b);
     if (signingUp) limit(signupTimes, PLATFORM.online.signupsPerMin); // only signups that had the code count
   }
 
@@ -338,6 +363,11 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       pingMs: pub ? PLATFORM.online.pingMs : PLATFORM.pingMs,
       entryDigits: pub ? PLATFORM.online.entryDigits : 0,
     }),
+    // The player exe checks the 입장 코드 once, together with the internet address, and hands it to the app.
+    'POST /api/entry': (req, b, _res, pub) => {
+      if (pub) checkEntry(req, b);
+      return { ok: true };
+    },
     'POST /api/signup': (req, b, _res, pub) => {
       if (pub) gate(req, b, true);
       const e = store.run((s) => signup(s, { name: b.name, pin: b.pin, key: keyOf(b) }));
@@ -381,6 +411,10 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       touch(p.id);
       return { me: me(p.id) };
     },
+    'GET /api/rank': (req) => {
+      const p = authPlayer(bearer(req));
+      return playerRankView(store.state, (id) => live(id)?.online ?? false, p.id);
+    },
     'POST /api/ping': (req) => {
       const p = authPlayer(bearer(req));
       touch(p.id);
@@ -406,6 +440,50 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       const { id, game, stake, secret } = e.session;
       return { session: { id, game, stake, secret, openedAt: e.at }, me: me(p.id) };
     },
+    'POST /api/death/start': (req) => {
+      const p = authPlayer(bearer(req));
+      touch(p.id);
+      if (!deathOpenFor(store.state, p)) throw new LedgerError('death_rich');
+      const run: DeathRun = { id: randomUUID(), stage: 0, at: clock() };
+      deathRuns.set(p.id, run);
+      return { run: run.id };
+    },
+    'POST /api/death/stage': (req, b) => {
+      const p = authPlayer(bearer(req));
+      touch(p.id);
+      const r = deathRun(p, b.run);
+      if (b.stage === r.stage && r.stage > 0) return { ok: true }; // sent again (the answer was lost): already counted
+      const now = clock();
+      // In order, one at a time, and no faster than a person can play: anything else is a forged report.
+      if (b.stage !== r.stage + 1 || r.stage >= T.deathStageMinMs.length || now - r.at < T.deathStageMinMs[r.stage]) {
+        deathRuns.delete(p.id);
+        throw new LedgerError('death_run');
+      }
+      r.stage++;
+      r.at = now;
+      return { ok: true };
+    },
+    'POST /api/death/clear': (req, b) => {
+      const p = authPlayer(bearer(req));
+      touch(p.id);
+      const key = keyOf(b);
+      if (!store.state.keys.has(key)) {
+        // A repeated request (its answer was lost) finds its event by the key; a new one needs the whole run.
+        if (deathRun(p, b.run).stage !== T.deathStageMinMs.length) throw new LedgerError('death_run');
+        deathRuns.delete(p.id);
+      }
+      store.run((s) => clearDeathGame(s, { playerId: p.id, key }));
+      return { me: me(p.id) };
+    },
+    'POST /api/message': (req, b) => {
+      const p = authPlayer(bearer(req));
+      touch(p.id);
+      let times = messageTimes.get(p.id);
+      if (!times) messageTimes.set(p.id, (times = []));
+      limit(times, PLATFORM.message.perMin);
+      store.run((s) => sendMessage(s, { playerId: p.id, text: b.text, key: keyOf(b) }));
+      return { me: me(p.id) };
+    },
     // Needs no login: the session secret is enough, so a game can report after a logout, a kick or a restart.
     'POST /api/game/close': (_req, b) => {
       const e = store.run((s) => closeGame(s, { id: b.id, payout: b.payout, secret: b.secret, by: 'player' }));
@@ -416,6 +494,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
 
   const adminRoutes: Record<string, Handler> = {
     'GET /api/admin/state': () => ({ ...adminInfo(), log: store.state.log }),
+    'GET /api/admin/rank': () => rankView(store.state, (id) => live(id)?.online ?? false, clock()),
     'POST /api/admin/edit': (_req, b) => {
       store.run((s) => edit(s, { id: b.id, version: b.version, name: b.name, pin: b.pin, total: b.total }));
       return { ok: true };
@@ -436,8 +515,8 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       store.run((s) => cancelSettlement(s, { id: b.id, by: 'admin' }));
       return { ok: true };
     },
-    'POST /api/admin/bankrupt/done': (_req, b) => {
-      store.run((s) => resolveBankruptcy(s, b.id));
+    'POST /api/admin/message/read': (_req, b) => {
+      store.run((s) => readMessage(s, b.id));
       return { ok: true };
     },
     'POST /api/admin/game/close': (_req, b) => {
@@ -457,7 +536,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
   };
 
   function openPlayerStream(req: IncomingMessage, res: ServerResponse, url: URL): void {
-    sse(res, true);
+    sse(res);
     let p: Player;
     try {
       p = authPlayer(url.searchParams.get('token'));
@@ -480,7 +559,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
   }
 
   function openAdminStream(req: IncomingMessage, res: ServerResponse): void {
-    sse(res, false);
+    sse(res);
     const a: AdminStream = { res, logSent: store.state.log.length };
     send(res, 'snapshot', { ...adminInfo(), log: store.state.log });
     adminStreams.add(a);
@@ -521,13 +600,15 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       url = new URL(req.url ?? '/', 'http://x');
     } catch {
       // A request line no URL can be made of must not take the server down.
-      reply(res, 400, { error: 'bad_request', message: ERROR_TEXT.bad_request }, false);
+      reply(res, 400, { error: 'bad_request', message: ERROR_TEXT.bad_request });
       return;
     }
     const path = url.pathname;
     const route = `${req.method} ${path}`;
     const isApi = path.startsWith('/api/');
-    const isAdmin = path.startsWith('/api/admin/') || path === '/admin' || path === '/admin.html';
+    const isRank = path === '/rank' || path === '/rank.html'; // 순위 대시보드: on the admin PC (a projector), not online
+    const isSim = path === '/sim' || path === '/sim.html'; // 확률 시뮬레이터: on the admin PC
+    const isAdmin = path.startsWith('/api/admin/') || path === '/admin' || path === '/admin.html' || isRank || isSim;
     if (pub) {
       // The player app and the games come from this same address: no other site needs to read these answers,
       // frame these pages or sniff their types.
@@ -535,47 +616,38 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       res.setHeader('X-Frame-Options', 'SAMEORIGIN');
       res.setHeader('Referrer-Policy', 'no-referrer');
     }
-    const cors = !isAdmin && !pub; // the Wi-Fi player app may be opened from a file; through the tunnel it never is
     try {
       // Through the tunnel: no admin anything (not even its page) and no live updates. Checked first: the tunnel
       // connects from 127.0.0.1, which fromThisPc() would take for the admin PC.
       if (pub && (isAdmin || route === 'GET /api/events')) throw new HttpError(404, 'not found');
       if (isAdmin && !fromThisPc(req)) throw new LedgerError('forbidden');
-      if (isApi && cors && req.method === 'OPTIONS') {
-        res.writeHead(204, {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST',
-          'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-          'Access-Control-Max-Age': '600',
-        });
-        res.end();
-        return;
-      }
       if (route === 'GET /api/events') return openPlayerStream(req, res, url);
       if (route === 'GET /api/admin/events') return openAdminStream(req, res);
       if (route === 'GET /api/admin/log.csv') return logCsv(res);
       const handler = playerRoutes[route] ?? adminRoutes[route];
       if (handler) {
         const body = req.method === 'POST' ? await readBody(req) : {};
-        reply(res, 200, handler(req, body, res, pub), cors);
+        reply(res, 200, handler(req, body, res, pub));
         return;
       }
       if (isApi) throw new HttpError(404, 'not found');
       if (req.method !== 'GET' && req.method !== 'HEAD') throw new HttpError(405, 'method not allowed');
       if (path === '/' || path === '/index.html') return await serveFile(res, 'index.html');
       const game = /^\/games\/([a-z]+)\/(?:index\.html)?$/.exec(path)?.[1];
-      if (game && gameDef(game)) return await serveFile(res, `games/${game}/index.html`);
+      if (game && (gameDef(game) || game === DEATH_GAME)) return await serveFile(res, `games/${game}/index.html`);
+      if (isRank) return await serveFile(res, 'rank.html');
+      if (isSim) return await serveFile(res, 'sim.html');
       if (isAdmin) return await serveFile(res, 'admin.html');
       if (path.startsWith('/assets/')) return await serveFile(res, path.slice(1));
       throw new HttpError(404, 'not found');
     } catch (err) {
       if (err instanceof LedgerError) {
-        reply(res, STATUS[err.code] ?? 400, { error: err.code, message: ERROR_TEXT[err.code] }, cors);
+        reply(res, STATUS[err.code] ?? 400, { error: err.code, message: ERROR_TEXT[err.code] });
       } else if (err instanceof HttpError) {
-        reply(res, err.status, { error: 'bad_request', message: err.message }, cors);
+        reply(res, err.status, { error: 'bad_request', message: err.message });
       } else {
         console.error(err);
-        reply(res, 500, { error: 'bad_request', message: '서버 오류' }, cors);
+        reply(res, 500, { error: 'bad_request', message: '서버 오류' });
       }
     }
   }
@@ -583,7 +655,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
   const server = createServer((req, res) => void handle(req, res, false));
   const publicServer = online ? createServer((req, res) => void handle(req, res, true)) : null;
   try {
-    await listen(server, o.port ?? PLATFORM.port, o.host ?? '0.0.0.0');
+    await listen(server, o.port ?? PLATFORM.port, o.host ?? '127.0.0.1');
     if (publicServer) await listen(publicServer, o.publicPort ?? PLATFORM.online.publicPort, '127.0.0.1');
   } catch (e) {
     clearInterval(sweep);
@@ -597,21 +669,17 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
   if (publicPort !== null && o.tunnel) {
     tunnel = startTunnel({ exe: o.tunnel.exe, port: publicPort, restartMs: PLATFORM.online.tunnelRestartMs, onChange: () => scheduleAdmin() });
   }
-  urls = lanUrls(port);
-  const discovery = o.discoveryPort === null ? null : answerDiscovery(o.discoveryPort ?? PLATFORM.discoveryPort, port);
 
   return {
     port,
     publicPort,
     tunnel: () => tunnel?.state() ?? null,
     url: `http://127.0.0.1:${port}/`, // not "localhost": that may mean IPv6, and the server listens on IPv4
-    urls,
     store,
     async close() {
       for (const id of [...presence.keys()]) goOffline(id); // saves everyone's online time
       closing = true;
       tunnel?.stop();
-      discovery?.close();
       clearInterval(sweep);
       clearInterval(keepAlive);
       if (adminTimer) clearTimeout(adminTimer);
@@ -657,28 +725,11 @@ export function ipKey(ip: string): string {
     .join(':')}::/64`;
 }
 
+/** The 데스 게임's page (games/deathgame): not a chip game, it pays PLATFORM.deathGame.reward once cleared. */
+const DEATH_GAME = 'deathgame';
+
 /** A new 입장 코드: random digits, leading zeros kept. */
 const newCode = (): string => String(randomInt(0, 10 ** PLATFORM.online.entryDigits)).padStart(PLATFORM.online.entryDigits, '0');
-
-export const DISCOVERY_QUESTION = 'CASINO?';
-
-/**
- * Answers player PCs looking for the server: they broadcast "CASINO?" on the Wi-Fi and get back the HTTP port,
- * and the answer's sender address is the server. A taken port only costs the automatic search.
- */
-function answerDiscovery(udpPort: number, httpPort: number): { close(): void } | null {
-  const sock = createSocket({ type: 'udp4', reuseAddr: true });
-  sock.on('error', (e) => {
-    console.warn(`자동 찾기(UDP ${udpPort})를 켜지 못했습니다: ${e.message}`);
-    sock.close();
-  });
-  sock.on('message', (msg, from) => {
-    if (msg.toString() !== DISCOVERY_QUESTION) return;
-    sock.send(JSON.stringify({ casino: true, port: httpPort }), from.port, from.address);
-  });
-  sock.bind(udpPort);
-  return { close: () => sock.close() };
-}
 
 /** The player whose app should hear about this event. */
 function affected(e: LedgerEvent): string | null {
@@ -695,6 +746,10 @@ function affected(e: LedgerEvent): string | null {
       return e.session.playerId;
     case 'settleRequest':
       return e.settlement.playerId;
+    case 'message':
+      return e.message.playerId;
+    case 'messageRead':
+      return null; // the player sees it on the next report
     default:
       return e.playerId;
   }
@@ -725,25 +780,13 @@ async function readBody(req: IncomingMessage): Promise<Record<string, unknown>> 
   throw new LedgerError('bad_request');
 }
 
-function reply(res: ServerResponse, status: number, data: unknown, cors: boolean): void {
+function reply(res: ServerResponse, status: number, data: unknown): void {
   if (res.headersSent) return;
   res.writeHead(status, {
     'Content-Type': 'application/json; charset=utf-8',
     'Cache-Control': 'no-store',
-    ...(cors ? { 'Access-Control-Allow-Origin': '*' } : {}),
   });
   res.end(JSON.stringify(data));
-}
-
-/** http://<address>:<port>/ for every IPv4 address of this PC, Wi-Fi first and virtual adapters last. */
-export function lanUrls(port: number): LanUrl[] {
-  const out: LanUrl[] = [];
-  for (const [name, list] of Object.entries(networkInterfaces())) {
-    for (const a of list ?? []) if (a.family === 'IPv4' && !a.internal) out.push({ name, url: `http://${a.address}:${port}/` });
-  }
-  const rank = (n: string): number =>
-    /wi-?fi|wlan|wireless|무선/i.test(n) ? 0 : /vethernet|virtual|vmware|vbox|docker|wsl|loopback|tailscale|zerotier|vpn/i.test(n) ? 2 : 1;
-  return out.sort((a, b) => rank(a.name) - rank(b.name));
 }
 
 function localTime(ms: number): string {

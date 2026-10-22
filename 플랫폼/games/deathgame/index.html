@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="color-scheme" content="dark">
+    <link rel="icon" href="data:,">
+    <title>데스 게임 · THE FINAL SEAT</title>
+    <!-- Google Fonts: Cinzel, Noto Sans KR, Special Elite (the page falls back to system fonts without them) -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@700;900&family=Noto+Sans+KR:wght@300;400;700;900&family=Special+Elite&display=swap" rel="stylesheet">
+</head>
+<body class="relative w-screen h-screen room-container flex flex-col justify-between items-center select-none">
+
+    <!-- 필름 노이즈 그레인 오버레이 -->
+    <div class="grain-overlay"></div>
+
+    <!-- 핀조명 빔 -->
+    <div class="spotlight"></div>
+
+    <!-- 조명 등기구 SVGs -->
+    <div class="absolute top-0 left-1/2 -translate-x-1/2 z-20 pointer-events-none flex flex-col items-center">
+        <div class="w-1 h-20 bg-zinc-800"></div>
+        <div class="w-16 h-8 bg-zinc-900 rounded-t-full border-t border-zinc-700 shadow-2xl"></div>
+    </div>
+
+    <!-- 먼지 입자 파티클 캔버스 -->
+    <canvas id="dustCanvas" class="absolute inset-0 pointer-events-none z-10"></canvas>
+
+    <!-- 배경 어두운 비네팅 -->
+    <div class="absolute inset-0 pointer-events-none z-10" style="background: radial-gradient(circle, transparent 35%, rgba(0,0,0,0.88) 88%);"></div>
+
+    <!-- 1. 메인 헤더 & 타이틀 영역 -->
+    <header class="relative z-30 pt-16 flex flex-col items-center text-center">
+        <div class="text-[11px] uppercase tracking-[0.45em] text-red-800/90 font-bold mb-2 animate-pulse">
+            ─── 심리 추리 생존 잔혹극 ───
+        </div>
+        <h1 class="glitch-text font-cinzel text-5xl md:text-7xl font-black text-zinc-100 tracking-wider" data-text="THE FINAL SEAT">
+            THE FINAL SEAT
+        </h1>
+        <p class="mt-3 font-special text-xs md:text-sm text-zinc-500 tracking-widest">
+            "마지막 의자에 앉아 모든 것을 증명하라."
+        </p>
+    </header>
+
+    <!-- 2. 중앙 테이블 및 의자 실루엣 그래픽 -->
+    <div class="table-silhouette z-20 flex flex-col items-center justify-end pb-4">
+        <div class="absolute bottom-6 w-96 h-10 bg-zinc-200/5 rounded-full blur-xl pointer-events-none"></div>
+
+        <svg class="w-full h-full drop-shadow-[0_12px_28px_rgba(0,0,0,0.98)]" viewBox="0 0 800 260" fill="none" xmlns="http://www.w3.org/2000/svg">
+            <path d="M370 70 H430 V120 H370 Z" fill="#08080c" />
+            <path d="M365 120 H435 V130 H365 Z" fill="#0e0e14" />
+            <polygon points="120,160 680,160 740,210 60,210" fill="#111116" stroke="#22222c" stroke-width="1.2" />
+            <polygon points="60,210 740,210 740,216 60,216" fill="#07070a" />
+            <rect x="100" y="216" width="20" height="44" fill="#060608" />
+            <rect x="680" y="216" width="20" height="44" fill="#060608" />
+            <path d="M 330,260 L 340,195 Q 400,185 460,195 L 470,260 Z" fill="#050508" stroke="#16161f" stroke-width="1" />
+            <rect x="380" y="175" width="25" height="15" rx="1" fill="#181822" transform="rotate(-15 380 175)"/>
+            <circle cx="440" cy="180" r="4.5" fill="#2d0a0a" />
+        </svg>
+    </div>
+
+    <!-- 3. 메인 메뉴 UI (버튼 위치를 상향 조절: mb-12 -> mb-24) -->
+    <main id="mainMenu" class="relative z-30 mb-24 flex flex-col items-center space-y-3.5 w-72 sm:w-80">
+        <button id="btnStart" class="btn-death w-full py-3 px-6 rounded-md text-zinc-200 font-bold tracking-widest text-xs sm:text-sm flex items-center justify-center space-x-2 group">
+            <span class="w-1.5 h-1.5 rounded-full bg-red-800 group-hover:scale-150 transition-transform"></span>
+            <span>게임 시작 (START)</span>
+        </button>
+
+        <button id="btnRules" class="btn-death w-full py-3 px-6 rounded-md text-zinc-400 font-medium tracking-widest text-xs sm:text-sm flex items-center justify-center space-x-2">
+            <span>게임 규칙 (RULES)</span>
+        </button>
+
+        <button id="btnSettings" class="btn-death w-full py-3 px-6 rounded-md text-zinc-400 font-medium tracking-widest text-xs sm:text-sm flex items-center justify-center space-x-2">
+            <span>설정 (SETTINGS)</span>
+        </button>
+
+        <button id="btnExit" class="btn-death w-full py-3 px-6 rounded-md text-zinc-400 font-medium tracking-widest text-xs sm:text-sm flex items-center justify-center space-x-2" data-testid="death-lobby">
+            <span>로비로 (EXIT)</span>
+        </button>
+
+        <div class="pt-2 text-center">
+            <span id="rewardNote" class="text-[11px] text-amber-500/90 tracking-wider" data-testid="death-reward"></span>
+        </div>
+    </main>
+
+    <!-- 4. 모달: 게임 규칙 (RULES) -->
+    <div id="modalRules" class="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center hidden opacity-0 fade-transition">
+        <div class="bg-zinc-950 border border-zinc-800/80 text-zinc-300 w-11/12 max-w-lg rounded-lg p-6 shadow-2xl relative">
+            <h2 class="text-lg font-bold font-cinzel text-red-700 tracking-wider mb-4 border-b border-zinc-800/80 pb-2">
+                PLAYER RULES
+            </h2>
+            <div class="space-y-3 text-xs md:text-sm leading-relaxed text-zinc-400 max-h-72 overflow-y-auto pr-2 font-light">
+                <p><strong class="text-zinc-200 font-bold">진행:</strong> 총 5개 관문을 순서대로 통과하면 승리합니다. 각 관문은 시작 안내 후 게임이 시작됩니다. 카지노에서는 잔고가 0칩일 때 도전할 수 있고, 모두 통과하면 칩 5개를 받으며, 실패하면 처음부터 다시 도전할 수 있습니다.</p>
+                <p><strong class="text-zinc-200 font-bold">제1관문 · 독 잔 추리 또는 암호 해독:</strong> 독 잔 게임은 네 단서 중 하나만 거짓인 점을 이용해 독 잔을 찾으세요. 오답은 두 번까지 허용됩니다. 암호 게임은 1~9의 중복 없는 네 숫자를 6회 안에 맞히세요. 초록은 숫자와 자리 모두 일치, 호박색은 숫자만 일치합니다.</p>
+                <p><strong class="text-zinc-200 font-bold">제2관문 · 불빛 암기:</strong> 불빛 순서를 기억해 같은 순서로 입력하세요. 3개부터 시작해 라운드마다 하나씩 늘어나며, 총 5라운드입니다. 목숨은 3개이고 오답이면 같은 순서를 다시 보여줍니다.</p>
+                <p><strong class="text-zinc-200 font-bold">제3관문 · 인디언 포커:</strong> 내 목숨 5개, 딜러 목숨 4개로 시작합니다. 카드는 1~15이며 내 이마 카드는 보이지 않고 상대 카드만 보입니다. 내 차례에는 1개 또는 2개의 목숨을 걸어 콜하거나 다이할 수 있습니다. 딜러가 콜하면 받아들이거나 다이할 수 있으며(다이하면 목숨을 잃지 않습니다), 먼저 상대의 목숨을 모두 없애면 통과합니다.</p>
+                <p><strong class="text-zinc-200 font-bold">제4관문 · 시한폭탄 해체:</strong> 90초 안에 무작위로 배정된 두 회로 퍼즐을 모두 해결하세요. 오답이면 해당 퍼즐이 다시 설정되며 제한 시간은 계속 흐릅니다.</p>
+                <p><strong class="text-zinc-200 font-bold">제5관문 · 러시안 룰렛:</strong> 6개 탄창 중 한 곳에 실탄이 있습니다. 상대 주사위는 무작위로 굴러가고, 내 주사위는 1→6 순서로 돌아가며 원하는 순간에 멈출 수 있습니다. 더 낮은 숫자가 나온 사람이 자신에게 방아쇠를 당깁니다. 동점이면 다시 굴립니다. 빈 탄창이면 다음 라운드로 넘어가고, 내가 실탄에 맞으면 실패하며 상대가 맞으면 통과합니다.</p>
+            </div>
+            <div class="mt-6 text-right">
+                <button id="btnCloseRules" class="px-5 py-2 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700/50 text-zinc-300 hover:text-white rounded text-xs transition">
+                    닫기 (CLOSE)
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 5. 모달: 설정 (SETTINGS) -->
+    <div id="modalSettings" class="fixed inset-0 z-50 bg-black/85 backdrop-blur-sm flex items-center justify-center hidden opacity-0 fade-transition">
+        <div class="bg-zinc-950 border border-zinc-800/80 text-zinc-300 w-11/12 max-w-md rounded-lg p-6 shadow-2xl">
+            <h2 class="text-lg font-bold font-cinzel text-zinc-200 tracking-wider mb-4 border-b border-zinc-800/80 pb-2">
+                SETTINGS
+            </h2>
+            <div class="space-y-4 text-xs sm:text-sm">
+                <div class="flex justify-between items-center">
+                    <label for="bgmToggle" class="text-zinc-400">배경 서스펜스 드론 (Ambient)</label>
+                    <input type="checkbox" id="bgmToggle" checked class="w-4 h-4 accent-red-800 cursor-pointer">
+                </div>
+                <div class="flex justify-between items-center">
+                    <label for="sfxToggle" class="text-zinc-400">효과음 (SFX)</label>
+                    <input type="checkbox" id="sfxToggle" checked class="w-4 h-4 accent-red-800 cursor-pointer">
+                </div>
+                <div class="flex justify-between items-center">
+                    <label for="flickerToggle" class="text-zinc-400">조명 깜빡임 효과</label>
+                    <input type="checkbox" id="flickerToggle" checked class="w-4 h-4 accent-red-800 cursor-pointer">
+                </div>
+            </div>
+            <div class="mt-6 text-right">
+                <button id="btnCloseSettings" class="px-5 py-2 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700/50 text-zinc-300 rounded text-xs transition">
+                    저장 및 닫기
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 6. 게임 진행 화면 -->
+    <div id="gameScreen" class="fixed inset-0 z-40 bg-black flex flex-col items-center justify-center hidden opacity-0 fade-transition">
+        <div id="stageContainer" class="w-full h-full flex flex-col items-center justify-center p-4">
+            <!-- 스테이지 UI 로드 영역 -->
+        </div>
+    </div>
+
+    <script type="module" src="./src/game.js"></script>
+</body>
+</html>

@@ -1,0 +1,313 @@
+/* 확률 시뮬레이터 (admin PC). Dark, like the admin screen; chart colours validated for this surface
+   (dataviz validator: #3987e5 / #d95926 on #15101f, all checks pass). */
+:root {
+  color-scheme: dark;
+  --bg: #0b0814;
+  --surface-1: #15101f;
+  --surface-2: #1e1730;
+  --line: rgba(255, 255, 255, 0.1);
+  --text-primary: #f0efec;
+  --text-secondary: #c3c2b7;
+  --text-muted: #8f8aa3;
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --accent: #ffcf4a;
+  --grid: rgba(255, 255, 255, 0.07);
+}
+* {
+  box-sizing: border-box;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: 'Malgun Gothic', 'Apple SD Gothic Neo', 'Noto Sans KR', system-ui, sans-serif;
+}
+#app {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 20px 16px 40px;
+  display: grid;
+  gap: 16px;
+}
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+.sm-head h1 {
+  margin: 0;
+  font-size: 26px;
+  color: var(--accent);
+}
+.sm-head p {
+  margin: 4px 0 0;
+  color: var(--text-secondary);
+}
+.sm-panel {
+  background: var(--surface-1);
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  padding: 16px;
+  display: grid;
+  gap: 14px;
+}
+.sm-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 22px;
+  align-items: flex-start;
+}
+.sm-row:empty {
+  display: none;
+}
+.sm-field {
+  display: grid;
+  gap: 6px;
+}
+.sm-label {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.sm-field small,
+.sm-hint {
+  color: var(--text-muted);
+  font-size: 12px;
+  margin: 0;
+}
+.sm-hint {
+  max-width: 760px;
+  line-height: 1.5;
+}
+.sm-input {
+  width: 92px;
+  padding: 7px 9px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+}
+.sm-unit,
+.sm-bet {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+.sm-bet .sm-input {
+  width: 72px;
+}
+.sm-stack {
+  display: grid;
+  gap: 6px;
+}
+.sm-seg {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.sm-seg button {
+  padding: 7px 12px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  cursor: pointer;
+  font-size: 14px;
+}
+.sm-seg button.on {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #241400;
+  font-weight: 800;
+}
+.sm-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.sm-run {
+  padding: 10px 22px;
+  border-radius: 10px;
+  border: 0;
+  background: var(--accent);
+  color: #241400;
+  font-weight: 900;
+  cursor: pointer;
+}
+.sm-run:disabled {
+  opacity: 0.5;
+  cursor: wait;
+}
+.sm-stop {
+  padding: 9px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--line);
+  background: transparent;
+  cursor: pointer;
+}
+.sm-progress {
+  width: 200px;
+  height: 8px;
+  border-radius: 8px;
+  background: var(--surface-2);
+  overflow: hidden;
+}
+.sm-progress-fill {
+  height: 100%;
+  width: 0;
+  background: var(--series-1);
+  transition: width 0.2s;
+}
+.sm-status {
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+.sm-tiles {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
+  gap: 10px;
+}
+.sm-tiles:empty {
+  display: none;
+}
+.sm-tile {
+  background: var(--surface-2);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+.sm-tile-label {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.sm-tile-value {
+  font-size: 24px;
+  font-weight: 900;
+  font-variant-numeric: tabular-nums;
+}
+.sm-tile-sub {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.sm-chart-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 18px;
+}
+.sm-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  flex: 1;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.sm-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.sm-key i {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+}
+.sm-key.now i {
+  background: var(--series-1);
+}
+.sm-key.prev i {
+  height: 0;
+  border-top: 2px solid var(--series-2);
+  border-radius: 0;
+  width: 16px;
+}
+.sm-check {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.sm-chart {
+  width: 100%;
+  min-height: 260px;
+}
+.sm-chart svg {
+  display: block;
+}
+.sm-empty {
+  display: grid;
+  place-items: center;
+  min-height: 260px;
+  color: var(--text-muted);
+}
+.sm-grid {
+  stroke: var(--grid);
+  stroke-width: 1;
+}
+.sm-base {
+  stroke: var(--text-muted);
+  stroke-width: 1;
+}
+.sm-axis {
+  fill: var(--text-muted);
+  font-size: 12px;
+}
+.sm-value {
+  fill: var(--text-primary);
+  font-size: 12px;
+  font-weight: 700;
+}
+.sm-bar {
+  fill: var(--series-1);
+}
+.sm-prev {
+  fill: none;
+  stroke: var(--series-2);
+  stroke-width: 2;
+  stroke-linejoin: round;
+}
+.sm-hit {
+  fill: transparent;
+}
+.sm-hit:hover {
+  fill: rgba(255, 255, 255, 0.05);
+}
+.sm-tip {
+  position: fixed;
+  z-index: 10;
+  pointer-events: none;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  display: grid;
+  gap: 2px;
+}
+.sm-tip-sub {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.sm-details summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+.sm-table table {
+  border-collapse: collapse;
+  margin-top: 8px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+.sm-table th,
+.sm-table td {
+  padding: 3px 14px 3px 0;
+  text-align: right;
+}
+.sm-table th:first-child,
+.sm-table td:first-child {
+  text-align: left;
+}

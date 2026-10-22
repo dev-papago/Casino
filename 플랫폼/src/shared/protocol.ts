@@ -19,12 +19,16 @@ export type ErrorCode =
   | 'unchanged'
   | 'game'
   | 'payout'
+  | 'settle_cap'
   | 'closed'
   | 'review'
   | 'entry'
   | 'entry_locked'
   | 'busy'
   | 'forbidden'
+  | 'death_rich'
+  | 'death_run'
+  | 'message'
   | 'not_found';
 
 export const ERROR_TEXT: Record<ErrorCode, string> = {
@@ -44,12 +48,16 @@ export const ERROR_TEXT: Record<ErrorCode, string> = {
   unchanged: '바뀐 값이 없습니다',
   game: '알 수 없는 게임입니다',
   payout: '게임 결과가 한도를 넘습니다. 관리자에게 문의하세요',
+  settle_cap: '실물 칩은 한 사람당 축제 동안 50개까지만 받을 수 있습니다',
   closed: '이미 정산된 게임입니다',
   review: '관리자가 확인하고 있는 게임입니다',
   entry: '입장 코드가 맞지 않습니다. 행사장에서 안내한 코드를 넣으세요',
   entry_locked: '입장 코드를 여러 번 틀렸습니다. 2분 뒤에 다시 하세요',
   busy: '요청이 너무 많습니다. 잠시 뒤에 다시 하세요',
   forbidden: '관리자 PC에서만 할 수 있습니다',
+  death_rich: '잔고가 0칩일 때만 데스 게임에 도전할 수 있습니다',
+  death_run: '데스 게임 진행 기록이 맞지 않습니다. 처음부터 다시 도전하세요',
+  message: '메시지는 1~200글자로 적으세요',
   not_found: '없는 플레이어입니다',
 };
 
@@ -76,9 +84,17 @@ export interface PlayerView {
   free: number; // free to use
   held: number; // held for the pending settlement request
   inGame: number; // staked in open game sessions
+  paidOut: number; // physical chips received so far
+  settleLeft: number; // physical chips this player can still receive (PLATFORM.settleMax in all)
   settlement: { id: string; amount: number; requestedAt: number } | null;
-  bankrupt: boolean; // a bankruptcy request is waiting for the admin
+  deathGame: boolean; // no chips at all: the 데스 게임 pays out
+  messages: { id: string; text: string; at: number; read: boolean }[]; // sent to the admin, newest first
   games: GameSessionView[];
+}
+
+/** POST /api/death/start: the run the server follows; its stages are reported as they are cleared. */
+export interface DeathStartReply {
+  run: string;
 }
 
 export interface AuthReply {
@@ -127,6 +143,7 @@ export type LogKind =
   | 'settleDirect'
   | 'bankrupt'
   | 'bankruptDone'
+  | 'deathClear'
   | 'gameOpen'
   | 'gameClose'
   | 'gameReview'
@@ -141,8 +158,9 @@ export const LOG_LABEL: Record<LogKind, string> = {
   settleReject: '정산 거절',
   settleDone: '정산 완료',
   settleDirect: '관리자 정산',
-  bankrupt: '파산 신청',
+  bankrupt: '파산',
   bankruptDone: '파산 처리',
+  deathClear: '데스 게임 통과',
   gameOpen: '게임 입장',
   gameClose: '게임 정산',
   gameReview: '지급 확인 요청',
@@ -178,8 +196,10 @@ export interface AdminPlayer {
   online: boolean;
   played: number; // game sessions finished
   net: number; // chips won (+) or lost (−) in them
+  paidOut: number; // physical chips handed over
+  settleLeft: number; // physical chips still allowed (PLATFORM.settleMax in all)
   version: number;
-  bankrupt: boolean;
+  deathClears: number; // 데스 게임 cleared (each paid PLATFORM.deathGame.reward)
 }
 
 export interface AdminSettlement {
@@ -190,11 +210,14 @@ export interface AdminSettlement {
   requestedAt: number;
 }
 
-export interface AdminBankruptcy {
+/** A player's message to the admin. */
+export interface AdminMessage {
   id: string;
   playerId: string;
   name: string;
-  filedAt: number;
+  text: string;
+  at: number;
+  read: boolean;
 }
 
 export interface AdminGame extends GameSessionView {
@@ -211,26 +234,46 @@ export interface AdminOnline {
   code: string; // 입장 코드
 }
 
-/** An address of the admin PC that player PCs can open, with the network it is on (Wi-Fi, 이더넷, …). */
-export interface LanUrl {
-  name: string;
-  url: string;
-}
-
 export interface AdminState {
   at: number;
   players: AdminPlayer[];
   settlements: AdminSettlement[];
-  bankruptcies: AdminBankruptcy[];
+  messages: AdminMessage[]; // unread first, then the latest read ones
   games: AdminGame[];
-  // Chips given at signup, net admin edits, net game results, paid out at the counter, lost with deleted accounts,
+  // Chips given (signup, 데스 게임), net admin edits, net game results, paid out at the counter, lost with deleted accounts,
   // and still owed to players. outstanding = bonus + edits + games − settled − deleted, always.
   totals: { bonus: number; edits: number; games: number; settled: number; deleted: number; outstanding: number };
-  server: { urls: LanUrl[]; dataDir: string; startedAt: number; online: AdminOnline | null };
+  server: { dataDir: string; startedAt: number; online: AdminOnline | null };
 }
 
 /** Server-sent events on /api/admin/events: a full snapshot first, then only what changed and the new log lines. */
 export interface AdminEvents {
   snapshot: AdminState & { log: LogRecord[] };
   update: AdminState & { log: LogRecord[] };
+}
+
+// ------------------------------------------------------------------ 순위 대시보드 (admin PC: /rank)
+
+export interface RankRow {
+  name: string;
+  total: number; // 잔고
+  paidOut: number; // physical chips received
+  played: number;
+  net: number;
+  online: boolean;
+}
+
+export interface RankReply {
+  at: number;
+  rows: RankRow[]; // by 잔고, highest first
+  players: number;
+  outstanding: number; // all 잔고 together
+  settled: number; // physical chips handed over in all
+}
+
+/** The ranking beside the player app: the top players and this player's place. */
+export interface PlayerRankReply {
+  rows: { name: string; total: number; online: boolean; me: boolean }[];
+  me: { rank: number; total: number } | null;
+  players: number;
 }

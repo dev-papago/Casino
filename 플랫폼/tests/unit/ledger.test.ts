@@ -6,16 +6,19 @@ import { PLATFORM } from '../../src/shared/config.ts';
 import {
   LedgerError,
   cancelSettlement,
+  clearDeathGame,
   closeGame,
   completeSettlement,
   decideReview,
   directSettlement,
+  deathOpenFor,
   edit,
   login,
   openGame,
+  readMessage,
   remove,
   requestSettlement,
-  resolveBankruptcy,
+  sendMessage,
   signup,
   totalOf,
   type LedgerEvent,
@@ -48,9 +51,11 @@ const code = (f: () => unknown): string => {
 function fresh(): { store: Store; dir: string; join: (name: string) => string } {
   const dir = tempDir();
   const store = new Store(dir);
+  /** A new player who cleared the 데스 게임: PLATFORM.deathGame.reward chips to play with. */
   const joinPlayer = (name: string): string => {
     const e = store.run((s) => signup(s, { name, pin: '1234', key: key() }));
     if (e.type !== 'signup') throw new Error();
+    store.run((s) => clearDeathGame(s, { playerId: e.player.id, key: key() }));
     return e.player.id;
   };
   return { store, dir, join: joinPlayer };
@@ -65,10 +70,12 @@ function balanced(s: State): void {
 }
 
 describe('accounts', () => {
-  it('a signup gets the bonus; names are unique whatever the case and spacing; PIN is 4 digits', () => {
+  it('a signup starts with no chips; names are unique whatever the case and spacing; PIN is 4 digits', () => {
     const { store, join } = fresh();
-    const id = join('  홍길동 ');
-    expect(p(store.state, id)).toMatchObject({ name: '홍길동', chips: PLATFORM.signupBonus, version: 1 });
+    const e = store.run((s) => signup(s, { name: '  홍길동 ', pin: '1234', key: key() }));
+    if (e.type !== 'signup') throw new Error();
+    expect(p(store.state, e.player.id)).toMatchObject({ name: '홍길동', chips: 0, version: 1 });
+    expect(PLATFORM.signupBonus).toBe(0);
     expect(code(() => store.run((s) => signup(s, { name: '홍길동', pin: '1111', key: key() })))).toBe('name_taken');
     join('Kim Lee');
     expect(code(() => store.run((s) => signup(s, { name: 'kim   LEE', pin: '1111', key: key() })))).toBe('name_taken');
@@ -106,7 +113,7 @@ describe('accounts', () => {
 });
 
 describe('games', () => {
-  it('a game takes its stake, pays out once, and checks the secret and the limit', () => {
+  it('a game takes its stake, pays out once, and checks the secret; game wins have no limit', () => {
     const { store, join } = fresh();
     const id = join('게이머');
     const open = store.run((s) => openGame(s, { playerId: id, game: 'yabawi', stake: 3, key: key() }));
@@ -117,13 +124,22 @@ describe('games', () => {
     expect(code(() => store.run((s) => openGame(s, { playerId: id, game: 'yabawi', stake: 3, key: key() })))).toBe('funds');
     expect(code(() => store.run((s) => openGame(s, { playerId: id, game: 'poker', stake: 1, key: key() })))).toBe('game');
     expect(code(() => store.run((s) => closeGame(s, { id: gid, payout: 7, secret: 'wrong', by: 'player' })))).toBe('session');
-    expect(code(() => store.run((s) => closeGame(s, { id: gid, payout: 51, secret, by: 'player' })))).toBe('payout');
     const close = store.run((s) => closeGame(s, { id: gid, payout: 7, secret, by: 'player' }));
     expect(p(store.state, id)).toMatchObject({ chips: 9, played: 1, net: 4 });
+    // 야바위 and 영끌문S run many rounds: no payout limit. A one-round game pays at most stake × its top prize.
+    const big = store.run((s) => openGame(s, { playerId: id, game: 'yabawi', stake: 1, key: key() }));
+    if (big.type !== 'gameOpen') throw new Error();
+    store.run((s) => closeGame(s, { id: big.session.id, payout: 120, secret: big.session.secret, by: 'player' }));
+    expect(p(store.state, id).chips).toBe(128);
+    const spin = store.run((s) => openGame(s, { playerId: id, game: 'slot', stake: 2, key: key() }));
+    if (spin.type !== 'gameOpen') throw new Error();
+    expect(code(() => store.run((s) => closeGame(s, { id: spin.session.id, payout: 101, secret: spin.session.secret, by: 'player' })))).toBe('payout');
+    store.run((s) => closeGame(s, { id: spin.session.id, payout: 100, secret: spin.session.secret, by: 'player' })); // 777 × 2
+    expect(p(store.state, id).chips).toBe(226);
     // The same report again (the answer was lost) changes nothing; a different one is refused.
     expect(store.run((s) => closeGame(s, { id: gid, payout: 7, secret, by: 'player' }))).toBe(close);
     expect(code(() => store.run((s) => closeGame(s, { id: gid, payout: 9, secret, by: 'player' })))).toBe('closed');
-    expect(p(store.state, id).chips).toBe(9);
+    expect(p(store.state, id).chips).toBe(226);
     balanced(store.state);
   });
 
@@ -147,7 +163,7 @@ describe('games', () => {
     expect(store.state.log.at(-1)).toMatchObject({ kind: 'gameForce', delta: 0, text: expect.stringContaining('환불') });
   });
 
-  it('an online game holds a big win for the admin; a Wi-Fi game and a small online win pay out at once', () => {
+  it('an online game holds a big win for the admin; a local game and a small online win pay out at once', () => {
     const { store, dir, join } = fresh();
     const id = join('온라인');
     const big = PLATFORM.online.reviewNet;
@@ -156,7 +172,7 @@ describe('games', () => {
       if (e.type !== 'gameOpen') throw new Error();
       return e.session;
     };
-    // Wi-Fi: paid at once, however big (only the game's limit applies), as before.
+    // Opened on the admin PC itself: paid at once, however big (only the game's limit applies).
     const lan = opened(false);
     expect(lan).not.toHaveProperty('online');
     store.run((s) => closeGame(s, { id: lan.id, payout: 1 + big, secret: lan.secret, by: 'player' }));
@@ -230,6 +246,24 @@ describe('settlements', () => {
     balanced(store.state);
   });
 
+  it(`one player gets at most ${PLATFORM.settleMax} physical chips over the festival; game chips stay unlimited`, () => {
+    const { store, join } = fresh();
+    const id = join('부자');
+    const g = store.run((s) => openGame(s, { playerId: id, game: 'yabawi', stake: 5, key: key() }));
+    if (g.type !== 'gameOpen') throw new Error();
+    store.run((s) => closeGame(s, { id: g.session.id, payout: 80, secret: g.session.secret, by: 'player' }));
+    expect(code(() => store.run((s) => requestSettlement(s, { playerId: id, amount: 51, key: key() })))).toBe('settle_cap');
+    const r = store.run((s) => requestSettlement(s, { playerId: id, amount: 30, key: key() }));
+    if (r.type !== 'settleRequest') throw new Error();
+    // The pending 30 counts: only 20 more at the counter.
+    expect(code(() => store.run((s) => directSettlement(s, { playerId: id, amount: 21, key: key() })))).toBe('settle_cap');
+    store.run((s) => completeSettlement(s, r.settlement.id));
+    store.run((s) => directSettlement(s, { playerId: id, amount: 20, key: key() }));
+    expect(p(store.state, id)).toMatchObject({ paidOut: 50, chips: 30 });
+    expect(code(() => store.run((s) => directSettlement(s, { playerId: id, amount: 1, key: key() })))).toBe('settle_cap');
+    balanced(store.state);
+  });
+
   it('the admin settles directly, once per key', () => {
     const { store, join } = fresh();
     const id = join('카운터');
@@ -241,40 +275,62 @@ describe('settlements', () => {
   });
 });
 
-describe('bankruptcy', () => {
-  it('losing the last chip in a game files for bankruptcy once; the admin handles it', () => {
+describe('bankruptcy and the 데스 게임', () => {
+  it('losing the last chip in a game records a bankruptcy, and the 데스 게임 pays again', () => {
     const { store, join } = fresh();
     const id = join('파산');
     const open = store.run((s) => openGame(s, { playerId: id, game: 'yabawi', stake: 5, key: key() }));
     if (open.type !== 'gameOpen') throw new Error();
     store.run((s) => closeGame(s, { id: open.session.id, payout: 0, secret: open.session.secret, by: 'player' }));
-    expect(store.state.bankruptcies.size).toBe(1);
-    expect(store.state.log.at(-1)).toMatchObject({ kind: 'bankrupt', name: '파산' });
-    const [b] = store.state.bankruptcies.values();
-    store.run((s) => resolveBankruptcy(s, b.id));
-    expect(store.state.bankruptcies.size).toBe(0);
+    expect(store.state.log.at(-1)).toMatchObject({ kind: 'bankrupt', name: '파산', chips: 0 });
+    expect(deathOpenFor(store.state, p(store.state, id))).toBe(true);
+    store.run((s) => clearDeathGame(s, { playerId: id, key: key() }));
+    expect(p(store.state, id)).toMatchObject({ chips: PLATFORM.deathGame.reward, deathClears: 2 });
+    expect(store.state.log.at(-1)).toMatchObject({ kind: 'deathClear', delta: PLATFORM.deathGame.reward });
+    balanced(store.state);
   });
 
-  it('is not filed while chips are still held for a settlement or staked in another game', () => {
+  it('is not recorded while chips are still held for a settlement or staked in another game', () => {
     const { store, join } = fresh();
     const id = join('아직');
     store.run((s) => requestSettlement(s, { playerId: id, amount: 2, key: key() }));
     const open = store.run((s) => openGame(s, { playerId: id, game: 'yabawi', stake: 3, key: key() }));
     if (open.type !== 'gameOpen') throw new Error();
     store.run((s) => closeGame(s, { id: open.session.id, payout: 0, secret: open.session.secret, by: 'player' }));
-    expect(store.state.bankruptcies.size).toBe(0);
+    expect(store.state.log.some((r) => r.kind === 'bankrupt')).toBe(false);
   });
 
-  it('ends when the admin gives the player chips again', () => {
+  it('the 데스 게임 pays only a player with no chips at all, and a repeated request once', () => {
     const { store, join } = fresh();
-    const id = join('재기');
-    const open = store.run((s) => openGame(s, { playerId: id, game: 'yabawi', stake: 5, key: key() }));
+    const id = join('부자');
+    expect(code(() => store.run((s) => clearDeathGame(s, { playerId: id, key: key() })))).toBe('death_rich');
+    const open = store.run((s) => openGame(s, { playerId: id, game: 'yabawi', stake: 4, key: key() }));
     if (open.type !== 'gameOpen') throw new Error();
     store.run((s) => closeGame(s, { id: open.session.id, payout: 0, secret: open.session.secret, by: 'player' }));
-    const pl = p(store.state, id);
-    store.run((s) => edit(s, { id, version: pl.version, name: pl.name, pin: pl.pin, total: 5 }));
-    expect(store.state.bankruptcies.size).toBe(0);
-    expect(store.state.log.at(-1)?.text).toContain('파산 해제');
+    expect(code(() => store.run((s) => clearDeathGame(s, { playerId: id, key: key() })))).toBe('death_rich'); // 1 chip left
+    store.run((s) => requestSettlement(s, { playerId: id, amount: 1, key: key() }));
+    expect(code(() => store.run((s) => clearDeathGame(s, { playerId: id, key: key() })))).toBe('death_rich'); // held: still counts
+    store.run((s) => completeSettlement(s, [...s.settlements.values()][0].id));
+    const k = key();
+    const first = store.run((s) => clearDeathGame(s, { playerId: id, key: k }));
+    expect(store.run((s) => clearDeathGame(s, { playerId: id, key: k })).seq).toBe(first.seq);
+    expect(p(store.state, id).chips).toBe(PLATFORM.deathGame.reward);
+    balanced(store.state);
+  });
+});
+
+describe('messages', () => {
+  it('a player writes one line to the admin; the admin marks it read once', () => {
+    const { store, join } = fresh();
+    const id = join('문의');
+    const e = store.run((s) => sendMessage(s, { playerId: id, text: '  칩이\n안 들어왔어요 ', key: key() }));
+    if (e.type !== 'message') throw new Error();
+    expect(store.state.messages.get(e.message.id)).toMatchObject({ playerId: id, text: '칩이 안 들어왔어요', read: false });
+    expect(code(() => store.run((s) => sendMessage(s, { playerId: id, text: '   ', key: key() })))).toBe('message');
+    expect(code(() => store.run((s) => sendMessage(s, { playerId: id, text: '가'.repeat(PLATFORM.message.maxLength + 1), key: key() })))).toBe('message');
+    store.run((s) => readMessage(s, e.message.id));
+    expect(store.state.messages.get(e.message.id)?.read).toBe(true);
+    expect(code(() => store.run((s) => readMessage(s, e.message.id)))).toBe('gone');
   });
 });
 
@@ -407,10 +463,7 @@ describe('journal', () => {
         },
         () => store.run((st) => edit(st, { id, version: pl.version, name: pl.name, pin: pl.pin, total: rnd(20) })),
         () => store.run((st) => directSettlement(st, { playerId: id, amount: 1 + rnd(2), key: key() })),
-        () => {
-          const b = [...s.bankruptcies.values()].find((x) => x.playerId === id);
-          if (b) store.run((st) => resolveBankruptcy(st, b.id));
-        },
+        () => store.run((st) => clearDeathGame(st, { playerId: id, key: key() })),
         () => rnd(100) === 0 && store.run((st) => remove(st, id)),
       ];
       try {

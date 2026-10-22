@@ -1,38 +1,37 @@
-// Electron wrapper for a player PC: finds the casino server on the Wi-Fi and shows the player app full screen.
-// Finding: the address that worked last time, else a broadcast "CASINO?" that the server answers (UDP
-// PLATFORM.discoveryPort), else a page where staff type the address shown on the admin screen.
+// Electron wrapper for a player PC: opens the casino's internet address and shows the player app full screen.
+// The address is the https://….trycloudflare.com one on the admin screen, asked for together with the 입장 코드
+// (checked right away, then handed to the app so the login form does not ask again). Both change when the server
+// restarts, so the boxes show at once while the last address and code are tried in the background for a while.
 // Reload, dev tools and zoom keys are blocked (a reload in the middle of a game must not be a way out of a loss;
 // the games settle such a stop anyway), and the window never leaves the server's pages.
-// 온라인판 (built with casinoMode "online"): no broadcast search (it cannot cross the internet); the
-// address is the https://….trycloudflare.com one on the admin screen, which changes when the server restarts.
 const { app, BrowserWindow, shell } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
-const { discover } = require('./discover.cjs');
 
-const HTTP_PORT = 7777;
-const ONLINE = require('../package.json').casinoMode === 'online' || process.env.CASINO_MODE === 'online';
-const ADDRESS_HINT = ONLINE ? '관리자 화면의 인터넷 주소 (https://….trycloudflare.com)' : '관리자 화면의 접속 주소 (예: 192.168.0.12:7777)';
-const SETUP = 'casino-setup:'; // links on the local pages: casino-setup://search, casino-setup://connect?addr=…
+const ADDRESS_HINT = '관리자 화면의 인터넷 주소 (https://….trycloudflare.com)';
+const SETUP = 'casino-setup:'; // links on the local pages: casino-setup://search, casino-setup://connect?addr=…&code=…
 
 if (!app.requestSingleInstanceLock()) app.quit();
 
 let win = null;
-let server = ''; // http://address:port/
+let server = ''; // https://….trycloudflare.com/
+let attempt = 0; // bumped by every new search or typed address: an older background try then gives up
 const configPath = () => path.join(app.getPath('userData'), 'server.json');
 
-function savedServer() {
+/** The last address and 입장 코드 that worked. */
+function saved() {
   try {
-    return JSON.parse(fs.readFileSync(configPath(), 'utf8')).url || '';
+    const v = JSON.parse(fs.readFileSync(configPath(), 'utf8'));
+    return { url: v.url || '', code: v.code || '' };
   } catch {
-    return '';
+    return { url: '', code: '' };
   }
 }
 
-function saveServer(url) {
+function saveServer(url, code) {
   try {
     fs.mkdirSync(path.dirname(configPath()), { recursive: true });
-    fs.writeFileSync(configPath(), JSON.stringify({ url }));
+    fs.writeFileSync(configPath(), JSON.stringify({ url, code }));
   } catch {
     // remembered until the window closes
   }
@@ -41,9 +40,8 @@ function saveServer(url) {
 function normalize(raw) {
   let v = String(raw || '').trim();
   if (!v) return '';
-  if (!/^https?:\/\//.test(v)) v = `http://${v}`;
+  if (!/^https?:\/\//.test(v)) v = `https://${v}`; // the tunnel's address is https
   const u = new URL(v);
-  if (!u.port && u.protocol === 'http:') u.port = String(HTTP_PORT); // https (the tunnel) keeps its own port
   return `${u.protocol}//${u.host}/`;
 }
 
@@ -55,6 +53,28 @@ async function reachable(url) {
     return res.status === 404; // the server's own "not found": it is there
   } catch {
     return false;
+  }
+}
+
+/**
+ * The 입장 코드 at this address: 'ok', 'wrong', 'locked' (too many wrong codes from here, or a flood: wait), or
+ * 'down'. The admin PC's own address needs no code.
+ */
+async function checkCode(url, code) {
+  try {
+    const hello = await (await fetch(`${url}api/hello`, { signal: AbortSignal.timeout(6000) })).json();
+    if (!hello.entryDigits) return 'ok';
+    const res = await fetch(`${url}api/entry`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ code }),
+      signal: AbortSignal.timeout(6000),
+    });
+    if (res.ok) return 'ok';
+    const err = (await res.json().catch(() => ({}))).error;
+    return err === 'entry' ? 'wrong' : err === 'entry_locked' || err === 'busy' ? 'locked' : 'down';
+  } catch {
+    return 'down';
   }
 }
 
@@ -71,15 +91,23 @@ function page(title, body) {
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
 
-function showSetup(note) {
-  win.loadURL(
+const escapeHtml = (v) => String(v).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+
+function showSetup(note, value = '', code = '') {
+  return win.loadURL(
     page(
       '카지노 서버 찾기',
-      `<h1>♠ 카지노</h1><p>${note}</p>
-       <form action="${SETUP}//connect"><input name="addr" placeholder="${ADDRESS_HINT}" autofocus>
-       <button>연결</button></form><a class="btn" href="${SETUP}//search">다시 찾기</a>`,
+      `<h1>♠ 카지노</h1><p id="note">${note}</p>
+       <form action="${SETUP}//connect"><input name="addr" placeholder="${ADDRESS_HINT}" value="${escapeHtml(value)}" onfocus="this.select()" autofocus>
+       <input name="code" placeholder="입장 코드 (숫자 6자리, 관리자 화면에 표시)" inputmode="numeric" maxlength="6" value="${escapeHtml(code)}" onfocus="this.select()">
+       <button>연결</button></form><a class="btn" href="${SETUP}//search">저장된 주소로 다시 시도</a>`,
     ),
   );
+}
+
+/** Changes the line above the address box without reloading the page (what is typed stays). */
+function setNote(text) {
+  win.webContents.executeJavaScript(`{const n=document.getElementById('note'); if (n) n.textContent=${JSON.stringify(text)};}`).catch(() => {});
 }
 
 function showOffline() {
@@ -93,34 +121,39 @@ function showOffline() {
   );
 }
 
-async function connect(url) {
-  if (url && (await reachable(url))) {
-    server = url;
-    saveServer(url);
-    win.loadURL(server);
-    return true;
-  }
-  return false;
+/** Opens the app at this address with this 입장 코드: 'ok', 'wrong', 'locked' or 'down' (see checkCode). */
+async function connect(url, code, mine = ++attempt) {
+  if (!url || !(await reachable(url))) return 'down';
+  const r = await checkCode(url, code);
+  if (r !== 'ok' || mine !== attempt) return r;
+  server = url;
+  saveServer(url, code);
+  win.loadURL(code ? `${server}#entry=${code}` : server); // the app keeps the code and hides its field
+  return 'ok';
 }
+
+const ASK = '관리자 화면의 "인터넷 주소"와 "입장 코드"를 입력하세요.';
+const CODE_TEXT = {
+  wrong: '입장 코드가 맞지 않습니다. 관리자 화면의 입장 코드를 확인하세요.',
+  locked: '입장 코드를 여러 번 틀렸습니다. 2분 뒤에 다시 하세요.',
+};
 
 async function search() {
-  showSetupNote(ONLINE ? '카지노 서버에 연결하는 중…' : '같은 와이파이에서 카지노 서버를 찾는 중…');
-  if (await connect(savedServer())) return;
-  if (ONLINE) {
-    // A tunnel that just started answers only after a few seconds: keep trying the saved address for a while.
-    for (let i = 0; i < 6 && savedServer(); i++) {
-      showSetupNote(`카지노 서버에 연결하는 중… (${i + 2}번째 시도)`);
-      await new Promise((r) => setTimeout(r, 4000));
-      if (await connect(savedServer())) return;
-    }
-    return showSetup('저장된 인터넷 주소에 연결하지 못했습니다. 관리자 장부를 다시 켜면 주소가 바뀝니다. 새 주소를 입력하세요.');
+  const mine = ++attempt;
+  const last = saved();
+  if (!last.url) return showSetup(ASK);
+  // The boxes are there at once: the admin may already have a new address and code (both change when the ledger
+  // restarts). Meanwhile the saved ones are tried for about half a minute (a tunnel that just started answers late).
+  await showSetup('지난번 주소에 연결하는 중… 관리자 화면의 주소가 바뀌었으면 새 주소와 입장 코드를 입력하세요.', last.url, last.code);
+  for (let i = 0; i < 7; i++) {
+    if (mine !== attempt) return; // the player typed an address
+    const r = await connect(last.url, last.code, mine);
+    if (r === 'ok' || mine !== attempt) return;
+    if (r !== 'down') return setNote(CODE_TEXT[r]);
+    setNote(`지난번 주소에 연결하는 중… (${i + 2}번째 시도) 관리자 화면의 주소가 바뀌었으면 새 주소와 입장 코드를 입력하세요.`);
+    await new Promise((r) => setTimeout(r, 4000));
   }
-  if (await connect(await discover())) return;
-  showSetup('서버를 찾지 못했습니다. 관리자 PC가 켜져 있고 같은 와이파이인지 확인하세요.');
-}
-
-function showSetupNote(note) {
-  win.loadURL(page('카지노', `<h1>♠ 카지노</h1><p>${note}</p>`));
+  if (mine === attempt) setNote('지난번 주소는 응답하지 않습니다. 관리자 장부를 다시 켜면 주소와 입장 코드가 바뀝니다. 새로 입력하세요.');
 }
 
 function isBlockedKey(input) {
@@ -137,9 +170,11 @@ function isBlockedKey(input) {
 async function onSetupLink(url) {
   const u = new URL(url);
   if (u.host === 'search') return search();
-  if (u.host === 'setup') return showSetup(ONLINE ? '관리자 화면의 "인터넷 주소"를 입력하세요.' : '관리자 화면 오른쪽 위의 "플레이어 접속 주소"를 입력하세요.');
+  if (u.host === 'setup') return showSetup(ASK, saved().url, saved().code);
   if (u.host === 'retry') {
-    if (!(await connect(server))) showOffline();
+    const r = await connect(server, saved().code);
+    if (r === 'down') showOffline();
+    else if (r !== 'ok') showSetup(CODE_TEXT[r], server);
     return;
   }
   if (u.host === 'connect') {
@@ -149,7 +184,11 @@ async function onSetupLink(url) {
     } catch {
       addr = '';
     }
-    if (!(await connect(addr))) showSetup(`${addr || '그 주소'}에서 서버가 응답하지 않습니다. 주소를 다시 확인하세요.`);
+    const code = String(u.searchParams.get('code') || '').replace(/\D/g, '');
+    setNote(`${addr || '그 주소'}에 연결하는 중…`);
+    const r = await connect(addr, code);
+    if (r === 'down') showSetup(`${escapeHtml(addr || '그 주소')}에서 서버가 응답하지 않습니다. 주소를 다시 확인하세요.`, addr, code);
+    else if (r !== 'ok') showSetup(CODE_TEXT[r], addr);
   }
 }
 

@@ -1,15 +1,15 @@
-// Admin screen on the admin PC: every player live with 수정 · 정산 · 삭제, the things waiting
-// for the admin (정산 요청, 파산 신청, games that stopped reporting), and the DB 기록 window with every edit, delete
-// and settlement. Everything comes from the server's event stream; every action is a request the server checks
+// Admin screen on the admin PC: every player live with 수정 · 정산 · 삭제, the 메시지 panel (players' messages,
+// 정산 요청, big online wins to approve, games that stopped reporting), and the DB 기록 window with every edit,
+// delete and settlement. Everything comes from the server's event stream; every action is a request the server checks
 // again, so a double click or a stale screen cannot do a thing twice or undo a change it did not see.
 import './style.css';
 import { PLATFORM } from '../shared/config.ts';
 import {
   GAME_KINDS,
   LOG_LABEL,
-  type AdminBankruptcy,
   type AdminEvents,
   type AdminGame,
+  type AdminMessage,
   type AdminPlayer,
   type AdminSettlement,
   type AdminState,
@@ -42,18 +42,19 @@ window.addEventListener('pointerdown', unlockAudio, { capture: true });
 
 const statusEl = h('span', { class: 'status', 'data-testid': 'status' });
 const summaryEl = h('div', { class: 'summary', 'data-testid': 'summary' });
-const urlsEl = h('div', { class: 'urls', 'data-testid': 'urls' });
-const onlineEl = h('div', { class: 'online-box', hidden: true, 'data-testid': 'online' }); // 온라인판
+const onlineEl = h('div', { class: 'online-box', hidden: true, 'data-testid': 'online' }); // internet address, 입장 코드
 const tabPlayers = h('button', { class: 'tab', type: 'button', 'data-testid': 'tab-players' });
 const tabLog = h('button', { class: 'tab', type: 'button', 'data-testid': 'tab-log' });
 const searchInput = h('input', { class: 'search', type: 'search', placeholder: '이름 검색', 'data-testid': 'search' });
 const tbody = h('tbody', { 'data-testid': 'players' });
 const emptyEl = h('div', { class: 'empty' }, '아직 가입한 플레이어가 없습니다');
+const reqMessages = h('div', { class: 'req-list', 'data-testid': 'messages' });
 const reqReview = h('div', { class: 'req-list', 'data-testid': 'reviews' });
 const reqSettle = h('div', { class: 'req-list', 'data-testid': 'requests' });
-const reqBankrupt = h('div', { class: 'req-list', 'data-testid': 'bankruptcies' });
 const reqGames = h('div', { class: 'req-list', 'data-testid': 'open-games' });
-const noReqEl = h('div', { class: 'empty small' }, '처리할 일이 없습니다');
+const readMessages = h('div', { class: 'req-list read', 'data-testid': 'read-messages' });
+const READ_SHOWN = 10; // read messages kept below the rest
+const noReqEl = h('div', { class: 'empty small' }, '새 메시지가 없습니다');
 const logBody = h('tbody', { 'data-testid': 'log' });
 const logNote = h('div', { class: 'log-note' });
 const logAllBtn = h('button', { class: 'chip-btn', type: 'button', 'data-testid': 'log-all' });
@@ -92,12 +93,13 @@ const playersView = h(
   h(
     'aside',
     { class: 'panel side-panel' },
-    h('h2', {}, '처리할 일'),
+    h('h2', {}, '메시지'),
     noReqEl,
+    h('div', { class: 'req-group' }, reqMessages),
     h('div', { class: 'req-group' }, reqReview),
     h('div', { class: 'req-group' }, reqSettle),
-    h('div', { class: 'req-group' }, reqBankrupt),
     h('div', { class: 'req-group' }, reqGames),
+    h('div', { class: 'req-group' }, readMessages),
   ),
 );
 
@@ -124,10 +126,18 @@ root.append(
   h(
     'header',
     { class: 'top' },
-    h('div', { class: 'brand' }, h('span', { class: 'mark' }, '♠'), '카지노 장부', h('small', {}, '관리자')),
+    h(
+      'div',
+      { class: 'brand' },
+      h('span', { class: 'mark' }, '♠'),
+      '카지노 장부',
+      h('small', {}, '관리자'),
+      // Opens in the PC's browser (a second screen or a projector): every player by 잔고, live.
+      h('a', { class: 'btn small', href: `${BASE}rank`, target: '_blank', 'data-testid': 'rank-link' }, '순위 대시보드'),
+      h('a', { class: 'btn small', href: `${BASE}sim`, target: '_blank', 'data-testid': 'sim-link' }, '확률 시뮬레이터'),
+    ),
     statusEl,
     summaryEl,
-    urlsEl,
     onlineEl,
   ),
   h('nav', { class: 'tabs' }, tabPlayers, tabLog),
@@ -180,12 +190,12 @@ function connect(): void {
 function receive(s: AdminState): void {
   state = s;
   receivedAt = Date.now();
-  const live = new Set([...s.settlements, ...s.bankruptcies, ...s.games].map((r) => r.id));
+  const live = new Set([...s.settlements, ...s.messages.filter((m) => !m.read), ...s.games].map((r) => r.id));
   for (const id of handled) if (!live.has(id)) handled.delete(id);
   setConnected(true);
-  // A new request is something the admin has to do: sound and highlight (not for the ones already there).
+  // A new message or request is something the admin has to look at: sound and highlight (not for the ones already there).
   const reviews = s.games.filter((g) => g.review !== null).map((g) => ({ id: `review:${g.id}` }));
-  const fresh = [...s.settlements, ...s.bankruptcies, ...reviews].filter((r) => !seenRequests.has(r.id));
+  const fresh = [...s.settlements, ...s.messages.filter((m) => !m.read), ...reviews].filter((r) => !seenRequests.has(r.id));
   for (const r of fresh) seenRequests.add(r.id);
   if (fresh.length && !firstSnapshot) play('alert');
   firstSnapshot = false;
@@ -205,19 +215,13 @@ function render(): void {
   if (!state) return;
   const s = state;
   const online = s.players.filter((p) => p.online).length;
-  const waiting = s.settlements.length + s.bankruptcies.length + s.games.filter((g) => g.review !== null).length;
+  const waiting = s.settlements.length + s.messages.filter((m) => !m.read).length + s.games.filter((g) => g.review !== null).length;
   summaryEl.replaceChildren(
     stat('플레이어', `${s.players.length}명`),
     stat('접속 중', `${online}명`),
     stat('잔고 합계', chips(s.totals.outstanding)),
     stat('지급한 실물 칩', chips(s.totals.settled)),
-    stat('처리할 일', `${waiting}건`, waiting > 0),
-  );
-  urlsEl.replaceChildren(
-    h('span', { class: 'urls-label' }, '플레이어 접속 주소'),
-    ...(s.server.urls.length
-      ? s.server.urls.map((u, i) => h('code', { class: i ? 'dim' : '', title: u.name }, `${u.url} `, h('small', {}, u.name)))
-      : [h('code', {}, '네트워크 없음')]),
+    stat('새 메시지', `${waiting}건`, waiting > 0),
   );
   renderOnline(s);
   setText(tabPlayers, `플레이어 (${s.players.length})`);
@@ -343,8 +347,7 @@ function fillRow(r: Row, p: AdminPlayer, now: number): void {
   r.dot.className = `dot ${p.online ? 'on' : 'off'}`;
   r.dot.title = p.online ? '온라인' : '오프라인';
   setText(r.dot, p.online ? '온라인' : '오프라인');
-  setText(r.name, p.name + (p.bankrupt ? ' · 파산' : ''));
-  r.name.classList.toggle('bankrupt', p.bankrupt);
+  setText(r.name, p.name + (p.deathClears ? ` · 데스 게임 ${p.deathClears}회` : ''));
   setText(r.pin, p.pin);
   setText(r.total, chips(p.total));
   const parts = [];
@@ -371,6 +374,10 @@ function renderRequests(): void {
   };
   const open = <T extends { id: string }>(list: T[]): T[] => list.filter((r) => !handled.has(r.id));
   place(
+    reqMessages,
+    open(state.messages.filter((m) => !m.read)).map((m) => card(`m:${m.id}`, keep, () => messageCard(m), (el) => setText(el.querySelector('.ago')!, ago(m.at, now)))),
+  );
+  place(
     reqReview,
     open(state.games.filter((g) => g.review !== null)).map((g) =>
       card(`r:${g.id}`, keep, () => reviewCard(g), (el) => setText(el.querySelector('.ago')!, `${duration(now - g.openedAt)}째`)),
@@ -382,10 +389,7 @@ function renderRequests(): void {
       .sort((a, b) => a.requestedAt - b.requestedAt)
       .map((r) => card(`s:${r.id}`, keep, () => settlementCard(r), (el) => setText(el.querySelector('.ago')!, ago(r.requestedAt, now)))),
   );
-  place(
-    reqBankrupt,
-    open(state.bankruptcies).map((b) => card(`b:${b.id}`, keep, () => bankruptcyCard(b), (el) => setText(el.querySelector('.ago')!, ago(b.filedAt, now)))),
-  );
+
   place(
     reqGames,
     open(state.games.filter((g) => g.review === null)).map((g) =>
@@ -395,13 +399,21 @@ function renderRequests(): void {
       }),
     ),
   );
+  const unread = keep.size; // everything above still waits for the admin
+  place(
+    readMessages,
+    state.messages
+      .filter((m) => m.read || handled.has(m.id))
+      .slice(0, READ_SHOWN)
+      .map((m) => card(`d:${m.id}`, keep, () => messageCard(m, true), (el) => setText(el.querySelector('.ago')!, ago(m.at, now)))),
+  );
   for (const [k, el] of cards) {
     if (!keep.has(k)) {
       el.remove();
       cards.delete(k);
     }
   }
-  noReqEl.hidden = cards.size > 0;
+  noReqEl.hidden = unread > 0;
 }
 
 function card(key: string, keep: Set<string>, make: () => HTMLElement, refresh: (el: HTMLElement) => void): HTMLElement {
@@ -440,17 +452,22 @@ function settlementCard(r: AdminSettlement): HTMLElement {
   );
 }
 
-function bankruptcyCard(b: AdminBankruptcy): HTMLElement {
+/** A player's message. [확인] marks it read: it moves down to the read ones (and the player sees it was read). */
+function messageCard(m: AdminMessage, read = false): HTMLElement {
+  const p = state?.players.find((x) => x.id === m.playerId);
   return h(
     'div',
-    { class: 'req bankrupt', 'data-testid': 'bankruptcy' },
-    h('div', { class: 'req-title' }, h('b', {}, b.name), ' 파산 신청 (잔고 0칩)'),
-    h('div', { class: 'req-sub' }, h('span', { class: 'ago' }), ` · ${clockTime(b.filedAt)}`),
-    h(
-      'div',
-      { class: 'req-actions' },
-      h('button', { class: 'btn small', type: 'button', 'data-testid': 'bankruptcy-done', onclick: () => confirmDialog(`${b.name}의 파산을 처리했나요?`, '칩을 다시 주려면 플레이어 [수정]에서 잔고를 바꾸세요. 잔고가 생기면 파산은 자동으로 풀립니다.', '처리 완료', 'gold', () => post('bankrupt/done', { id: b.id }, '파산 처리 완료', b.id)) }, '처리 완료'),
-    ),
+    { class: `req message${read ? ' read' : ''}`, 'data-testid': read ? 'read-message' : 'message' },
+    h('div', { class: 'req-title' }, h('b', {}, m.name), p ? ` · 잔고 ${chips(p.total)}` : ''),
+    h('div', { class: 'req-text' }, m.text),
+    h('div', { class: 'req-sub' }, h('span', { class: 'ago' }), ` · ${clockTime(m.at)}`),
+    read
+      ? null
+      : h(
+          'div',
+          { class: 'req-actions' },
+          h('button', { class: 'btn small', type: 'button', 'data-testid': 'message-read', onclick: () => void post('message/read', { id: m.id }, '확인했습니다', m.id) }, '확인'),
+        ),
   );
 }
 
@@ -623,11 +640,13 @@ function editDialog(p: AdminPlayer): void {
 /** 정산 by the admin (the player is at the counter): the chips come off the ledger first, then the physical chips go out. */
 function settleDialog(p: AdminPlayer): void {
   const key = requestKey(); // one dialog, one settlement, however many clicks
-  const amount = h('input', { class: 'field mono', type: 'number', min: 1, max: p.free, step: 1, value: p.free, 'data-testid': 'settle-amount' });
+  const most = Math.min(p.free, p.settleLeft);
+  const amount = h('input', { class: 'field mono', type: 'number', min: 1, max: most, step: 1, value: most, 'data-testid': 'settle-amount' });
   dialog({
     title: `${p.name} 정산 (실물 칩 교환)`,
     body: [
       h('p', {}, `사용 가능한 칩 ${chips(p.free)} 중에서 실물 칩으로 바꿔 줄 개수를 적으세요. [정산 확정]으로 장부에서 뺀 뒤에 실물 칩을 건네세요.`),
+      h('div', { class: 'dlg-note' }, `실물 칩은 한 사람당 ${PLATFORM.settleMax}개까지: 지금까지 ${p.paidOut}개 받음 · 앞으로 ${p.settleLeft}개`),
       field('바꿀 칩', amount),
       p.held ? h('div', { class: 'dlg-note' }, `이 플레이어는 ${chips(p.held)} 정산 요청을 기다리고 있습니다 (오른쪽 목록)`) : h('span'),
     ],
