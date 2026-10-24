@@ -31,6 +31,7 @@
     "games/plinko",
     "games/slot",
     "games/yacht",
+    "games/roulette",
     "tests",
     "scripts",
     "vite.config.ts",

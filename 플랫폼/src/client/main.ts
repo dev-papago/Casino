@@ -1,6 +1,6 @@
 // Player app: 로그인 / 가입하기, then the lobby with the chip balance always on screen, the
-// games, the settlement request and messages to the admin. A player with no chips at all (a new account starts
-// with none) gets the 데스 게임, which pays its reward once cleared. Everything comes from the ledger server; the app keeps only its login token.
+// games, the settlement request and messages to the admin. A new account starts with PLATFORM.signupBonus chips;
+// a player with no chips at all gets the 데스 게임, which pays its reward once cleared. Everything comes from the ledger server; the app keeps only its login token.
 // When the server cannot be reached the app says so, keeps trying, and blocks anything that moves chips.
 // A game opens on top of the lobby in a frame from the same server, under a bar that keeps the balance in view;
 // it takes and gives back chips itself (sdk/casino.ts). Whatever way a game stops, its chips come back: the app
@@ -15,7 +15,7 @@ import { ApiError, api } from '../ui/net.ts';
 import { play, unlockAudio } from '../ui/sound.ts';
 import { flush, settleLeftovers } from '../../sdk/casino.ts';
 
-const GAME_ICON: Record<GameDef['id'], string> = { yabawi: '🥤', yeongkkeul: '📈', plinko: '🔮', slot: '🎰', yacht: '🎲' };
+const GAME_ICON: Record<GameDef['id'], string> = { yabawi: '🥤', yeongkkeul: '📈', plinko: '🔮', slot: '🎰', yacht: '🎲', roulette: '🔫' };
 
 /** A page that opens over the lobby: a chip game, or the 데스 게임. */
 interface Page {
@@ -83,7 +83,7 @@ function showLogin(notice = ''): void {
     tabSignup.classList.toggle('active', m === 'signup');
     pin2Row.hidden = m === 'login';
     setText(submit, m === 'login' ? '로그인' : '가입하고 시작');
-    setText(msg, m === 'signup' ? `가입하고 데스 게임을 통과하면 ${PLATFORM.deathGame.reward}칩을 드려요` : '');
+    setText(msg, m === 'signup' ? `처음 가입하면 ${PLATFORM.signupBonus}칩을 드려요` : '');
     msg.className = 'form-msg';
   };
   tabLogin.addEventListener('click', () => setMode('login'));
@@ -116,7 +116,7 @@ function showLogin(notice = ''): void {
         token = r.token;
         save(TOKEN_KEY, token);
         play('coin');
-        showLobby(r.me, mode === 'signup' ? `가입 완료! 데스 게임을 통과하면 ${PLATFORM.deathGame.reward}칩` : '');
+        showLobby(r.me, mode === 'signup' ? `가입 완료! 보너스 ${PLATFORM.signupBonus}칩` : '');
       } catch (err) {
         if (err instanceof ApiError && err.code === 'entry') {
           // The code changed (a server restart or [새 코드]): never send the old one again by accident.

@@ -1,13 +1,13 @@
 /// <reference types="vitest/config" />
 // Pages served by the ledger server: index.html (player), admin.html (admin PC only), the arcade games
-// (games/plinko, games/slot, games/yacht → dist/games/<id>/index.html) and the 데스 게임 (games/deathgame, styled
+// (games/plinko, games/slot, games/yacht, games/roulette → dist/games/<id>/index.html) and the 데스 게임 (games/deathgame, styled
 // with Tailwind: only its stylesheet has @tailwind in it). 야바위 and 영끌문S are their own projects
 // (scripts/build-games.mjs).
 import { resolve } from 'node:path';
 import tailwindcss from 'tailwindcss';
 import { defineConfig } from 'vite';
 
-const ARCADE = ['plinko', 'slot', 'yacht', 'deathgame'];
+const ARCADE = ['plinko', 'slot', 'yacht', 'roulette', 'deathgame'];
 
 export default defineConfig({
   base: './',

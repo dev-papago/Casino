@@ -17,6 +17,8 @@
 // 데스 게임: the page plays in the browser, so the server follows each run (in memory: a restart means starting
 // over). A run starts only for a player with no chips at all, its five stages must be reported in
 // order and no faster than stageMinMs, and only then does the ledger pay the reward.
+//
+// 러시안 룰렛: the rooms and games run here too (roulette.ts); the players' games poll /api/roulette/state.
 import { readFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -36,6 +38,7 @@ import {
   decideReview,
   directSettlement,
   edit,
+  endDuel,
   login,
   logout,
   nameKey,
@@ -48,6 +51,7 @@ import {
   type LedgerEvent,
   type Player,
 } from './ledger.ts';
+import { RouletteHall, type RouletteTiming } from './roulette.ts';
 import { Store } from './store.ts';
 import { startTunnel, type Tunnel, type TunnelState } from './tunnel.ts';
 import { adminState, playerRankView, playerView, rankView, type Live } from './views.ts';
@@ -72,6 +76,7 @@ interface Timing {
   loginLockMs: number;
   entryLockMs: number; // an IP that got the 입장 코드 wrong too often waits this long
   deathStageMinMs: readonly number[]; // 데스 게임: the least time a stage can take (tests: 0)
+  roulette: Partial<RouletteTiming>; // 러시안 룰렛's phases (tests: shorter)
 }
 
 /** A 데스 게임 run the server follows: the stages cleared so far and when the last one was. */
@@ -149,6 +154,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
     loginLockMs: PLATFORM.loginLockMs,
     entryLockMs: PLATFORM.online.entryLockMs,
     deathStageMinMs: PLATFORM.deathGame.stageMinMs,
+    roulette: {},
     ...o.timing,
   };
   const store = new Store(o.dataDir, clock);
@@ -170,6 +176,27 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
   const wrongTimes: number[] = []; // wrong 입장 코드 from everywhere, last minute
   const signupTimes: number[] = [];
   const deathRuns = new Map<string, DeathRun>(); // player id → the 데스 게임 run in progress
+
+  // 러시안 룰렛: stakes left in the ledger by a server that stopped (its rooms are gone) go back first.
+  for (const g of [...store.state.games.values()]) {
+    if (gameDef(g.game)?.duel) store.run((s) => endDuel(s, { reason: 'refund', closes: [{ id: g.id, payout: g.stake }] }));
+  }
+  const hall = new RouletteHall(
+    {
+      stake: (playerId, stake, key) => {
+        const e = store.run((s) => openGame(s, { playerId, game: 'roulette', stake, key, server: true }));
+        if (e.type !== 'gameOpen') throw new LedgerError('bad_request');
+        return e.session.id;
+      },
+      settle: (reason, closes) => {
+        store.run((s) => endDuel(s, { reason, closes: closes.map((c) => ({ id: c.session, payout: c.payout })) }));
+      },
+      open: (session) => store.state.games.has(session),
+    },
+    clock,
+    T.roulette,
+  );
+  const hallTimer = setInterval(() => hall.tick(), 200);
   const messageTimes = new Map<string, number[]>(); // player id → messages sent in the last minute
 
   // ------------------------------------------------------------ presence
@@ -475,6 +502,41 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
       store.run((s) => clearDeathGame(s, { playerId: p.id, key }));
       return { me: me(p.id) };
     },
+    'POST /api/roulette/rooms': (req) => {
+      const p = authPlayer(bearer(req));
+      touch(p.id);
+      return { ...hall.list(p.id), free: p.chips };
+    },
+    'POST /api/roulette/create': (req, b) => {
+      const p = authPlayer(bearer(req));
+      touch(p.id);
+      return hall.create(p, { stake: b.stake, lives: b.lives, key: keyOf(b) });
+    },
+    'POST /api/roulette/join': (req, b) => {
+      const p = authPlayer(bearer(req));
+      touch(p.id);
+      return hall.join(p, b.room, keyOf(b));
+    },
+    'POST /api/roulette/cancel': (req, b) => {
+      const p = authPlayer(bearer(req));
+      hall.cancel(p.id, b.room);
+      return { ok: true };
+    },
+    'POST /api/roulette/state': (req, b) => {
+      const p = authPlayer(bearer(req));
+      touch(p.id);
+      return hall.state(p.id, b.room, b.after);
+    },
+    'POST /api/roulette/shoot': (req, b) => {
+      const p = authPlayer(bearer(req));
+      touch(p.id);
+      return hall.shoot(p.id, b.room, b.target);
+    },
+    'POST /api/roulette/forfeit': (req, b) => {
+      const p = authPlayer(bearer(req));
+      hall.forfeit(p.id, b.room);
+      return { ok: true };
+    },
     'POST /api/message': (req, b) => {
       const p = authPlayer(bearer(req));
       touch(p.id);
@@ -660,6 +722,7 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
   } catch (e) {
     clearInterval(sweep);
     clearInterval(keepAlive);
+    clearInterval(hallTimer);
     if (server.listening) server.close();
     store.close();
     throw e;
@@ -678,6 +741,8 @@ export async function startServer(o: ServerOptions): Promise<RunningServer> {
     store,
     async close() {
       for (const id of [...presence.keys()]) goOffline(id); // saves everyone's online time
+      clearInterval(hallTimer);
+      hall.closeAll(); // rooms still running: their stakes go back
       closing = true;
       tunnel?.stop();
       clearInterval(sweep);
@@ -750,6 +815,8 @@ function affected(e: LedgerEvent): string | null {
       return e.message.playerId;
     case 'messageRead':
       return null; // the player sees it on the next report
+    case 'duelEnd':
+      return null; // two players: each one's game asks for news
     default:
       return e.playerId;
   }

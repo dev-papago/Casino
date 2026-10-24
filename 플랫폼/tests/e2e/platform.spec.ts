@@ -17,19 +17,16 @@ test('signup, admin edit, settlement, network drop, another login, delete', asyn
   await expect(admin.getByTestId('summary')).toContainText('플레이어');
   const before = await count();
 
-  // Sign up: no chips yet, the 데스 게임 is offered; its reward is 5 chips. The admin sees the player online at once.
+  // Sign up: the 2-chip bonus (the 데스 게임 waits for 0 chips). The admin sees the player online at once.
   await signUp(player, '테스터', '1234');
-  await expect(player.getByTestId('balance')).toHaveText('0칩');
-  await expect(player.getByTestId('game-deathgame')).toBeVisible();
-  await expect(player.getByTestId('notice')).toContainText('데스 게임');
-  await earnChips(player);
+  await expect(player.getByTestId('balance')).toHaveText('2칩');
   await expect(player.getByTestId('game-deathgame')).toBeHidden();
+  await earnChips(player);
   await expect(player.getByTestId('who')).toHaveText('테스터');
   const row = admin.getByTestId('players').locator('tr', { hasText: '테스터' });
   await expect(row).toContainText('온라인');
   await expect(row).toContainText('1234');
   await expect(row).toContainText('5칩');
-  await expect(row).toContainText('데스 게임 1회');
 
   // 메시지: the player writes, the admin reads it, the player sees that.
   await player.getByTestId('message-text').fill('정산은 어디서 하나요?');
@@ -80,7 +77,7 @@ test('signup, admin edit, settlement, network drop, another login, delete', asyn
   // DB 기록 has every edit and settlement.
   await admin.getByTestId('tab-log').click();
   const log = admin.getByTestId('log');
-  for (const kind of ['가입', '데스 게임 통과', '수정', '정산 요청', '정산 완료', '정산 거절', '관리자 정산']) await expect(log).toContainText(kind);
+  for (const kind of ['가입', '수정', '정산 요청', '정산 완료', '정산 거절', '관리자 정산']) await expect(log).toContainText(kind);
   await expect(log.locator('tr').first()).toContainText('관리자 정산');
   await admin.getByTestId('tab-players').click();
 

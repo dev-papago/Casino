@@ -11,19 +11,17 @@ export async function signUp(page: Page, name: string, pin = '1234', path = '/')
   await page.getByTestId('submit').click();
 }
 
-/**
- * The 데스 게임's reward without playing it: its server calls with the app's login (the e2e server lets the
- * stages through at once, tests/e2e/serve.ts). The lobby then shows the chips.
- */
-export async function earnChips(page: Page): Promise<void> {
-  await expect(page.getByTestId('balance')).toHaveText('0칩'); // logged in: the app has its token
-  await page.evaluate(async () => {
-    const token = localStorage.getItem('casino:v1:token');
-    const post = async (path: string, body: unknown) =>
-      (await fetch(`/api/${path}`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify(body) })).json();
-    const { run } = (await post('death/start', {})) as { run: string };
-    for (let stage = 1; stage <= 5; stage++) await post('death/stage', { run, stage });
-    await post('death/clear', { run, key: `death-${run}` });
-  });
-  await expect(page.getByTestId('balance')).toHaveText('5칩', { timeout: 10_000 });
+/** Sets the logged-in player's chips (an admin edit: the e2e server runs on this PC). The lobby then shows them. */
+export async function setChips(page: Page, total: number): Promise<void> {
+  await expect(page.getByTestId('balance')).toHaveText(/칩$/); // logged in
+  await page.evaluate(async (total) => {
+    const name = document.querySelector('[data-testid="who"]')?.textContent;
+    const state = (await (await fetch('/api/admin/state')).json()) as { players: { id: string; name: string; pin: string; version: number }[] };
+    const p = state.players.find((x) => x.name === name)!;
+    await fetch('/api/admin/edit', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ id: p.id, version: p.version, name: p.name, pin: p.pin, total }) });
+  }, total);
+  await expect(page.getByTestId('balance')).toHaveText(`${total}칩`, { timeout: 10_000 });
 }
+
+/** 5 chips to play with (the signup bonus, topped up). */
+export const earnChips = (page: Page): Promise<void> => setChips(page, 5);

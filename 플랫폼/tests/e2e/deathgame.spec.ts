@@ -1,14 +1,16 @@
 // 데스 게임 in the player app: offered to a player without chips, it starts a run on the server from its title,
 // and hides once the player has chips (its reward is taken through the API in the other tests).
 import { expect, test, type Frame } from '@playwright/test';
-import { earnChips, signUp } from './helpers.ts';
+import { earnChips, setChips, signUp } from './helpers.ts';
 
 test('데스 게임 opens from the lobby, starts a run on the server, and goes back to the lobby', async ({ page }) => {
   const errors: string[] = [];
   page.on('pageerror', (e) => errors.push(String(e)));
   page.on('console', (m) => m.type() === 'error' && errors.push(m.text()));
   await signUp(page, '도전자');
-  await expect(page.getByTestId('balance')).toHaveText('0칩');
+  await expect(page.getByTestId('balance')).toHaveText('2칩'); // the signup bonus: no 데스 게임 yet
+  await expect(page.getByTestId('game-deathgame')).toBeHidden();
+  await setChips(page, 0);
   await page.getByTestId('game-deathgame').click();
   await expect(page.getByTestId('game-layer')).toBeVisible();
   let f: Frame | undefined;

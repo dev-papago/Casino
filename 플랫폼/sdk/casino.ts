@@ -231,6 +231,13 @@ export async function deathClear(run: string, key: string): Promise<CasinoPlayer
   return r.me;
 }
 
+// ------------------------------------------------------------------ games the server runs (러시안 룰렛)
+
+/** A logged-in request to the server's API (`path` under /api/); a dropped connection is tried again for `retryMs`. */
+export function request<T>(path: string, body: unknown = {}, retryMs = 4_000): Promise<T> {
+  return call<T>(path, body, { auth: true, retryMs });
+}
+
 /** Back to the player app: closes the game window opened by the app, or goes to the app's page. */
 export function exit(): void {
   if (window.parent !== window) window.parent.postMessage({ type: 'casino:exit' }, location.origin);

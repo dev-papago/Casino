@@ -1,7 +1,7 @@
 // Every tunable number of the platform. The ledger server, the admin screen and the player app read this one
 // object. Chips are whole numbers everywhere: in the ledger, inside the games and at the counter (실물 칩).
 
-export type GameId = 'yabawi' | 'yeongkkeul' | 'plinko' | 'slot' | 'yacht';
+export type GameId = 'yabawi' | 'yeongkkeul' | 'plinko' | 'slot' | 'yacht' | 'roulette';
 
 /**
  * A game in the player app. A game session takes chips out of the player's balance when it starts (the stake)
@@ -16,17 +16,32 @@ export interface GameDef {
   // A one-round game pays out at most stake × maxMult (its top prize); a bigger report is a bug or a forgery.
   // Games that run many rounds per session (야바위, 영끌문S) have no limit: chips won in games are unlimited.
   maxMult?: number;
+  // A game between players that the server runs itself (러시안 룰렛): it opens and closes the sessions, so a player
+  // can neither open one nor report a result for one.
+  duel?: true;
 }
 
 export const PLATFORM = {
   port: 7777,
-  signupBonus: 0, // chips a new account starts with: none, the 데스 게임 gives the first ones
+  signupBonus: 2, // chips a new account starts with (at 0 chips the 데스 게임 gives more)
   // 데스 게임 (THE FINAL SEAT, games/deathgame): a player with no chips at all (free, held and in games together)
   // can play it; clearing all five stages pays `reward` chips. The server follows the run stage by stage and refuses a stage reported
   // sooner after the previous one than stageMinMs allows (faster than anyone can play it: a forged report).
   deathGame: {
     reward: 5,
     stageMinMs: [8_000, 20_000, 10_000, 6_000, 4_000] as readonly number[],
+  },
+  // 러시안 룰렛 (1대1, games/roulette): the server keeps the rooms and runs the games (src/server/roulette.ts).
+  roulette: {
+    maxLives: 5, // a room's creator picks 1 to this many lives
+    chambers: 6, // the revolver's cylinder: every round loads all six
+    live: [2, 4] as readonly [number, number], // live rounds per load, the rest blanks
+    turnMs: 10_000, // to choose: shoot yourself or the other player (then the gun goes off at yourself)
+    loadMs: 4_000, // a new cylinder shown: how many live and blank
+    coinMs: 3_400, // the coin toss for who starts the round
+    shotMs: 2_900, // one shot played out
+    absentMs: 30_000, // a player whose game has not asked for news this long has left: the other one wins
+    keepMs: 120_000, // a finished room stays this long, so both players see how it ended
   },
   // 메시지: a player writes to the admin (the admin screen's 메시지 panel).
   message: {
@@ -99,6 +114,15 @@ export const PLATFORM = {
       perChip: 1,
       unit: '칩',
       maxMult: 20,
+    },
+    {
+      id: 'roulette',
+      name: '러시안 룰렛',
+      description: '1대1 대결. 같은 판돈을 걸고 리볼버 한 자루로 버틴다. 살아남은 사람이 판돈을 모두 가져간다.',
+      perChip: 1,
+      unit: '칩',
+      maxMult: 2,
+      duel: true,
     },
   ] as readonly GameDef[],
 };

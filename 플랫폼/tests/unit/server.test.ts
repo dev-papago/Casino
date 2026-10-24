@@ -40,18 +40,15 @@ async function boot(dir = mkdtempSync(join(tmpdir(), 'srv-')), timing: Partial<t
 }
 type Call = (path: string, body?: unknown, token?: string) => Promise<{ status: number; data: any }>;
 
-/** Plays the 데스 게임 through to its reward (every stage at once: TIMING allows it). */
-async function clearDeath(call: Call, token: string): Promise<{ status: number; data: any }> {
-  const { run } = (await call('death/start', {}, token)).data as { run: string };
-  for (let stage = 1; stage <= 5; stage++) await call('death/stage', { run, stage }, token);
-  return call('death/clear', { run, key: `death-${run}` }, token);
+/** Sets a new player's chips (an admin edit of the account as it was at signup). */
+async function setChips(call: Call, auth: AuthReply, total: number): Promise<AuthReply> {
+  await call('admin/edit', { id: auth.me.id, version: 1, name: auth.me.name, pin: '1234', total });
+  return { token: auth.token, me: ((await call('me', undefined, auth.token)).data as MeReply).me };
 }
 
-/** A new player with the 데스 게임's chips to play with. */
+/** A new player with 5 chips to play with (the signup bonus, topped up by the admin). */
 async function newPlayer(call: Call, body: { name: string; pin: string; key?: string }): Promise<AuthReply> {
-  const auth = (await call('signup', body)).data as AuthReply;
-  const done = await clearDeath(call, auth.token);
-  return { token: auth.token, me: (done.data as MeReply).me };
+  return setChips(call, (await call('signup', body)).data as AuthReply, 5);
 }
 
 const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
@@ -101,8 +98,8 @@ describe('server', () => {
     const s = await call('signup', { name: '철수', pin: '1234', key: 'signup-key-1' });
     expect(s.status).toBe(200);
     const auth = s.data as AuthReply;
-    expect(auth.me).toMatchObject({ name: '철수', total: 0, free: 0, held: 0, inGame: 0, deathGame: true, messages: [] });
-    expect((await call('me', undefined, auth.token)).data.me.total).toBe(0);
+    expect(auth.me).toMatchObject({ name: '철수', total: 2, free: 2, held: 0, inGame: 0, deathGame: false, messages: [] });
+    expect((await call('me', undefined, auth.token)).data.me.total).toBe(2);
     expect((await call('signup', { name: '철수', pin: '1111' })).data.error).toBe('name_taken');
     for (let i = 0; i < 5; i++) expect((await call('login', { name: '철수', pin: '0000' })).data.error).toBe('login');
     const locked = await call('login', { name: '철수', pin: '1234' });
@@ -147,8 +144,8 @@ describe('server', () => {
     expect(close.status).toBe(200);
     const state = (await call('admin/state')).data as AdminState & { log: LogRecord[] };
     // Lost everything: recorded as a bankruptcy, and the 데스 게임 is open again.
-    expect(state.log.map((r) => r.kind)).toEqual(['signup', 'deathClear', 'gameOpen', 'gameClose', 'bankrupt']);
-    expect(state.players[0]).toMatchObject({ total: 0, deathClears: 1 });
+    expect(state.log.map((r) => r.kind)).toEqual(['signup', 'edit', 'gameOpen', 'gameClose', 'bankrupt']);
+    expect(state.players[0]).toMatchObject({ total: 0, deathClears: 0 });
   });
 
   it('pushes changes to the player app and tells an old login it was replaced', async () => {
@@ -202,13 +199,13 @@ describe('server', () => {
     expect([...bytes.slice(0, 3)]).toEqual([0xef, 0xbb, 0xbf]); // BOM
     const text = new TextDecoder().decode(bytes);
     expect(text).toContain('"번호","시각","종류","플레이어"');
-    expect(text).toContain('"가입","기록","0","0"');
-    expect(text).toContain('"데스 게임 통과","기록","5","5"');
+    expect(text).toContain('"가입","기록","2","2"');
   });
 
   it('pays the 데스 게임 for a whole run only: in order, no faster than a person, to a player with no chips', async () => {
     const { call } = await boot();
-    const { token } = (await call('signup', { name: '도전자', pin: '1234' })).data as AuthReply;
+    const { token } = await setChips(call, (await call('signup', { name: '도전자', pin: '1234' })).data as AuthReply, 0);
+    expect((await call('death/start', {}, (await call('signup', { name: '가진자', pin: '1234' })).data.token)).data.error).toBe('death_rich');
     expect((await call('death/clear', { run: 'x', key: 'death-x' }, token)).data.error).toBe('death_run');
     // Out of order: the run is void.
     let { run } = (await call('death/start', {}, token)).data;
@@ -228,7 +225,7 @@ describe('server', () => {
 
     // A stage reported sooner than anyone can play it: refused.
     const slow = await boot(undefined, { deathStageMinMs: [60_000, 0, 0, 0, 0] });
-    const other = (await slow.call('signup', { name: '번개', pin: '1234' })).data as AuthReply;
+    const other = await setChips(slow.call, (await slow.call('signup', { name: '번개', pin: '1234' })).data as AuthReply, 0);
     const r = (await slow.call('death/start', {}, other.token)).data.run;
     expect((await slow.call('death/stage', { run: r, stage: 1 }, other.token)).data.error).toBe('death_run');
   });

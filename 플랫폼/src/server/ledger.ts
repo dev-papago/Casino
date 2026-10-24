@@ -5,8 +5,8 @@
 //
 // A player's chips are in one of three places: free (`chips`), held for a settlement request (until the admin
 // hands over the physical chips or turns the request down), or staked in an open game session (until the game
-// reports its result). Their sum is the player's 잔고. Nothing ever goes below zero. Chips come in by the 데스 게임
-// (and the signup bonus of older ledgers), admin edits and game wins, and go out by settlements (physical chips),
+// reports its result). Their sum is the player's 잔고. Nothing ever goes below zero. Chips come in by the signup
+// bonus, the 데스 게임, admin edits and game wins, and go out by settlements (physical chips),
 // admin edits, game losses and deleting an account; `totals` counts each, so the ledger can always be checked
 // against itself. A player who loses the last chip in a game goes broke: that is recorded, and the 데스 게임 opens
 // again. Players' messages to the admin are kept here too.
@@ -96,7 +96,18 @@ export type EventBody =
   | { type: 'bankruptDone'; id: string; playerId: string } // older ledgers: the admin handled a bankruptcy
   | { type: 'deathClear'; key: string; playerId: string; reward: number }
   | { type: 'message'; key: string; message: { id: string; playerId: string; text: string } }
-  | { type: 'messageRead'; id: string };
+  | { type: 'messageRead'; id: string }
+  | {
+      // 러시안 룰렛 ended (or was called off): every session of the room closed at once, the chips only moving
+      // between the players (the payouts add up to the stakes).
+      type: 'duelEnd';
+      reason: DuelReason;
+      closes: { id: string; playerId: string; payout: number }[];
+      bankruptcy: string[]; // players left with no chips at all
+    };
+
+/** How a 러시안 룰렛 room ended: someone ran out of lives, gave up, left, or the room was called off (stakes back). */
+export type DuelReason = 'dead' | 'forfeit' | 'left' | 'refund';
 
 export type LedgerEvent = EventBody & { seq: number; at: number };
 
@@ -261,13 +272,13 @@ export function remove(s: State, id: unknown): EventBody {
 /** A game takes its stake out of the free chips; the game then plays without the network until it reports. */
 export function openGame(
   s: State,
-  input: { playerId: string; game: unknown; stake: unknown; key: string; online?: boolean },
+  input: { playerId: string; game: unknown; stake: unknown; key: string; online?: boolean; server?: boolean },
 ): Outcome {
   const done = replay(s, input.key, 'gameOpen', (e) => e.type === 'gameOpen' && e.session.playerId === input.playerId);
   if (done) return done;
   const p = player(s, input.playerId);
   const def = typeof input.game === 'string' ? gameDef(input.game) : undefined;
-  if (!def) throw new LedgerError('game');
+  if (!def || (def.duel && !input.server)) throw new LedgerError('game'); // a duel's sessions are the server's
   const stake = checkChips(input.stake, 1);
   if (stake > p.chips) throw new LedgerError('funds');
   const session = { id: newId(), playerId: p.id, game: def.id, stake, secret: newSecret() };
@@ -289,7 +300,7 @@ export function closeGame(s: State, input: { id: unknown; payout: unknown; secre
   }
   const g = s.games.get(id);
   if (!g) throw new LedgerError('gone');
-  if (input.by === 'player' && input.secret !== g.secret) throw new LedgerError('session');
+  if (input.by === 'player' && (input.secret !== g.secret || gameDef(g.game)?.duel)) throw new LedgerError('session');
   if (g.review && input.by === 'player') {
     // Sent again while the admin looks at it: the same report gets the same answer, anything else waits.
     if (input.payout === g.review.payout) return { type: 'gameReview', id, playerId: g.playerId, ...g.review };
@@ -353,6 +364,32 @@ export function directSettlement(s: State, input: { playerId: unknown; amount: u
   if (amount > p.chips) throw new LedgerError('funds');
   if (amount > settleLeftOf(s, p)) throw new LedgerError('settle_cap');
   return { type: 'settleDirect', key: input.key, id: newId(), playerId: p.id, amount };
+}
+
+/**
+ * The end of a 러시안 룰렛 room: its open sessions close with these payouts in one event. The payouts must add up
+ * to the stakes (chips only change hands), so no mistake can make or lose chips.
+ */
+export function endDuel(s: State, input: { reason: DuelReason; closes: { id: string; payout: number }[] }): EventBody {
+  const closes = input.closes.map((c) => {
+    const g = s.games.get(c.id);
+    if (!g || !gameDef(g.game)?.duel) throw new LedgerError('gone');
+    return { id: g.id, playerId: g.playerId, payout: checkChips(c.payout, 0), stake: g.stake };
+  });
+  if (!closes.length || closes.reduce((t, c) => t + c.payout - c.stake, 0) !== 0) throw new LedgerError('payout');
+  const left = new Map<string, number>(); // chips each player has after it, outside these sessions
+  for (const c of closes) {
+    const p = player(s, c.playerId);
+    const others = gamesOf(s, p.id).filter((g) => !closes.some((x) => x.id === g.id)).length;
+    const base = left.get(p.id) ?? (others || settlementOf(s, p.id) ? 1 : p.chips);
+    left.set(p.id, base + c.payout);
+  }
+  return {
+    type: 'duelEnd',
+    reason: input.reason,
+    closes: closes.map(({ id, playerId, payout }) => ({ id, playerId, payout })),
+    bankruptcy: [...left].filter(([, n]) => n <= 0).map(([id]) => id),
+  };
 }
 
 /** The 데스 게임 cleared (the server followed the run): the reward, if the player is still poor enough for it. */
@@ -531,6 +568,34 @@ export function apply(s: State, e: LedgerEvent): void {
     case 'message':
       s.messages.set(e.message.id, { ...e.message, at: e.at, read: false });
       break;
+    case 'duelEnd': {
+      const names = new Map(e.closes.map((c) => [c.playerId, s.players.get(c.playerId)?.name ?? '?']));
+      for (const c of e.closes) {
+        const g = s.games.get(c.id);
+        if (!g) throw new Error(`장부에 없는 게임 ${c.id}`);
+        const p = must(s, g.playerId);
+        p.chips += c.payout;
+        p.played++;
+        p.net += c.payout - g.stake;
+        p.version++;
+        s.games.delete(g.id);
+        s.closed.set(g.id, { secret: g.secret, event: e });
+        s.totals.games += c.payout - g.stake;
+        const rival = [...names].find(([id]) => id !== p.id)?.[1];
+        const how =
+          e.reason === 'refund'
+            ? '취소 · 판돈 반환'
+            : c.payout > g.stake
+              ? `승리${e.reason === 'forfeit' ? ' (상대 기권)' : e.reason === 'left' ? ' (상대 이탈)' : ''}`
+              : `패배${e.reason === 'forfeit' ? ' (기권)' : e.reason === 'left' ? ' (자리 비움)' : ''}`;
+        log(s, e, 'gameClose', p, c.payout - g.stake, `${gameName(g.game)} ${how}${rival ? ` · 상대 ${rival}` : ''} · ${g.stake}칩 → ${c.payout}칩`);
+      }
+      for (const id of e.bankruptcy) {
+        const p = s.players.get(id);
+        if (p) log(s, e, 'bankrupt', p, 0, '잔고 0칩 · 파산 (데스 게임에 다시 도전할 수 있음)');
+      }
+      break;
+    }
     case 'messageRead': {
       const m = s.messages.get(e.id);
       if (m) m.read = true;

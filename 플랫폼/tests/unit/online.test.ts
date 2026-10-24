@@ -45,11 +45,9 @@ async function boot(dir = mkdtempSync(join(tmpdir(), 'online-')), timing: { entr
   return { srv, dir, lan, pub, code };
 }
 
-/** Plays the 데스 게임 through to its reward, through the tunnel (the stage minimums are 0 here). */
-async function clearDeath(pub: (path: string, body?: unknown, o?: { token?: string }) => Promise<Reply>, token: string): Promise<Reply> {
-  const { run } = (await pub('api/death/start', {}, { token })).data as { run: string };
-  for (let stage = 1; stage <= 5; stage++) await pub('api/death/stage', { run, stage }, { token });
-  return pub('api/death/clear', { run, key: `death-${run}` }, { token });
+/** Tops a new player up to 5 chips (an admin edit on the admin PC). */
+async function fiveChips(lan: (path: string, body?: unknown) => Promise<Reply>, auth: { me: { id: string; name: string } }): Promise<void> {
+  await lan('api/admin/edit', { id: auth.me.id, version: 1, name: auth.me.name, pin: auth.me.name === '이등' ? '2222' : '7777', total: 5 });
 }
 
 describe('public listener', () => {
@@ -79,7 +77,7 @@ describe('public listener', () => {
     expect((await lan('api/entry', {})).data).toEqual({ ok: true }); // this PC: no code
     const a = (await pub('api/signup', { name: '일등', pin: '1111', code: c })).data;
     const b = (await pub('api/signup', { name: '이등', pin: '2222', code: c })).data;
-    expect((await clearDeath(pub, b.token)).data.me.total).toBe(5);
+    await fiveChips(lan, b);
     await lan('api/admin/edit', { id: a.me.id, version: 1, name: '일등', pin: '1111', total: 30 });
     expect((await pub('api/rank')).status).toBe(401); // players only
     const r = (await pub('api/rank', undefined, { token: b.token })).data;
@@ -204,7 +202,7 @@ describe('public listener', () => {
     const { lan, pub, code } = await boot();
     const c = await code();
     const auth = (await pub('api/signup', { name: '행운', pin: '7777', code: c })).data;
-    await clearDeath(pub, auth.token);
+    await fiveChips(lan, auth);
     const big = 1 + PLATFORM.online.reviewNet;
     const play = async (call: typeof pub) => {
       const r = await call('api/game/open', { game: 'yabawi', stake: 1, key: `k-${Math.random()}` }, { token: auth.token });

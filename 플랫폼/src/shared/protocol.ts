@@ -29,6 +29,10 @@ export type ErrorCode =
   | 'death_rich'
   | 'death_run'
   | 'message'
+  | 'roulette_busy'
+  | 'roulette_lives'
+  | 'roulette_full'
+  | 'roulette_turn'
   | 'not_found';
 
 export const ERROR_TEXT: Record<ErrorCode, string> = {
@@ -58,6 +62,10 @@ export const ERROR_TEXT: Record<ErrorCode, string> = {
   death_rich: '잔고가 0칩일 때만 데스 게임에 도전할 수 있습니다',
   death_run: '데스 게임 진행 기록이 맞지 않습니다. 처음부터 다시 도전하세요',
   message: '메시지는 1~200글자로 적으세요',
+  roulette_busy: '이미 들어가 있는 러시안 룰렛 방이 있습니다',
+  roulette_lives: '목숨은 1~5개로 정하세요',
+  roulette_full: '이미 시작했거나 끝난 방입니다',
+  roulette_turn: '지금은 내 차례가 아닙니다',
   not_found: '없는 플레이어입니다',
 };
 
@@ -90,6 +98,45 @@ export interface PlayerView {
   deathGame: boolean; // no chips at all: the 데스 게임 pays out
   messages: { id: string; text: string; at: number; read: boolean }[]; // sent to the admin, newest first
   games: GameSessionView[];
+}
+
+// ------------------------------------------------------------------ 러시안 룰렛 (src/server/roulette.ts)
+
+/** A room waiting for a second player. */
+export interface RouletteRoomInfo {
+  id: string;
+  host: string;
+  stake: number;
+  lives: number;
+  createdAt: number;
+  mine: boolean;
+}
+
+/** What happened in a room, numbered; the players' games play these out in order. Seats are 0 (creator) and 1. */
+export type RouletteEvent =
+  | { n: number; kind: 'start'; names: string[]; lives: number; stake: number }
+  | { n: number; kind: 'load'; round: number; live: number; blank: number }
+  | { n: number; kind: 'coin'; first: number }
+  | { n: number; kind: 'turn'; seat: number; round: number }
+  | { n: number; kind: 'shot'; shooter: number; target: number; live: boolean; auto: boolean; lives: number[]; left: { live: number; blank: number } }
+  | { n: number; kind: 'end'; winner: number | null; reason: 'dead' | 'forfeit' | 'left' | 'refund'; payout: number };
+
+/** A room as one of its players sees it. */
+export interface RouletteView {
+  id: string;
+  stake: number;
+  lives: number; // each player's at the start
+  phase: 'waiting' | 'load' | 'coin' | 'turn' | 'shot' | 'over';
+  msLeft: number; // until the phase ends (in 'turn': the time left to choose)
+  round: number;
+  turn: number;
+  me: number; // my seat
+  seats: { name: string; lives: number }[];
+  left: { live: number; blank: number }; // rounds still in the cylinder
+  winner: number | null;
+  reason: 'dead' | 'forfeit' | 'left' | 'refund' | null;
+  events: RouletteEvent[]; // after the number asked for
+  last: number; // the number of the latest event
 }
 
 /** POST /api/death/start: the run the server follows; its stages are reported as they are cleared. */

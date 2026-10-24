@@ -51,11 +51,11 @@ const code = (f: () => unknown): string => {
 function fresh(): { store: Store; dir: string; join: (name: string) => string } {
   const dir = tempDir();
   const store = new Store(dir);
-  /** A new player who cleared the 데스 게임: PLATFORM.deathGame.reward chips to play with. */
+  /** A new player with 5 chips to play with (the signup bonus, topped up by the admin). */
   const joinPlayer = (name: string): string => {
     const e = store.run((s) => signup(s, { name, pin: '1234', key: key() }));
     if (e.type !== 'signup') throw new Error();
-    store.run((s) => clearDeathGame(s, { playerId: e.player.id, key: key() }));
+    store.run((s) => edit(s, { id: e.player.id, version: 1, name: e.player.name, pin: '1234', total: 5 }));
     return e.player.id;
   };
   return { store, dir, join: joinPlayer };
@@ -70,12 +70,12 @@ function balanced(s: State): void {
 }
 
 describe('accounts', () => {
-  it('a signup starts with no chips; names are unique whatever the case and spacing; PIN is 4 digits', () => {
+  it('a signup gets the bonus; names are unique whatever the case and spacing; PIN is 4 digits', () => {
     const { store, join } = fresh();
     const e = store.run((s) => signup(s, { name: '  홍길동 ', pin: '1234', key: key() }));
     if (e.type !== 'signup') throw new Error();
-    expect(p(store.state, e.player.id)).toMatchObject({ name: '홍길동', chips: 0, version: 1 });
-    expect(PLATFORM.signupBonus).toBe(0);
+    expect(p(store.state, e.player.id)).toMatchObject({ name: '홍길동', chips: PLATFORM.signupBonus, version: 1 });
+    expect(PLATFORM.signupBonus).toBe(2);
     expect(code(() => store.run((s) => signup(s, { name: '홍길동', pin: '1111', key: key() })))).toBe('name_taken');
     join('Kim Lee');
     expect(code(() => store.run((s) => signup(s, { name: 'kim   LEE', pin: '1111', key: key() })))).toBe('name_taken');
@@ -285,7 +285,7 @@ describe('bankruptcy and the 데스 게임', () => {
     expect(store.state.log.at(-1)).toMatchObject({ kind: 'bankrupt', name: '파산', chips: 0 });
     expect(deathOpenFor(store.state, p(store.state, id))).toBe(true);
     store.run((s) => clearDeathGame(s, { playerId: id, key: key() }));
-    expect(p(store.state, id)).toMatchObject({ chips: PLATFORM.deathGame.reward, deathClears: 2 });
+    expect(p(store.state, id)).toMatchObject({ chips: PLATFORM.deathGame.reward, deathClears: 1 });
     expect(store.state.log.at(-1)).toMatchObject({ kind: 'deathClear', delta: PLATFORM.deathGame.reward });
     balanced(store.state);
   });
